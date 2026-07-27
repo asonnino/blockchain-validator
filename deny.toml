@@ -1,0 +1,84 @@
+# This section is considered when running `cargo deny check advisories`
+# More documentation for the advisories section can be found here:
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
+[advisories]
+version = 2
+ignore = [
+  # bincode is unmaintained (development ceased permanently); mysticeti's dag
+  # crate still depends on bincode 1.
+  "RUSTSEC-2025-0141",
+  # proc-macro-error2 is unmaintained; pulled in via tabled_derive through
+  # mysticeti's dag crate.
+  "RUSTSEC-2026-0173",
+]
+
+# This section is considered when running `cargo deny check licenses`
+# More documentation for the licenses section can be found here:
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+[licenses]
+version = 2
+# List of explicitly allowed licenses
+# See https://spdx.org/licenses/ for list of possible licenses
+# [possible values: any SPDX 3.11 short identifier (+ optional exception)].
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+]
+# The confidence threshold for detecting a license from license text.
+# The higher the value, the more closely the license text must be to the
+# canonical license text of a valid SPDX license file.
+# [possible values: any between 0.0 and 1.0].
+confidence-threshold = 0.8
+
+[licenses.private]
+# If true, ignores workspace crates that aren't published, or are only
+# published to private registries.
+# To see how to mark a crate as unpublished (to the official registry),
+# visit https://doc.rust-lang.org/cargo/reference/manifest.html#the-publish-field.
+ignore = true
+
+# This section is considered when running `cargo deny check bans`.
+# More documentation about the 'bans' section can be found here:
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
+[bans]
+# Lint level for when multiple versions of the same crate are detected
+multiple-versions = "deny"
+skip = [
+  # ed25519-consensus and protobuf-support still depend on thiserror 1 while
+  # the rest of the tree uses thiserror 2.
+  { name = "thiserror", version = "1" },
+  { name = "thiserror-impl", version = "1" },
+]
+skip-tree = [
+  # ed25519-consensus 2.1 pulls old sha2 0.9, digest 0.9, and rand_core 0.6
+  # via curve25519-dalek-ng.
+  { name = "ed25519-consensus" },
+]
+
+# This section is considered when running `cargo deny check sources`.
+# More documentation about the 'sources' section can be found here:
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is not
+# in the allow list is encountered
+unknown-registry = "deny"
+# Lint level for what to happen when a crate from a git repository that is not
+# in the allow list is encountered
+unknown-git = "deny"
+allow-git = [
+  # The mysticeti consensus crates (dag, replica, simulator) are pinned to a rev.
+  "https://github.com/asonnino/mysticeti",
+]
+
+[sources.allow-org]
+# github.com organizations to allow git sources for
+github = ["MystenLabs"]

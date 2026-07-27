@@ -39,6 +39,13 @@ a rev in the workspace `Cargo.toml`; bump the rev everywhere at once.
 
 - Toolchain pinned in `rust-toolchain.toml` (Rust 1.97, edition 2024).
 - Format with `cargo fmt` (repo `rustfmt.toml`); lint with `cargo clippy`.
+- A pre-commit hook chain (`.pre-commit-config.yaml`) runs on every commit:
+  whitespace/EOF fixers, editorconfig, yamlfmt, taplo, typos, licensesnip,
+  shellcheck, cargo fmt/clippy/nextest. Install with
+  `pip install pre-commit && pre-commit install`. If a hook fails, fix the
+  underlying issue rather than bypassing the hook.
+- Commit messages and PR titles follow Conventional Commits (enforced in CI).
+- Lines are capped at 100 characters (`.editorconfig`).
 - When mysticeti internals are unclear, read the sister repo directly —
   `docs/architecture.md` there documents the crate seams and the
   transaction-input / commit-output contract.
