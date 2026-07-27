@@ -23,7 +23,8 @@ jobs:
             --repo https://github.com/pre-commit/pre-commit-hooks \
             --repo https://github.com/editorconfig-checker/editorconfig-checker.python \
             --repo https://github.com/google/yamlfmt \
-            --repo https://github.com/crate-ci/typos
+            --repo https://github.com/crate-ci/typos \
+            --repo https://github.com/streetsidesoftware/cspell-cli
       - run: pre-commit run --all-files
       - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # pin@v8.1.1
         if: ${{ success() }}
