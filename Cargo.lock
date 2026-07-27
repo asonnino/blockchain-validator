@@ -304,7 +304,8 @@ dependencies = [
 name = "execution"
 version = "0.1.0"
 dependencies = [
- "dag",
+ "bincode",
+ "serde",
 ]
 
 [[package]]
