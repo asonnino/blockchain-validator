@@ -6,10 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-checkpoint.workspace = true
 dag.workspace = true
 execution.workspace = true
+eyre.workspace = true
 replica.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-simulator.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

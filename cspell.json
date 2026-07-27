@@ -9,7 +9,9 @@
     ],
     "words": [
         "amannn",
+        "backpressure",
         "backpressures",
+        "checkpointing",
         "CLICOLOR",
         "clippy",
         "dalek",
@@ -28,6 +30,7 @@
         "RUSTUP",
         "serde",
         "shellcheck",
+        "subdag",
         "Swatinem",
         "taiki",
         "taplo",
