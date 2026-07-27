@@ -52,10 +52,18 @@ jobs:
         run: ./yamlfmt -lint
   typos:
     runs-on: ubuntu-latest
-    name: Check spelling
+    name: Check typos
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
       - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # pin@v1.48.0
+  cspell:
+    runs-on: ubuntu-latest
+    name: Check spelling
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+      - uses: streetsidesoftware/cspell-action@de2a73e963e7443969755b648a1008f77033c5b2 # pin@v8.4.0
+        with:
+          incremental_files_only: false
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
@@ -80,6 +88,7 @@ jobs:
       - pr-title
       - formatting
       - typos
+      - cspell
       - shellcheck
       - license-headers
     runs-on: ubuntu-latest

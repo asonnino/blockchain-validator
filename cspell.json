@@ -1,0 +1,40 @@
+{
+    "version": "0.2",
+    "language": "en",
+    "useGitignore": true,
+    "ignorePaths": [
+        ".git",
+        "Cargo.lock",
+        "LICENSE"
+    ],
+    "words": [
+        "amannn",
+        "backpressures",
+        "CLICOLOR",
+        "clippy",
+        "dalek",
+        "dorny",
+        "fixint",
+        "licensesnip",
+        "MSVC",
+        "Mysten",
+        "mysticeti",
+        "nextest",
+        "profdata",
+        "profraw",
+        "rustc",
+        "RUSTDOCFLAGS",
+        "RUSTSEC",
+        "RUSTUP",
+        "serde",
+        "shellcheck",
+        "Swatinem",
+        "taiki",
+        "taplo",
+        "thiserror",
+        "unforgeable",
+        "venv",
+        "worktrees",
+        "writebacks"
+    ]
+}
