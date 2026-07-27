@@ -3,12 +3,17 @@
 
 //! Client transactions and their byte codec.
 
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     object::{ObjectId, Version},
     store::StateView,
 };
+
+/// Transactions larger than this fail to decode. Bounds the allocations a malformed length
+/// prefix can request, since transaction bytes come from untrusted clients via consensus.
+pub const MAX_TRANSACTION_SIZE: u64 = 1024 * 1024;
 
 /// A fixed-size reference to the function a transaction invokes.
 ///
@@ -81,7 +86,13 @@ impl Transaction {
 
     /// Decodes a transaction from consensus payload bytes.
     pub fn from_bytes(bytes: &[u8]) -> bincode::Result<Self> {
-        bincode::deserialize(bytes)
+        // Same format as `bincode::serialize` (fixint, trailing bytes tolerated), plus the
+        // size limit.
+        bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_TRANSACTION_SIZE)
+            .deserialize_from(bytes)
     }
 
     /// Statically verifies the transaction, independently of any state.
@@ -136,6 +147,13 @@ mod tests {
     #[test]
     fn garbage_bytes_fail_to_decode() {
         assert!(Transaction::from_bytes(&[0xFF]).is_err());
+    }
+
+    #[test]
+    fn oversized_transactions_fail_to_decode() {
+        let args = vec![0; 2 * super::MAX_TRANSACTION_SIZE as usize];
+        let transaction = Transaction::new(FunctionId::new(7), vec![], args);
+        assert!(Transaction::from_bytes(&transaction.to_bytes()).is_err());
     }
 
     #[test]
