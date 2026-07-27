@@ -1,10 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-  "crates/execution",
-  "crates/checkpoint",
-  "crates/validator",
-]
+members = ["crates/execution", "crates/checkpoint", "crates/validator"]
 
 [workspace.package]
 edition = "2024"
@@ -16,11 +12,9 @@ publish = false
 checkpoint = { path = "crates/checkpoint" }
 execution = { path = "crates/execution" }
 
-# Mysticeti crates are pinned to a single rev: same URL + same rev resolves to
-# one source, so types like `CommittedSubDag` unify across `dag` and `replica`.
-dag = { git = "https://github.com/asonnino/mysticeti", rev = "c5dbe28aa3d6f06ca807f757728f376c82c306c5" }
-replica = { git = "https://github.com/asonnino/mysticeti", rev = "c5dbe28aa3d6f06ca807f757728f376c82c306c5" }
-simulator = { git = "https://github.com/asonnino/mysticeti", rev = "c5dbe28aa3d6f06ca807f757728f376c82c306c5" }
+dag = { git = "https://github.com/asonnino/mysticeti", rev = "5a093a2223bda5cca1d15ee6bee97438782ab32e" }
+replica = { git = "https://github.com/asonnino/mysticeti", rev = "5a093a2223bda5cca1d15ee6bee97438782ab32e" }
+simulator = { git = "https://github.com/asonnino/mysticeti", rev = "5a093a2223bda5cca1d15ee6bee97438782ab32e" }
 
 [profile.release]
 panic = "abort"
