@@ -60,7 +60,12 @@ impl CheckpointChain {
 #[cfg(test)]
 mod tests {
     use dag::block::BlockReference;
-    use execution::crypto::Digest;
+    use execution::{
+        crypto::Digest,
+        effects::ExecutionOutput,
+        object::{Object, ObjectId, Version},
+        store::InMemoryStore,
+    };
 
     use crate::checkpoint::CheckpointChain;
 
@@ -99,6 +104,23 @@ mod tests {
         let mut second = CheckpointChain::default();
         first.push(anchor(1), Digest::default());
         second.push(anchor(2), Digest::default());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn differing_commitments_yield_unequal_chains() {
+        // A store with one write yields a commitment different from the genesis digest.
+        let mut store = InMemoryStore::default();
+        store.apply(ExecutionOutput::success(vec![Object::new(
+            ObjectId::new(1),
+            Version::new(1),
+            vec![1],
+        )]));
+
+        let mut first = CheckpointChain::default();
+        let mut second = CheckpointChain::default();
+        first.push(anchor(1), Digest::default());
+        second.push(anchor(1), store.commitment());
         assert_ne!(first, second);
     }
 }

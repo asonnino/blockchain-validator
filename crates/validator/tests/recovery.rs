@@ -59,9 +59,9 @@ async fn restarted_committee_recovers_execution_state() {
         // The reference chain is a prefix of the rebuilt one: replay reproduced it, then the
         // post-restart update appended. Prefix rather than equality guards the edge where the
         // WAL holds a final commit the pre-shutdown driver never received.
+        assert!(rebuilt_chain.checkpoints().len() > reference_chain.checkpoints().len());
         let prefix = &rebuilt_chain.checkpoints()[..reference_chain.checkpoints().len()];
         assert_eq!(reference_chain.checkpoints(), prefix);
-        assert!(rebuilt_chain.checkpoints().len() > reference_chain.checkpoints().len());
     }
     let (first, first_chain) = &rebuilt[0];
     let store = first.store();
