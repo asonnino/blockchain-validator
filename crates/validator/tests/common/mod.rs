@@ -8,6 +8,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
+use checkpoint::checkpoint::CheckpointChain;
 use dag::{authority::Authority, context::TokioCtx};
 use execution::{fake::FakeExecutor, scheduler::SequentialScheduler, transaction::Transaction};
 use replica::{
@@ -86,12 +87,13 @@ impl Testbed {
         }
     }
 
-    /// Stops every validator and returns the schedulers with their executed state.
-    pub async fn shutdown(self) -> Vec<SequentialScheduler<FakeExecutor>> {
-        let mut schedulers = Vec::with_capacity(self.validators.len());
+    /// Stops every validator and returns the schedulers with their executed state and
+    /// checkpoint chains.
+    pub async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointChain)> {
+        let mut results = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
-            schedulers.push(validator.shutdown().await);
+            results.push(validator.shutdown().await);
         }
-        schedulers
+        results
     }
 }

@@ -44,7 +44,8 @@ async fn restarted_committee_recovers_execution_state() {
     let rebuilt = testbed.shutdown().await;
 
     assert_eq!(references.len(), rebuilt.len());
-    for (reference, rebuilt) in references.iter().zip(&rebuilt) {
+    for ((reference, reference_chain), (rebuilt, rebuilt_chain)) in references.iter().zip(&rebuilt)
+    {
         // Replay reproduced the pre-restart history exactly...
         for version in 1..=total {
             assert_eq!(
@@ -55,9 +56,17 @@ async fn restarted_committee_recovers_execution_state() {
         // ...and the post-restart update landed on top of it.
         let latest = rebuilt.store().latest(&id).expect("object must exist");
         assert_eq!(latest.version(), Version::new(total + 1));
+        // The reference chain is a prefix of the rebuilt one: replay reproduced it, then the
+        // post-restart update appended. Prefix rather than equality guards the edge where the
+        // WAL holds a final commit the pre-shutdown driver never received.
+        assert!(rebuilt_chain.checkpoints().len() > reference_chain.checkpoints().len());
+        let prefix = &rebuilt_chain.checkpoints()[..reference_chain.checkpoints().len()];
+        assert_eq!(reference_chain.checkpoints(), prefix);
     }
-    let store = rebuilt[0].store();
-    for scheduler in &rebuilt {
+    let (first, first_chain) = &rebuilt[0];
+    let store = first.store();
+    for (scheduler, chain) in &rebuilt {
         assert_eq!(scheduler.store(), store);
+        assert_eq!(chain, first_chain);
     }
 }
