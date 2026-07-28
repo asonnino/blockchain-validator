@@ -44,6 +44,8 @@ a rev in the workspace `Cargo.toml`; bump the rev everywhere at once.
   shellcheck, cargo fmt/clippy/nextest. Install with
   `pip install pre-commit && pre-commit install`. If a hook fails, fix the
   underlying issue rather than bypassing the hook.
+- Before every commit, launch the `test-coverage-reviewer` subagent in the background on the
+  pending diff; fold worthwhile findings into the commit (or dismiss them with a reason).
 - Commit messages and PR titles follow Conventional Commits (enforced in CI).
 - Lines are capped at 100 characters (`.editorconfig`); fill the width in comments.
 - Prefer short, minimal comments and doc comments: state only what the code cannot say

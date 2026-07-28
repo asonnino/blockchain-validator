@@ -32,6 +32,7 @@
         "RUSTSEC",
         "RUSTUP",
         "seedable",
+        "stdlib",
         "serde",
         "shellcheck",
         "subdag",
