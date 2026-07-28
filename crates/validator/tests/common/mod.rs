@@ -1,0 +1,97 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Test harness booting validator committees on the local tokio network.
+
+// Each test binary compiles its own copy of this module and uses a subset of it.
+#![allow(dead_code)]
+
+use std::{fs, path::Path, time::Duration};
+
+use dag::{authority::Authority, context::TokioCtx};
+use execution::{fake::FakeExecutor, scheduler::SequentialScheduler, transaction::Transaction};
+use replica::{
+    builder::StorageKind,
+    config::{PrivateReplicaConfig, PublicReplicaConfig},
+};
+use tokio::time;
+use validator::validator::{ValidatorBuilder, ValidatorHandle};
+
+const COMMITTEE_SIZE: usize = 4;
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A committee of validators running on the local tokio network.
+pub struct Testbed {
+    validators: Vec<ValidatorHandle<TokioCtx, FakeExecutor>>,
+}
+
+impl Testbed {
+    /// Boots a committee with ephemeral storage.
+    pub async fn start(port_offset: u16) -> Self {
+        Self::boot(None, port_offset).await
+    }
+
+    /// Boots a committee persisting each replica's WAL under `dir`.
+    pub async fn start_with_wal(dir: &Path, port_offset: u16) -> Self {
+        Self::boot(Some(dir), port_offset).await
+    }
+
+    async fn boot(dir: Option<&Path>, port_offset: u16) -> Self {
+        let public_config =
+            PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE).with_port_offset(port_offset);
+        let private_configs = PrivateReplicaConfig::new_for_benchmarks(
+            dir.unwrap_or(Path::new("unused")),
+            COMMITTEE_SIZE,
+        );
+
+        let mut validators = Vec::with_capacity(COMMITTEE_SIZE);
+        for (index, private_config) in private_configs.into_iter().enumerate() {
+            let storage = match dir {
+                Some(_) => {
+                    fs::create_dir_all(&private_config.storage_path).expect("storage directory");
+                    StorageKind::Wal(private_config.wal())
+                }
+                None => StorageKind::Ephemeral,
+            };
+            let validator = ValidatorBuilder::new(
+                FakeExecutor,
+                Authority::from(index),
+                public_config.clone(),
+                private_config,
+            )
+            .with_storage(storage)
+            .build()
+            .start::<TokioCtx>()
+            .await
+            .expect("validator must start");
+            validators.push(validator);
+        }
+        Self { validators }
+    }
+
+    /// Submits transactions through the `validator`-th committee member.
+    pub async fn submit(&self, validator: usize, transactions: Vec<Transaction>) {
+        self.validators[validator]
+            .submit(transactions)
+            .await
+            .expect("submission must succeed");
+    }
+
+    /// Waits until every validator has executed at least `count` transactions.
+    pub async fn wait_for_transactions(&mut self, count: u64) {
+        for validator in &mut self.validators {
+            time::timeout(TIMEOUT, validator.wait_for_transactions(count))
+                .await
+                .expect("timed out waiting for transactions to execute");
+        }
+    }
+
+    /// Stops every validator and returns the schedulers with their executed state.
+    pub async fn shutdown(self) -> Vec<SequentialScheduler<FakeExecutor>> {
+        let mut schedulers = Vec::with_capacity(self.validators.len());
+        for validator in self.validators {
+            schedulers.push(validator.shutdown().await);
+        }
+        schedulers
+    }
+}

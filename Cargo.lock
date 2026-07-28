@@ -1467,6 +1467,7 @@ dependencies = [
  "rand",
  "replica",
  "simulator",
+ "tempfile",
  "tokio",
  "tracing",
 ]
