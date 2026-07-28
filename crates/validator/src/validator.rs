@@ -143,6 +143,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             return Ok(0);
         };
         let committee = self.public_config.committee();
+        // An isolated registry: replay metrics are discarded with this read-only handle.
         let metrics = Metrics::new_for_test(committee.len());
         let (storage, _recovered) = Storage::open(self.authority, wal, metrics, &committee)?;
 

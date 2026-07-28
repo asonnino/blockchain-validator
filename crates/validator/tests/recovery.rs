@@ -43,6 +43,7 @@ async fn restarted_committee_recovers_execution_state() {
     testbed.wait_for_transactions(total + 1).await;
     let rebuilt = testbed.shutdown().await;
 
+    assert_eq!(references.len(), rebuilt.len());
     for (reference, rebuilt) in references.iter().zip(&rebuilt) {
         // Replay reproduced the pre-restart history exactly...
         for version in 1..=total {
