@@ -153,12 +153,11 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 .sub_dag
                 .iter()
                 .map(|reference| {
-                    storage
-                        .block_reader()
-                        .get_block(*reference)
-                        .expect("committed block must be in the WAL")
+                    storage.block_reader().get_block(*reference).ok_or_else(|| {
+                        eyre::eyre!("committed block {reference} missing from the WAL")
+                    })
                 })
-                .collect();
+                .collect::<eyre::Result<_>>()?;
             let subdag = CommittedSubDag::new(commit.leader, blocks);
             replayed += Self::execute_subdag(&mut self.scheduler, subdag) as u64;
         }
