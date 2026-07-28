@@ -15,6 +15,10 @@ impl ObjectId {
         bytes[24..].copy_from_slice(&value.to_be_bytes());
         Self(bytes)
     }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 /// The version of an object.
@@ -35,6 +39,10 @@ impl Version {
     /// The version following `self`.
     pub fn next(&self) -> Self {
         Self(self.0.checked_add(1).expect("Version overflow"))
+    }
+
+    pub(crate) fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 

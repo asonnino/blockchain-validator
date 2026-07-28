@@ -13,6 +13,8 @@ checkpoint = { path = "crates/checkpoint" }
 execution = { path = "crates/execution" }
 
 bincode = "1.3.3"
+blake2 = "0.10.6"
+digest = "0.10.6"
 eyre = "0.6.8"
 futures = "0.3.28"
 rand = "0.8.5"
