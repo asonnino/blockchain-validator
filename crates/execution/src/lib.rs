@@ -3,6 +3,7 @@
 
 //! Transaction execution.
 
+pub mod crypto;
 pub mod effects;
 pub mod engine;
 pub mod fake;

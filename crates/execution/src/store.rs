@@ -5,7 +5,10 @@
 
 use std::collections::BTreeMap;
 
+use digest::Digest as _;
+
 use crate::{
+    crypto::{Digest, Hasher},
     effects::ExecutionOutput,
     object::{Object, ObjectId, Version},
 };
@@ -27,6 +30,9 @@ pub struct InMemoryStore {
     objects: BTreeMap<(ObjectId, Version), Object>,
     /// The highest written version of each object.
     latest: BTreeMap<ObjectId, Version>,
+    /// Rolling commitment to the full ordered write history; a persistent backend must persist
+    /// it in the same atomic batch as its delta's writes.
+    commitment: Digest,
 }
 
 impl InMemoryStore {
@@ -46,8 +52,23 @@ impl InMemoryStore {
                 previous.is_none_or(|p| p < version),
                 "object versions must move forward"
             );
+
+            // Only the trailing element is variable, so no length framing is needed.
+            let mut hasher = Hasher::new();
+            hasher.update(self.commitment.as_bytes());
+            hasher.update(id.as_bytes());
+            hasher.update(version.as_u64().to_be_bytes());
+            hasher.update(object.contents());
+            self.commitment = Digest::new(hasher.finalize().into());
+
             self.objects.insert((id, version), object);
         }
+    }
+
+    /// The commitment to the state: `H(previous ‖ id ‖ version ‖ contents)` folded over every
+    /// write in execution order.
+    pub fn commitment(&self) -> Digest {
+        self.commitment
     }
 }
 
@@ -61,6 +82,7 @@ impl StateView for InMemoryStore {
 #[cfg(test)]
 mod tests {
     use crate::{
+        crypto::Digest,
         effects::{AbortReason, ExecutionOutput},
         object::{Object, ObjectId, Version},
         store::{InMemoryStore, StateView},
@@ -101,5 +123,92 @@ mod tests {
         let object = || Object::new(ObjectId::new(1), Version::new(1), vec![1]);
         store.apply(ExecutionOutput::success(vec![object()]));
         store.apply(ExecutionOutput::success(vec![object()]));
+    }
+
+    #[test]
+    fn commitments_track_the_write_history() {
+        let write = |version: u64| {
+            ExecutionOutput::success(vec![Object::new(
+                ObjectId::new(1),
+                Version::new(version),
+                vec![version as u8],
+            )])
+        };
+        let (mut first, mut second) = (InMemoryStore::default(), InMemoryStore::default());
+        assert_eq!(first.commitment(), Digest::default());
+
+        first.apply(write(1));
+        second.apply(write(1));
+        assert_eq!(first.commitment(), second.commitment());
+
+        first.apply(write(2));
+        assert_ne!(first.commitment(), second.commitment());
+        second.apply(write(2));
+        assert_eq!(first.commitment(), second.commitment());
+    }
+
+    #[test]
+    fn commitments_flip_on_any_differing_write() {
+        let commit = |id: u64, version: u64, contents: Vec<u8>| {
+            let mut store = InMemoryStore::default();
+            let object = Object::new(ObjectId::new(id), Version::new(version), contents);
+            store.apply(ExecutionOutput::success(vec![object]));
+            store.commitment()
+        };
+        let reference = commit(1, 1, vec![7]);
+        assert_ne!(reference, commit(2, 1, vec![7]));
+        assert_ne!(reference, commit(1, 2, vec![7]));
+        assert_ne!(reference, commit(1, 1, vec![8]));
+    }
+
+    #[test]
+    fn commitments_are_order_sensitive() {
+        let first = || Object::new(ObjectId::new(1), Version::new(1), vec![1]);
+        let second = || Object::new(ObjectId::new(2), Version::new(1), vec![2]);
+
+        let mut forward = InMemoryStore::default();
+        forward.apply(ExecutionOutput::success(vec![first()]));
+        forward.apply(ExecutionOutput::success(vec![second()]));
+        let mut reverse = InMemoryStore::default();
+        reverse.apply(ExecutionOutput::success(vec![second()]));
+        reverse.apply(ExecutionOutput::success(vec![first()]));
+
+        assert_ne!(forward.commitment(), reverse.commitment());
+    }
+
+    #[test]
+    fn commitments_ignore_batch_boundaries() {
+        let first = || Object::new(ObjectId::new(1), Version::new(1), vec![1]);
+        let second = || Object::new(ObjectId::new(2), Version::new(1), vec![2]);
+
+        let mut batched = InMemoryStore::default();
+        batched.apply(ExecutionOutput::success(vec![first(), second()]));
+        let mut split = InMemoryStore::default();
+        split.apply(ExecutionOutput::success(vec![first()]));
+        split.apply(ExecutionOutput::success(vec![second()]));
+
+        assert_eq!(batched.commitment(), split.commitment());
+    }
+
+    // Commitments are persisted and compared across nodes, so the exact bytes matter: pin them so
+    // any change to the hash, field order, or endianness fails loudly.
+    #[test]
+    fn commitments_are_stable_across_releases() {
+        let mut store = InMemoryStore::default();
+        store.apply(ExecutionOutput::success(vec![
+            Object::new(ObjectId::new(1), Version::new(1), vec![1, 2, 3]),
+            Object::new(ObjectId::new(2), Version::new(7), vec![]),
+        ]));
+
+        let hex: String = store
+            .commitment()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "bc3d1e39e90374f882e0c4ecc1b5f7f3ed4638ad3eeaa165fd86a768ec5224df"
+        );
     }
 }

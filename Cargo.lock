@@ -305,6 +305,8 @@ name = "execution"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake2",
+ "digest 0.10.7",
  "serde",
 ]
 
