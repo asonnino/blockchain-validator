@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+checkpoint.workspace = true
 dag.workspace = true
 execution.workspace = true
 eyre.workspace = true

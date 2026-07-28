@@ -5,6 +5,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use checkpoint::checkpoint::CheckpointChain;
 use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
     consensus::CommittedSubDag, context::Ctx, crypto::AsBytes, metrics::Metrics, storage::Storage,
@@ -84,6 +85,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
         let (sender, receiver) = mpsc::channel(COMMIT_CHANNEL_CAPACITY);
         Validator {
             scheduler: SequentialScheduler::new(self.engine),
+            checkpoints: CheckpointChain::default(),
             authority: self.authority,
             public_config: self.public_config,
             wal: self.wal,
@@ -96,6 +98,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
 /// A fully configured validator, ready to [`start`](Validator::start).
 pub struct Validator<E> {
     scheduler: SequentialScheduler<E>,
+    checkpoints: CheckpointChain,
     authority: Authority,
     public_config: PublicReplicaConfig,
     wal: Option<PathBuf>,
@@ -112,6 +115,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let replayed = self.replay()?;
         let Self {
             mut scheduler,
+            mut checkpoints,
             replica,
             mut receiver,
             ..
@@ -122,10 +126,10 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let driver = C::spawn(async move {
             let mut count = replayed;
             while let Some(subdag) = receiver.recv().await {
-                count += Self::execute_subdag(&mut scheduler, subdag) as u64;
+                count += Self::execute_subdag(&mut scheduler, &mut checkpoints, subdag) as u64;
                 let _ = executed_sender.send(count);
             }
-            scheduler
+            (scheduler, checkpoints)
         });
 
         Ok(ValidatorHandle {
@@ -159,17 +163,22 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 })
                 .collect::<eyre::Result<_>>()?;
             let subdag = CommittedSubDag::new(commit.leader, blocks);
-            replayed += Self::execute_subdag(&mut self.scheduler, subdag) as u64;
+            replayed +=
+                Self::execute_subdag(&mut self.scheduler, &mut self.checkpoints, subdag) as u64;
         }
         Ok(replayed)
     }
 
     /// Executes every transaction of a committed sub-dag in canonical order and returns how
     /// many were executed. Undecodable transactions are skipped; the choice is deterministic.
+    /// Sub-dags that execute nothing are not checkpointed: their commitment is unchanged, and
+    /// their count varies across validators at any executed-transaction cut.
     fn execute_subdag(
         scheduler: &mut SequentialScheduler<E>,
+        checkpoints: &mut CheckpointChain,
         mut subdag: CommittedSubDag,
     ) -> usize {
+        let anchor = subdag.anchor;
         subdag.sort();
         let transactions = subdag
             .blocks
@@ -180,7 +189,11 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                     .inspect_err(|error| tracing::warn!(?error, "skipping undecodable transaction"))
                     .ok()
             });
-        scheduler.execute(transactions).len()
+        let executed = scheduler.execute(transactions).len();
+        if executed > 0 {
+            checkpoints.push(anchor, scheduler.store().commitment());
+        }
+        executed
     }
 }
 
@@ -191,7 +204,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
 /// node runs unchanged under tokio and under the mysticeti simulator.
 pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     replica: ReplicaHandle<C>,
-    driver: C::JoinHandle<SequentialScheduler<E>>,
+    driver: C::JoinHandle<(SequentialScheduler<E>, CheckpointChain)>,
     executed: watch::Receiver<u64>,
 }
 
@@ -217,8 +230,8 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
     }
 
     /// Stops the replica, waits for the driver to drain the remaining commits, and returns the
-    /// scheduler with the executed state.
-    pub async fn shutdown(self) -> SequentialScheduler<E> {
+    /// scheduler with the executed state and the checkpoint chain.
+    pub async fn shutdown(self) -> (SequentialScheduler<E>, CheckpointChain) {
         // The returned syncer holds the consensus storage; the WAL outlives it on disk, which
         // is what replay on the next start relies on.
         let _syncer = self.replica.shutdown().await;

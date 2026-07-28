@@ -32,12 +32,15 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
         )
         .await;
     testbed.wait_for_transactions(2).await;
-    let schedulers = testbed.shutdown().await;
+    let results = testbed.shutdown().await;
 
-    let store = schedulers[0].store();
-    for scheduler in &schedulers {
+    let (reference, chain) = &results[0];
+    let store = reference.store();
+    for (scheduler, checkpoints) in &results {
         assert_eq!(scheduler.store(), store);
+        assert_eq!(checkpoints, chain);
     }
+    assert!(!chain.checkpoints().is_empty());
     let latest = store.latest(&id).expect("object must exist");
     assert_eq!(latest.version(), Version::new(2));
     assert_eq!(latest.contents(), FakeExecutor::NEW_OBJECT_CONTENT);

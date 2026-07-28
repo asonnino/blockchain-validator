@@ -7,6 +7,7 @@
 
 use std::{path::Path, time::Duration};
 
+use checkpoint::checkpoint::CheckpointChain;
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::{
     fake::{FakeExecutor, FakeTransaction},
@@ -81,12 +82,12 @@ impl SimulatedTestbed {
         }
     }
 
-    async fn shutdown(self) -> Vec<SequentialScheduler<FakeExecutor>> {
-        let mut schedulers = Vec::with_capacity(self.validators.len());
+    async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointChain)> {
+        let mut results = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
-            schedulers.push(validator.shutdown().await);
+            results.push(validator.shutdown().await);
         }
-        schedulers
+        results
     }
 }
 
@@ -115,7 +116,7 @@ async fn submission_loop(
     }
 }
 
-fn run_once(seed: u64) -> Vec<SequentialScheduler<FakeExecutor>> {
+fn run_once(seed: u64) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointChain)> {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
         let mut committee = SimulatedTestbed::start().await;
         let submissions = committee
@@ -134,12 +135,15 @@ fn run_once(seed: u64) -> Vec<SequentialScheduler<FakeExecutor>> {
 
 #[test]
 fn validators_converge_under_simulation() {
-    let schedulers = run_once(7);
+    let results = run_once(7);
 
-    let store = schedulers[0].store();
-    for scheduler in &schedulers {
+    let (reference, chain) = &results[0];
+    let store = reference.store();
+    for (scheduler, checkpoints) in &results {
         assert_eq!(scheduler.store(), store);
+        assert_eq!(checkpoints, chain);
     }
+    assert!(!chain.checkpoints().is_empty());
     // Every submitter's object was created and modified at least once.
     for index in 0..COMMITTEE_SIZE {
         let latest = store
@@ -154,12 +158,13 @@ fn simulation_is_deterministic_per_seed() {
     for seed in [7, 42] {
         let first = run_once(seed);
         let second = run_once(seed);
-        for (a, b) in first.iter().zip(&second) {
+        for ((a, a_chain), (b, b_chain)) in first.iter().zip(&second) {
             assert_eq!(
                 a.store(),
                 b.store(),
                 "seed {seed} produced diverging stores"
             );
+            assert_eq!(a_chain, b_chain, "seed {seed} produced diverging chains");
         }
     }
 }

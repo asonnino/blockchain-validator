@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 dag.workspace = true
 execution.workspace = true
+
+[dev-dependencies]
+dag = { workspace = true, features = ["test-utils"] }
