@@ -18,7 +18,7 @@ use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
 };
 use tokio::time;
-use validator::validator::Validator;
+use validator::validator::ValidatorBuilder;
 
 const COMMITTEE_SIZE: usize = 4;
 const PORT_OFFSET: u16 = 3000;
@@ -34,13 +34,15 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
 
     let mut validators = Vec::with_capacity(COMMITTEE_SIZE);
     for (index, private_config) in private_configs.into_iter().enumerate() {
-        let validator = Validator::<TokioCtx, _>::start(
+        let validator = ValidatorBuilder::new(
             FakeExecutor,
             Authority::from(index),
             public_config.clone(),
             private_config,
-            StorageKind::Ephemeral,
         )
+        .with_storage(StorageKind::Ephemeral)
+        .build()
+        .start::<TokioCtx>()
         .await
         .expect("validator must start");
         validators.push(validator);
