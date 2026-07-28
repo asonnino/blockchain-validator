@@ -1,11 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The validator node: a mysticeti replica wired to an execution engine.
+//! The validator node: a consensus replica wired to an execution engine.
+
+use std::sync::Arc;
 
 use dag::{
-    authority::Authority, block::transaction::Transaction as DagTransaction, context::Ctx,
-    crypto::AsBytes,
+    authority::Authority, block::transaction::Transaction as ConsensusTransaction,
+    consensus::CommittedSubDag, context::Ctx, crypto::AsBytes, metrics::Metrics,
+    sync::network::Network,
 };
 use execution::{
     engine::ExecutionEngine, scheduler::SequentialScheduler, transaction::Transaction,
@@ -13,7 +16,7 @@ use execution::{
 use replica::{
     builder::{ReplicaBuilder, StorageKind},
     config::{PrivateReplicaConfig, PublicReplicaConfig},
-    replica::ReplicaHandle,
+    replica::{Replica, ReplicaHandle},
 };
 use tokio::sync::{mpsc, watch};
 
@@ -21,36 +24,76 @@ use tokio::sync::{mpsc, watch};
 /// backpressure the replica rather than drop or reorder commits.
 const COMMIT_CHANNEL_CAPACITY: usize = 1024;
 
-/// A validator node: a mysticeti replica whose committed transactions are executed by an
-/// [`ExecutionEngine`] through a [`SequentialScheduler`].
+/// Builds a [`Validator`], delegating replica options to the underlying [`ReplicaBuilder`].
 ///
-/// The driver task owns the scheduler and every task is spawned through [`Ctx`], so the whole
-/// node runs unchanged under tokio and under the mysticeti simulator.
-pub struct Validator<C: Ctx, E: ExecutionEngine + Send + 'static> {
-    replica: ReplicaHandle<C>,
-    driver: C::JoinHandle<SequentialScheduler<E>>,
-    executed: watch::Receiver<u64>,
+/// Under the simulator, `with_network` and `with_metrics` are mandatory: the replica defaults
+/// bind real TCP and spawn onto the tokio runtime, neither of which exists there.
+pub struct ValidatorBuilder<E> {
+    engine: E,
+    replica: ReplicaBuilder,
 }
 
-impl<C: Ctx, E: ExecutionEngine + Send + 'static> Validator<C, E> {
-    /// Starts the replica and the driver task feeding its committed transactions, in commit
-    /// order, to the scheduler. Undecodable transactions are skipped; the choice is
-    /// deterministic since every validator sees the same bytes.
-    pub async fn start(
+impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
+    pub fn new(
         engine: E,
         authority: Authority,
         public_config: PublicReplicaConfig,
         private_config: PrivateReplicaConfig,
-        storage: StorageKind,
-    ) -> eyre::Result<Self> {
-        let (sender, mut receiver) = mpsc::channel(COMMIT_CHANNEL_CAPACITY);
-        let replica = ReplicaBuilder::new(authority, public_config, private_config)
-            .with_storage(storage)
-            .with_commit_consumer(sender)
-            .build()
-            .run::<C>()
-            .await?;
+    ) -> Self {
+        Self {
+            engine,
+            replica: ReplicaBuilder::new(authority, public_config, private_config),
+        }
+    }
 
+    pub fn with_storage(mut self, storage: StorageKind) -> Self {
+        self.replica = self.replica.with_storage(storage);
+        self
+    }
+
+    pub fn with_network(mut self, network: Network) -> Self {
+        self.replica = self.replica.with_network(network);
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.replica = self.replica.with_metrics(metrics);
+        self
+    }
+
+    pub fn with_crypto_disabled(mut self) -> Self {
+        self.replica = self.replica.with_crypto_disabled();
+        self
+    }
+
+    /// Assembles the validator: registers the commit consumer and builds the replica. No I/O
+    /// happens until [`Validator::start`].
+    pub fn build(self) -> Validator<E> {
+        let (sender, receiver) = mpsc::channel(COMMIT_CHANNEL_CAPACITY);
+        Validator {
+            engine: self.engine,
+            replica: self.replica.with_commit_consumer(sender).build(),
+            receiver,
+        }
+    }
+}
+
+/// A fully configured validator, ready to [`start`](Validator::start).
+pub struct Validator<E> {
+    engine: E,
+    replica: Replica,
+    receiver: mpsc::Receiver<CommittedSubDag>,
+}
+
+impl<E: ExecutionEngine + Send + 'static> Validator<E> {
+    /// Starts the replica and the driver task feeding its committed transactions, in commit
+    /// order, to the scheduler. Undecodable transactions are skipped; the choice is
+    /// deterministic since every validator sees the same bytes.
+    pub async fn start<C: Ctx>(self) -> eyre::Result<ValidatorHandle<C, E>> {
+        let replica = self.replica.run::<C>().await?;
+
+        let engine = self.engine;
+        let mut receiver = self.receiver;
         let (executed_sender, executed) = watch::channel(0);
         let driver = C::spawn(async move {
             let mut scheduler = SequentialScheduler::new(engine);
@@ -74,19 +117,32 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> Validator<C, E> {
             scheduler
         });
 
-        Ok(Self {
+        Ok(ValidatorHandle {
             replica,
             driver,
             executed,
         })
     }
+}
 
-    /// Submits transactions to the replica; resolves once they are queued for inclusion in a
-    /// block, not once they are committed or executed.
+/// A handle to a running validator: a consensus replica whose committed transactions are
+/// executed by an [`ExecutionEngine`] through a [`SequentialScheduler`].
+///
+/// The driver task owns the scheduler and every task is spawned through [`Ctx`], so the whole
+/// node runs unchanged under tokio and under the mysticeti simulator.
+pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
+    replica: ReplicaHandle<C>,
+    driver: C::JoinHandle<SequentialScheduler<E>>,
+    executed: watch::Receiver<u64>,
+}
+
+impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
+    /// Submits transactions; resolves once they are queued for inclusion in a block, not once
+    /// they are committed or executed. Errors only if the replica has shut down.
     pub async fn submit(&self, transactions: Vec<Transaction>) -> eyre::Result<()> {
         let transactions = transactions
             .iter()
-            .map(|transaction| DagTransaction::new(transaction.to_bytes().into()))
+            .map(|transaction| ConsensusTransaction::new(transaction.to_bytes().into()))
             .collect();
         self.replica.submit(transactions).await
     }
@@ -94,13 +150,19 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> Validator<C, E> {
     /// Waits until at least `count` transactions have been executed. Returns early if the
     /// driver has stopped.
     pub async fn wait_for_transactions(&mut self, count: u64) {
-        while *self.executed.borrow_and_update() < count && self.executed.changed().await.is_ok() {}
+        while *self.executed.borrow_and_update() < count {
+            if self.executed.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Stops the replica, waits for the driver to drain the remaining commits, and returns the
     /// scheduler with the executed state.
     pub async fn shutdown(self) -> SequentialScheduler<E> {
-        drop(self.replica.shutdown().await);
+        // The returned syncer holds the consensus storage; recovery will need it, execution
+        // state does not.
+        let _syncer = self.replica.shutdown().await;
         self.driver.await.expect("driver task failed")
     }
 }

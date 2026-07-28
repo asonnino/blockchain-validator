@@ -45,7 +45,10 @@ a rev in the workspace `Cargo.toml`; bump the rev everywhere at once.
   `pip install pre-commit && pre-commit install`. If a hook fails, fix the
   underlying issue rather than bypassing the hook.
 - Commit messages and PR titles follow Conventional Commits (enforced in CI).
-- Lines are capped at 100 characters (`.editorconfig`).
+- Lines are capped at 100 characters (`.editorconfig`); fill the width in comments.
+- Prefer short, minimal comments and doc comments: state only what the code cannot say
+  itself, document each semantic in one place (don't repeat it across files), and add
+  functions/derives/APIs only when something uses them.
 - When mysticeti internals are unclear, read the sister repo directly —
   `docs/architecture.md` there documents the crate seams and the
   transaction-input / commit-output contract.
