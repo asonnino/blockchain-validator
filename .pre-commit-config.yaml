@@ -68,7 +68,7 @@ repos:
       - id: clippy
         name: clippy
         entry: cargo clippy
-        args: ["--tests", "--", "-D", "warnings"]
+        args: ["--all-targets", "--", "-D", "warnings"]
         language: system
         files: *rust-files-pattern
         pass_filenames: false

@@ -14,5 +14,12 @@ tracing.workspace = true
 test-utils = ["dag/test-utils", "execution/test-utils"]
 
 [dev-dependencies]
+# Self-dependency turning on the gated test constructors for the bench targets.
+checkpoint = { workspace = true, features = ["test-utils"] }
+criterion.workspace = true
 dag = { workspace = true, features = ["test-utils"] }
 execution = { workspace = true, features = ["test-utils"] }
+
+[[bench]]
+name = "certifier"
+harness = false
