@@ -1,19 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Client transactions and their byte codec.
+//! Client transactions.
 
-use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     object::{ObjectId, Version},
     store::StateView,
 };
-
-/// Transactions larger than this fail to decode. Bounds the allocations a malformed length
-/// prefix can request, since transaction bytes come from untrusted clients via consensus.
-pub const MAX_TRANSACTION_SIZE: u64 = 1024 * 1024;
 
 /// A fixed-size reference to the function a transaction invokes.
 ///
@@ -79,22 +74,6 @@ impl Transaction {
         &self.inputs
     }
 
-    /// Encodes the transaction into the opaque bytes carried by consensus.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("Serialization should not fail")
-    }
-
-    /// Decodes a transaction from consensus payload bytes.
-    pub fn from_bytes(bytes: &[u8]) -> bincode::Result<Self> {
-        // Same format as `bincode::serialize` (fixint, trailing bytes tolerated), plus the
-        // size limit.
-        bincode::options()
-            .with_fixint_encoding()
-            .allow_trailing_bytes()
-            .with_limit(MAX_TRANSACTION_SIZE)
-            .deserialize_from(bytes)
-    }
-
     /// Statically verifies the transaction, independently of any state.
     pub fn verify(&self) -> bool {
         // No duplicate ids in the inputs list.
@@ -129,32 +108,6 @@ mod tests {
         object::ObjectId,
         transaction::{AccessMode, FunctionId, Transaction},
     };
-
-    #[test]
-    fn transactions_roundtrip_through_bytes() {
-        let transaction = Transaction::new(
-            FunctionId::new(7),
-            vec![
-                (ObjectId::new(1), AccessMode::ReadOnly),
-                (ObjectId::new(2), AccessMode::WriteOnly),
-            ],
-            vec![1, 2, 3],
-        );
-        let decoded = Transaction::from_bytes(&transaction.to_bytes()).unwrap();
-        assert_eq!(decoded, transaction);
-    }
-
-    #[test]
-    fn garbage_bytes_fail_to_decode() {
-        assert!(Transaction::from_bytes(&[0xFF]).is_err());
-    }
-
-    #[test]
-    fn oversized_transactions_fail_to_decode() {
-        let args = vec![0; 2 * super::MAX_TRANSACTION_SIZE as usize];
-        let transaction = Transaction::new(FunctionId::new(7), vec![], args);
-        assert!(Transaction::from_bytes(&transaction.to_bytes()).is_err());
-    }
 
     #[test]
     fn function_ids_encode_like_object_ids() {

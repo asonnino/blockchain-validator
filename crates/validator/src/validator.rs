@@ -21,6 +21,8 @@ use replica::{
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::envelope::{Envelope, Payload};
+
 /// Capacity of the commit stream; a bounded channel is mandatory — a slow consumer must
 /// backpressure the replica rather than drop or reorder commits.
 const COMMIT_CHANNEL_CAPACITY: usize = 1024;
@@ -177,7 +179,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
     }
 
     /// Executes every transaction of a committed sub-dag in canonical order and returns how
-    /// many were executed. Undecodable transactions are skipped; the choice is deterministic.
+    /// many were executed. Undecodable payloads are skipped; the choice is deterministic.
     /// Sub-dags that execute nothing are not checkpointed: their commitment is unchanged, and
     /// their count varies across validators at any executed-transaction cut.
     fn execute_subdag(
@@ -191,10 +193,14 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             .blocks
             .iter()
             .flat_map(|block| block.transactions())
-            .filter_map(|transaction| {
-                Transaction::from_bytes(transaction.as_bytes())
-                    .inspect_err(|error| tracing::warn!(?error, "skipping undecodable transaction"))
+            .filter_map(|payload| {
+                Envelope::from_bytes(payload.as_bytes())
+                    .inspect_err(|error| tracing::warn!(?error, "skipping undecodable payload"))
                     .ok()
+            })
+            .map(|envelope| {
+                let Payload::Execute(transaction) = envelope.into_payload();
+                transaction
             });
         let executed = scheduler.execute(transactions).len();
         if executed > 0 {
@@ -217,11 +223,17 @@ pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
 
 impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
     /// Submits transactions to the replica; resolves once they are queued for inclusion in a
-    /// block, not once they are committed or executed.
+    /// block, not once they are committed or executed. Every payload is stamped with the
+    /// submission time (one clock read per batch), from which mysticeti derives its
+    /// commit-latency metric.
     pub async fn submit(&self, transactions: Vec<Transaction>) -> eyre::Result<()> {
+        let timestamp_ms = C::timestamp_utc().as_millis() as u64;
         let transactions = transactions
-            .iter()
-            .map(|transaction| ConsensusTransaction::new(transaction.to_bytes().into()))
+            .into_iter()
+            .map(|transaction| {
+                let envelope = Envelope::new(timestamp_ms, Payload::Execute(transaction));
+                ConsensusTransaction::new(envelope.to_bytes().into())
+            })
             .collect();
         self.replica.submit(transactions).await
     }
@@ -243,5 +255,72 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
         // is what replay on the next start relies on.
         let _syncer = self.replica.shutdown().await;
         self.driver.await.expect("driver task failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use checkpoint::certifier::CheckpointCertifier;
+    use dag::{
+        authority::Authority,
+        block::{Block, data::Data, transaction::Transaction as ConsensusTransaction},
+        consensus::CommittedSubDag,
+        crypto::CryptoEngine,
+    };
+    use execution::{
+        fake::{FakeExecutor, FakeTransaction},
+        object::ObjectId,
+        scheduler::SequentialScheduler,
+    };
+
+    use crate::{
+        envelope::{Envelope, Payload},
+        validator::Validator,
+    };
+
+    /// A single-block sub-dag carrying the given raw payloads.
+    fn subdag(payloads: Vec<Vec<u8>>) -> CommittedSubDag {
+        let transactions = payloads
+            .into_iter()
+            .map(|bytes| ConsensusTransaction::new(bytes.into()))
+            .collect();
+        let block = Block::new(
+            Authority::from(0usize),
+            1,
+            vec![],
+            transactions,
+            0,
+            &CryptoEngine::disabled(),
+        );
+        CommittedSubDag::new(*block.reference(), vec![Data::new(block)])
+    }
+
+    #[test]
+    fn undecodable_payloads_are_skipped() {
+        let mut scheduler = SequentialScheduler::new(FakeExecutor);
+        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+        let transaction = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
+        let valid = Envelope::new(0, Payload::Execute(transaction.into())).to_bytes();
+
+        let executed = Validator::execute_subdag(
+            &mut scheduler,
+            &mut certifier,
+            subdag(vec![vec![0xFF; 16], valid]),
+        );
+
+        assert_eq!(executed, 1);
+        assert_eq!(certifier.pending().count(), 1);
+    }
+
+    #[test]
+    fn subdags_with_only_undecodable_payloads_mint_no_checkpoint() {
+        let mut scheduler = SequentialScheduler::new(FakeExecutor);
+        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+
+        let executed =
+            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag(vec![vec![0xFF; 16]]));
+
+        assert_eq!(executed, 0);
+        assert_eq!(certifier.pending().count(), 0);
     }
 }

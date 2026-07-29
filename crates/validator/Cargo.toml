@@ -6,15 +6,18 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bincode.workspace = true
 checkpoint.workspace = true
 dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
 replica.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+checkpoint = { workspace = true, features = ["test-utils"] }
 execution = { workspace = true, features = ["test-utils"] }
 futures.workspace = true
 rand.workspace = true

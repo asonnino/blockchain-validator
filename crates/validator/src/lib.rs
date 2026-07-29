@@ -6,4 +6,5 @@
 //! Glue in the spirit of sui-node: builds the consensus replica and wires its committed
 //! sub-dags into the execution scheduler. Checkpointing comes later.
 
+pub mod envelope;
 pub mod validator;

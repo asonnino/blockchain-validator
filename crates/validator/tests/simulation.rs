@@ -5,7 +5,7 @@
 //! Unlike the smoke test, every validator submits through its own replica, so the total order
 //! of transactions is genuinely decided by consensus across concurrent proposers.
 
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use checkpoint::certifier::CheckpointCertifier;
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
@@ -34,6 +34,7 @@ struct SimulatedTestbed {
     /// Dropping the network silently severs all connections.
     _network: SimulatedNetwork,
     validators: Vec<ValidatorHandle<SimulatorContext, FakeExecutor>>,
+    metrics: Vec<Arc<Metrics>>,
 }
 
 impl SimulatedTestbed {
@@ -45,9 +46,12 @@ impl SimulatedTestbed {
             PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), COMMITTEE_SIZE);
 
         let mut validators = Vec::with_capacity(COMMITTEE_SIZE);
+        let mut metrics = Vec::with_capacity(COMMITTEE_SIZE);
         for (index, (node_network, private_config)) in
             node_networks.into_iter().zip(private_configs).enumerate()
         {
+            let node_metrics = Metrics::new_for_test(COMMITTEE_SIZE);
+            metrics.push(node_metrics.clone());
             let validator = ValidatorBuilder::new(
                 FakeExecutor,
                 Authority::from(index),
@@ -56,7 +60,7 @@ impl SimulatedTestbed {
             )
             .with_storage(StorageKind::Ephemeral)
             .with_crypto_disabled()
-            .with_metrics(Metrics::new_for_test(COMMITTEE_SIZE))
+            .with_metrics(node_metrics)
             .with_network(node_network)
             .build()
             .expect("validator must build")
@@ -70,6 +74,7 @@ impl SimulatedTestbed {
         Self {
             _network: network,
             validators,
+            metrics,
         }
     }
 
@@ -117,7 +122,12 @@ async fn submission_loop(
     }
 }
 
-fn run_once(seed: u64) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
+type RunOutcome = (
+    Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)>,
+    Vec<Arc<Metrics>>,
+);
+
+fn run_once(seed: u64) -> RunOutcome {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
         let mut committee = SimulatedTestbed::start().await;
         let submissions = committee
@@ -130,13 +140,28 @@ fn run_once(seed: u64) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCert
         // Every submitted transaction executes (success or abort), so the cut is exact.
         let total = (COMMITTEE_SIZE * (STATE_UPDATES + 1)) as u64;
         committee.wait_for_transactions(total).await;
-        committee.shutdown().await
+        let metrics = committee.metrics.clone();
+        (committee.shutdown().await, metrics)
     })
 }
 
 #[test]
 fn validators_converge_under_simulation() {
-    let results = run_once(7);
+    let (results, metrics) = run_once(7);
+
+    // Commit latency derives from the envelope timestamps: positive, and bounded well below
+    // the several simulated seconds the submissions span — unstamped payloads would instead
+    // record "commit time − epoch", which grows with the run.
+    for metrics in &metrics {
+        let p50 = metrics
+            .collect()
+            .latency_percentile_ms(0.5)
+            .expect("commit-latency histogram must be populated");
+        assert!(
+            p50 > 0.0 && p50 < 2_000.0,
+            "implausible commit latency: {p50} ms"
+        );
+    }
 
     let (reference, certifier) = &results[0];
     let store = reference.store();
@@ -159,8 +184,8 @@ fn validators_converge_under_simulation() {
 #[test]
 fn simulation_is_deterministic_per_seed() {
     for seed in [7, 42] {
-        let first = run_once(seed);
-        let second = run_once(seed);
+        let (first, _) = run_once(seed);
+        let (second, _) = run_once(seed);
         for ((a, a_certifier), (b, b_certifier)) in first.iter().zip(&second) {
             assert_eq!(
                 a.store(),
