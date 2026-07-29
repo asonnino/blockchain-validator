@@ -8,6 +8,11 @@ publish.workspace = true
 [dependencies]
 dag.workspace = true
 execution.workspace = true
+tracing.workspace = true
+
+[features]
+test-utils = ["dag/test-utils", "execution/test-utils"]
 
 [dev-dependencies]
 dag = { workspace = true, features = ["test-utils"] }
+execution = { workspace = true, features = ["test-utils"] }

@@ -19,4 +19,10 @@ impl Digest {
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// An arbitrary digest distinct per `byte`, for tests that need unequal commitments.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_test(byte: u8) -> Self {
+        Self([byte; 32])
+    }
 }
