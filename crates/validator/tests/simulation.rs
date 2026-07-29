@@ -88,6 +88,13 @@ impl SimulatedTestbed {
         }
     }
 
+    /// Waits until everything executed is certified; call after an executed-count cut.
+    async fn wait_for_certified(&mut self) {
+        for validator in &mut self.validators {
+            validator.wait_for_certified().await;
+        }
+    }
+
     async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
         let mut results = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
@@ -140,6 +147,7 @@ fn run_once(seed: u64) -> RunOutcome {
         // Every submitted transaction executes (success or abort), so the cut is exact.
         let total = (COMMITTEE_SIZE * (STATE_UPDATES + 1)) as u64;
         committee.wait_for_transactions(total).await;
+        committee.wait_for_certified().await;
         let metrics = committee.metrics.clone();
         (committee.shutdown().await, metrics)
     })
@@ -165,13 +173,17 @@ fn validators_converge_under_simulation() {
 
     let (reference, certifier) = &results[0];
     let store = reference.store();
-    // Without vote submission (arriving with the payload envelope), every minted checkpoint
-    // stays pending; equal pending chains are the divergence check.
+    let certified = certifier
+        .highest_certified()
+        .expect("everything executed is certified");
+    assert_eq!(certified.checkpoint().commitment(), store.commitment());
+    // Certification is a deterministic function of the commit stream: every validator holds
+    // the same byte-identical certificate and an empty pending window.
     for (scheduler, other) in &results {
         assert_eq!(scheduler.store(), store);
-        assert!(other.pending().eq(certifier.pending()));
+        assert_eq!(other.highest_certified(), Some(certified));
+        assert!(other.pending().next().is_none());
     }
-    assert!(certifier.pending().next().is_some());
     // Every submitter's object was created and modified at least once.
     for index in 0..COMMITTEE_SIZE {
         let latest = store
@@ -192,9 +204,10 @@ fn simulation_is_deterministic_per_seed() {
                 b.store(),
                 "seed {seed} produced diverging stores"
             );
-            assert!(
-                a_certifier.pending().eq(b_certifier.pending()),
-                "seed {seed} produced diverging checkpoints"
+            assert_eq!(
+                a_certifier.highest_certified(),
+                b_certifier.highest_certified(),
+                "seed {seed} produced diverging certificates"
             );
         }
     }

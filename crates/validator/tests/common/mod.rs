@@ -88,6 +88,16 @@ impl Testbed {
         }
     }
 
+    /// Waits until everything executed is certified on every validator; call after an
+    /// executed-count cut.
+    pub async fn wait_for_certified(&mut self) {
+        for validator in &mut self.validators {
+            time::timeout(TIMEOUT, validator.wait_for_certified())
+                .await
+                .expect("timed out waiting for certification");
+        }
+    }
+
     /// Stops every validator and returns the schedulers with their executed state and
     /// checkpoint certifiers.
     pub async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {

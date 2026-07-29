@@ -192,6 +192,7 @@ dependencies = [
  "criterion",
  "dag",
  "execution",
+ "serde",
  "tracing",
 ]
 

@@ -5,14 +5,15 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use checkpoint::certifier::CheckpointCertifier;
+use checkpoint::{certifier::CheckpointCertifier, checkpoint::Checkpoint};
 use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
     consensus::CommittedSubDag, context::Ctx, crypto::AsBytes, metrics::Metrics, storage::Storage,
     sync::network::Network,
 };
 use execution::{
-    engine::ExecutionEngine, scheduler::SequentialScheduler, transaction::Transaction,
+    crypto::Digest, engine::ExecutionEngine, scheduler::SequentialScheduler,
+    transaction::Transaction,
 };
 use replica::{
     builder::{ReplicaBuilder, StorageKind},
@@ -131,12 +132,29 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         } = self;
 
         let replica = replica.run::<C>().await?;
+        let client = replica.transaction_client();
         let (executed_sender, executed) = watch::channel(replayed);
+        let (certified_sender, certified) =
+            watch::channel(Self::certification_status(&certifier, &scheduler));
         let driver = C::spawn(async move {
             let mut count = replayed;
             while let Some(subdag) = receiver.recv().await {
-                count += Self::execute_subdag(&mut scheduler, &mut certifier, subdag) as u64;
+                let (executed, minted) =
+                    Self::execute_subdag(&mut scheduler, &mut certifier, subdag);
+                count += executed as u64;
                 let _ = executed_sender.send(count);
+                let _ = certified_sender.send(Self::certification_status(&certifier, &scheduler));
+                // Attest to the minted checkpoint through consensus: the vote rides this
+                // validator's own signed blocks. Failure is benign — the replica is shutting
+                // down, and lost votes are resubmitted after replay.
+                if let Some(checkpoint) = minted {
+                    let timestamp_ms = C::timestamp_utc().as_millis() as u64;
+                    let envelope = Envelope::new(timestamp_ms, Payload::Attest(checkpoint));
+                    let attestation = ConsensusTransaction::new(envelope.to_bytes().into());
+                    if client.submit(vec![attestation]).await.is_err() {
+                        tracing::debug!("attestation submission failed; shutting down");
+                    }
+                }
             }
             (scheduler, certifier)
         });
@@ -145,6 +163,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             replica,
             driver,
             executed,
+            certified,
         })
     }
 
@@ -172,41 +191,76 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 })
                 .collect::<eyre::Result<_>>()?;
             let subdag = CommittedSubDag::new(commit.leader, blocks);
-            replayed +=
-                Self::execute_subdag(&mut self.scheduler, &mut self.certifier, subdag) as u64;
+            // The minted checkpoint is dropped: replay never submits votes.
+            let (executed, _) =
+                Self::execute_subdag(&mut self.scheduler, &mut self.certifier, subdag);
+            replayed += executed as u64;
         }
         Ok(replayed)
     }
 
-    /// Executes every transaction of a committed sub-dag in canonical order and returns how
-    /// many were executed. Undecodable payloads are skipped; the choice is deterministic.
-    /// Sub-dags that execute nothing are not checkpointed: their commitment is unchanged, and
-    /// their count varies across validators at any executed-transaction cut.
+    /// Executes every transaction of a committed sub-dag in canonical order, dispatches its
+    /// checkpoint votes to the certifier, and returns how many transactions were executed
+    /// together with the checkpoint this sub-dag minted, if any. Undecodable payloads are
+    /// skipped; the choice is deterministic. Sub-dags that execute nothing are not
+    /// checkpointed: their commitment is unchanged, and their count varies across validators
+    /// at any executed-transaction cut.
     fn execute_subdag(
         scheduler: &mut SequentialScheduler<E>,
         certifier: &mut CheckpointCertifier,
         mut subdag: CommittedSubDag,
-    ) -> usize {
+    ) -> (usize, Option<Checkpoint>) {
         let anchor = subdag.anchor;
         subdag.sort();
+        // Votes are attributed to the block author: they ride their author's own signed
+        // blocks, so no authority can forge another's vote.
+        let mut votes = Vec::new();
         let transactions = subdag
             .blocks
             .iter()
-            .flat_map(|block| block.transactions())
-            .filter_map(|payload| {
-                Envelope::from_bytes(payload.as_bytes())
-                    .inspect_err(|error| tracing::warn!(?error, "skipping undecodable payload"))
-                    .ok()
+            .flat_map(|block| {
+                let author = block.author();
+                block
+                    .transactions()
+                    .iter()
+                    .map(move |payload| (author, payload))
             })
-            .map(|envelope| {
-                let Payload::Execute(transaction) = envelope.into_payload();
-                transaction
+            .filter_map(|(author, payload)| {
+                let envelope = Envelope::from_bytes(payload.as_bytes())
+                    .inspect_err(|error| tracing::warn!(?error, "skipping undecodable payload"))
+                    .ok()?;
+                match envelope.into_payload() {
+                    Payload::Execute(transaction) => Some(transaction),
+                    Payload::Attest(vote) => {
+                        votes.push((author, vote));
+                        None
+                    }
+                }
             });
         let executed = scheduler.execute(transactions).len();
-        if executed > 0 {
-            certifier.push(anchor, scheduler.store().commitment());
+        let minted = (executed > 0).then(|| {
+            certifier
+                .push(anchor, scheduler.store().commitment())
+                .clone()
+        });
+        // A vote can never reference its own delivering sub-dag's checkpoint (it is created
+        // only after that sub-dag commits), so recording after minting loses nothing.
+        for (author, vote) in votes {
+            certifier.record(anchor, author, vote);
         }
-        executed
+        (executed, minted)
+    }
+
+    /// The pair consumed by [`ValidatorHandle::wait_for_certified`]: the highest certified
+    /// commitment beside the store commitment at the same instant.
+    fn certification_status(
+        certifier: &CheckpointCertifier,
+        scheduler: &SequentialScheduler<E>,
+    ) -> (Option<Digest>, Digest) {
+        let certified = certifier
+            .highest_certified()
+            .map(|certificate| certificate.checkpoint().commitment());
+        (certified, scheduler.store().commitment())
     }
 }
 
@@ -219,6 +273,7 @@ pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     replica: ReplicaHandle<C>,
     driver: C::JoinHandle<(SequentialScheduler<E>, CheckpointCertifier)>,
     executed: watch::Receiver<u64>,
+    certified: watch::Receiver<(Option<Digest>, Digest)>,
 }
 
 impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
@@ -243,6 +298,23 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
     pub async fn wait_for_transactions(&mut self, count: u64) {
         while *self.executed.borrow_and_update() < count {
             if self.executed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Waits until everything executed is certified: the highest certified commitment equals
+    /// the store commitment. Equality is transient while submissions are in flight, so this is
+    /// meaningful after an executed-count cut ([`wait_for_transactions`]
+    /// (ValidatorHandle::wait_for_transactions) first). Returns early if the driver has
+    /// stopped.
+    pub async fn wait_for_certified(&mut self) {
+        loop {
+            let (certified, store) = *self.certified.borrow_and_update();
+            if certified == Some(store) {
+                return;
+            }
+            if self.certified.changed().await.is_err() {
                 return;
             }
         }
@@ -278,21 +350,33 @@ mod tests {
         validator::Validator,
     };
 
+    /// A sub-dag at `round` with one block per `(author, payloads)` entry, anchored at the
+    /// first block.
+    fn subdag_at(round: u64, blocks: Vec<(usize, Vec<Vec<u8>>)>) -> CommittedSubDag {
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .map(|(author, payloads)| {
+                let transactions = payloads
+                    .into_iter()
+                    .map(|bytes| ConsensusTransaction::new(bytes.into()))
+                    .collect();
+                let block = Block::new(
+                    Authority::from(author),
+                    round,
+                    vec![],
+                    transactions,
+                    0,
+                    &CryptoEngine::disabled(),
+                );
+                Data::new(block)
+            })
+            .collect();
+        CommittedSubDag::new(*blocks[0].reference(), blocks)
+    }
+
     /// A single-block sub-dag carrying the given raw payloads.
     fn subdag(payloads: Vec<Vec<u8>>) -> CommittedSubDag {
-        let transactions = payloads
-            .into_iter()
-            .map(|bytes| ConsensusTransaction::new(bytes.into()))
-            .collect();
-        let block = Block::new(
-            Authority::from(0usize),
-            1,
-            vec![],
-            transactions,
-            0,
-            &CryptoEngine::disabled(),
-        );
-        CommittedSubDag::new(*block.reference(), vec![Data::new(block)])
+        subdag_at(1, vec![(0, payloads)])
     }
 
     #[test]
@@ -302,13 +386,14 @@ mod tests {
         let transaction = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
         let valid = Envelope::new(0, Payload::Execute(transaction.into())).to_bytes();
 
-        let executed = Validator::execute_subdag(
+        let (executed, minted) = Validator::execute_subdag(
             &mut scheduler,
             &mut certifier,
             subdag(vec![vec![0xFF; 16], valid]),
         );
 
         assert_eq!(executed, 1);
+        assert!(minted.is_some());
         assert_eq!(certifier.pending().count(), 1);
     }
 
@@ -317,10 +402,72 @@ mod tests {
         let mut scheduler = SequentialScheduler::new(FakeExecutor);
         let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
 
-        let executed =
+        let (executed, minted) =
             Validator::execute_subdag(&mut scheduler, &mut certifier, subdag(vec![vec![0xFF; 16]]));
 
         assert_eq!(executed, 0);
+        assert!(minted.is_none());
         assert_eq!(certifier.pending().count(), 0);
+    }
+
+    #[test]
+    fn a_quorum_of_attestations_certifies_and_mints_nothing() {
+        let mut scheduler = SequentialScheduler::new(FakeExecutor);
+        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+        let transaction = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
+        let execute = Envelope::new(0, Payload::Execute(transaction.into())).to_bytes();
+        let (_, minted) =
+            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag(vec![execute]));
+        let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
+
+        // A quorum of votes delivered in a later sub-dag, one block per author.
+        let votes = (0..3)
+            .map(|author| {
+                let vote = Envelope::new(0, Payload::Attest(checkpoint.clone())).to_bytes();
+                (author, vec![vote])
+            })
+            .collect();
+        let delivering = subdag_at(2, votes);
+        let anchor = delivering.anchor;
+        let (executed, minted) =
+            Validator::execute_subdag(&mut scheduler, &mut certifier, delivering);
+
+        assert_eq!(executed, 0);
+        assert!(minted.is_none());
+        let certified = certifier.highest_certified().expect("quorum must certify");
+        assert_eq!(certified.checkpoint(), &checkpoint);
+        // The proof records the delivering sub-dag's anchor per counted vote.
+        assert_eq!(certified.proof(), [anchor; 3]);
+        assert!(certifier.pending().next().is_none());
+    }
+
+    #[test]
+    fn mixed_subdags_execute_mint_and_certify_together() {
+        let mut scheduler = SequentialScheduler::new(FakeExecutor);
+        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+        let create = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
+        let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
+        let (_, minted) =
+            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag(vec![execute]));
+        let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
+
+        // Votes for the first checkpoint share the sub-dag with a fresh transaction.
+        let vote = || Envelope::new(0, Payload::Attest(checkpoint.clone())).to_bytes();
+        let update = FakeTransaction::success(vec![], vec![], vec![ObjectId::new(1)]);
+        let update = Envelope::new(0, Payload::Execute(update.into())).to_bytes();
+        let blocks = vec![
+            (0, vec![vote(), update]),
+            (1, vec![vote()]),
+            (2, vec![vote()]),
+        ];
+        let (executed, minted) =
+            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag_at(2, blocks));
+
+        assert_eq!(executed, 1);
+        assert!(minted.is_some());
+        let certified = certifier.highest_certified().expect("quorum must certify");
+        assert_eq!(certified.checkpoint(), &checkpoint);
+        // The prior checkpoint certified and was reclaimed; only the new mint is pending.
+        assert_eq!(certifier.pending().count(), 1);
     }
 }

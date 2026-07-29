@@ -4,6 +4,7 @@
 //! The consensus payload envelope and its byte codec.
 
 use bincode::Options;
+use checkpoint::checkpoint::Checkpoint;
 use execution::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,8 @@ pub struct Envelope {
 pub enum Payload {
     /// A client transaction bound for the execution engine.
     Execute(Transaction),
+    /// A checkpoint vote bound for the certifier, attributed to the block author.
+    Attest(Checkpoint),
 }
 
 impl Envelope {
@@ -64,6 +67,7 @@ impl Envelope {
 mod tests {
     use std::time::Duration;
 
+    use checkpoint::checkpoint::Checkpoint;
     use dag::block::transaction::Transaction as ConsensusTransaction;
     use execution::transaction::{FunctionId, Transaction};
 
@@ -77,6 +81,13 @@ mod tests {
     #[test]
     fn envelopes_roundtrip_through_bytes() {
         let envelope = envelope(1234, vec![1, 2, 3]);
+        let decoded = Envelope::from_bytes(&envelope.to_bytes()).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn attestations_roundtrip_through_bytes() {
+        let envelope = Envelope::new(1234, Payload::Attest(Checkpoint::new_for_test(1)));
         let decoded = Envelope::from_bytes(&envelope.to_bytes()).unwrap();
         assert_eq!(decoded, envelope);
     }

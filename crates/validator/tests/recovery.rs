@@ -31,16 +31,23 @@ async fn restarted_committee_recovers_execution_state() {
     );
     testbed.submit(0, transactions).await;
     testbed.wait_for_transactions(total).await;
+    // Halt only once everything is certified: the run then loses no in-flight votes, so
+    // replay alone rebuilds the certified watermark (re-attestation is a separate concern).
+    testbed.wait_for_certified().await;
     let references = testbed.shutdown().await;
 
-    // Restart on the same WALs: replay must rebuild the executed count without new commits.
+    // Restart on the same WALs: replay must rebuild the executed count and the certified
+    // watermark without new commits — the WAL's post-cut sub-dags carry only attestations,
+    // which mint nothing.
     let mut testbed = Testbed::start_with_wal(dir.path(), 3200).await;
     testbed.wait_for_transactions(total).await;
+    testbed.wait_for_certified().await;
 
     // The restarted committee stays live: one more update commits and executes everywhere.
     let update = FakeTransaction::success(vec![], vec![], vec![id]).into();
     testbed.submit(0, vec![update]).await;
     testbed.wait_for_transactions(total + 1).await;
+    testbed.wait_for_certified().await;
     let rebuilt = testbed.shutdown().await;
 
     assert_eq!(references.len(), rebuilt.len());
@@ -57,22 +64,32 @@ async fn restarted_committee_recovers_execution_state() {
         // ...and the post-restart update landed on top of it.
         let latest = rebuilt.store().latest(&id).expect("object must exist");
         assert_eq!(latest.version(), Version::new(total + 1));
-        // Without vote submission every minted checkpoint stays pending. The reference
-        // checkpoints are a prefix of the rebuilt ones: replay reproduced them, then the
-        // post-restart update appended. Prefix rather than equality guards the edge where the
-        // WAL holds a final commit the pre-shutdown driver never received.
-        let reference_count = reference_certifier.pending().count();
-        assert!(rebuilt_certifier.pending().count() > reference_count);
-        assert!(
-            reference_certifier
-                .pending()
-                .eq(rebuilt_certifier.pending().take(reference_count))
+        // Replay rebuilt the certified watermark from the WAL's ordered votes, and the
+        // post-restart checkpoint certified on top of it.
+        let reference_certified = reference_certifier
+            .highest_certified()
+            .expect("first run halts certified");
+        let rebuilt_certified = rebuilt_certifier
+            .highest_certified()
+            .expect("restarted run halts certified");
+        assert_eq!(
+            reference_certified.checkpoint().commitment(),
+            reference.store().commitment()
         );
+        assert_eq!(
+            rebuilt_certified.checkpoint().commitment(),
+            rebuilt.store().commitment()
+        );
+        assert!(rebuilt_certified.round() > reference_certified.round());
     }
     let (first, first_certifier) = &rebuilt[0];
     let store = first.store();
     for (scheduler, certifier) in &rebuilt {
         assert_eq!(scheduler.store(), store);
-        assert!(certifier.pending().eq(first_certifier.pending()));
+        assert_eq!(
+            certifier.highest_certified(),
+            first_certifier.highest_certified()
+        );
+        assert!(certifier.pending().next().is_none());
     }
 }

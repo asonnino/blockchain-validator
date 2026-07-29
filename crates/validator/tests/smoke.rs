@@ -32,17 +32,22 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
         )
         .await;
     testbed.wait_for_transactions(2).await;
+    testbed.wait_for_certified().await;
     let results = testbed.shutdown().await;
 
     let (reference, certifier) = &results[0];
     let store = reference.store();
-    // Without vote submission (arriving with the payload envelope), every minted checkpoint
-    // stays pending; equal pending chains are the divergence check.
+    let certified = certifier
+        .highest_certified()
+        .expect("everything executed is certified");
+    assert_eq!(certified.checkpoint().commitment(), store.commitment());
+    // Certification is a deterministic function of the commit stream: every validator holds
+    // the same byte-identical certificate and an empty pending window.
     for (scheduler, other) in &results {
         assert_eq!(scheduler.store(), store);
-        assert!(other.pending().eq(certifier.pending()));
+        assert_eq!(other.highest_certified(), Some(certified));
+        assert!(other.pending().next().is_none());
     }
-    assert!(certifier.pending().next().is_some());
     let latest = store.latest(&id).expect("object must exist");
     assert_eq!(latest.version(), Version::new(2));
     assert_eq!(latest.contents(), FakeExecutor::NEW_OBJECT_CONTENT);

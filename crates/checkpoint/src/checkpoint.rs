@@ -5,6 +5,7 @@
 
 use dag::block::BlockReference;
 use execution::crypto::Digest;
+use serde::{Deserialize, Serialize};
 
 /// A commitment to the execution state after executing a committed sub-dag's transactions.
 ///
@@ -12,7 +13,7 @@ use execution::crypto::Digest;
 /// the full ordered write history. The anchor alone identifies the checkpoint — ordering is
 /// local knowledge, so no sequence number travels. A checkpoint doubles as this validator's
 /// vote when submitted through consensus.
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 pub struct Checkpoint {
     anchor: BlockReference,
     commitment: Digest,

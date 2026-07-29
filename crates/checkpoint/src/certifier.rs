@@ -91,15 +91,16 @@ impl CheckpointCertifier {
         }
     }
 
-    /// Mints this validator's checkpoint for the sub-dag anchored at `anchor`. Certification
-    /// can never outrun minting: a vote only commits after the sub-dag it attests, which we
-    /// process first.
-    pub fn push(&mut self, anchor: BlockReference, commitment: Digest) {
+    /// Mints this validator's checkpoint for the sub-dag anchored at `anchor` and returns it,
+    /// ready to submit as this validator's vote. Certification can never outrun minting: a
+    /// vote only commits after the sub-dag it attests, which we process first.
+    pub fn push(&mut self, anchor: BlockReference, commitment: Digest) -> &Checkpoint {
         self.pending.push_back(PendingCheckpoint {
             local: Checkpoint::new(anchor, commitment),
             accumulators: Vec::with_capacity(self.committee.len()),
             certificate: None,
         });
+        &self.pending.back().expect("just pushed").local
     }
 
     /// This validator's checkpoints not yet contiguously certified, in commit order.
@@ -217,6 +218,14 @@ mod tests {
     /// The anchor of the `n`-th sub-dag delivering votes, after the checkpointed ones.
     fn subdag(n: u64) -> BlockReference {
         BlockReference::new_test(0, 100 + n)
+    }
+
+    #[test]
+    fn push_returns_the_minted_checkpoint() {
+        // A non-empty window distinguishes the newly minted entry from the front.
+        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 1);
+        let minted = certifier.push(vote(2).anchor(), vote(2).commitment());
+        assert_eq!(minted, &vote(2));
     }
 
     #[test]
