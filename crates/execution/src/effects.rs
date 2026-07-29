@@ -55,6 +55,7 @@ impl ExecutionOutput {
         self.status
     }
 
+    #[cfg(test)]
     pub fn writes(&self) -> &[Object] {
         &self.writes
     }

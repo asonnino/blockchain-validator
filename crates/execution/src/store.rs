@@ -37,6 +37,7 @@ pub struct InMemoryStore {
 
 impl InMemoryStore {
     /// The object frozen at exactly `(id, version)`, or `None` if absent.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn get(&self, id: &ObjectId, version: Version) -> Option<&Object> {
         self.objects.get(&(*id, version))
     }

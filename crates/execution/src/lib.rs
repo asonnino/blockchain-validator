@@ -6,6 +6,7 @@
 pub mod crypto;
 pub mod effects;
 pub mod engine;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod fake;
 pub mod object;
 pub mod scheduler;
