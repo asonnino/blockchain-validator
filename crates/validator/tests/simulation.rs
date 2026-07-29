@@ -7,7 +7,7 @@
 
 use std::{path::Path, time::Duration};
 
-use checkpoint::checkpoint::CheckpointChain;
+use checkpoint::certifier::CheckpointCertifier;
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::{
     fake::{FakeExecutor, FakeTransaction},
@@ -59,6 +59,7 @@ impl SimulatedTestbed {
             .with_metrics(Metrics::new_for_test(COMMITTEE_SIZE))
             .with_network(node_network)
             .build()
+            .expect("validator must build")
             .start::<SimulatorContext>()
             .await
             .expect("validator must start");
@@ -82,7 +83,7 @@ impl SimulatedTestbed {
         }
     }
 
-    async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointChain)> {
+    async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
         let mut results = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
             results.push(validator.shutdown().await);
@@ -116,7 +117,7 @@ async fn submission_loop(
     }
 }
 
-fn run_once(seed: u64) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointChain)> {
+fn run_once(seed: u64) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
         let mut committee = SimulatedTestbed::start().await;
         let submissions = committee
@@ -137,13 +138,15 @@ fn run_once(seed: u64) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointChai
 fn validators_converge_under_simulation() {
     let results = run_once(7);
 
-    let (reference, chain) = &results[0];
+    let (reference, certifier) = &results[0];
     let store = reference.store();
-    for (scheduler, checkpoints) in &results {
+    // Without vote submission (arriving with the payload envelope), every minted checkpoint
+    // stays pending; equal pending chains are the divergence check.
+    for (scheduler, other) in &results {
         assert_eq!(scheduler.store(), store);
-        assert_eq!(checkpoints, chain);
+        assert!(other.pending().eq(certifier.pending()));
     }
-    assert!(!chain.checkpoints().is_empty());
+    assert!(certifier.pending().next().is_some());
     // Every submitter's object was created and modified at least once.
     for index in 0..COMMITTEE_SIZE {
         let latest = store
@@ -158,13 +161,16 @@ fn simulation_is_deterministic_per_seed() {
     for seed in [7, 42] {
         let first = run_once(seed);
         let second = run_once(seed);
-        for ((a, a_chain), (b, b_chain)) in first.iter().zip(&second) {
+        for ((a, a_certifier), (b, b_certifier)) in first.iter().zip(&second) {
             assert_eq!(
                 a.store(),
                 b.store(),
                 "seed {seed} produced diverging stores"
             );
-            assert_eq!(a_chain, b_chain, "seed {seed} produced diverging chains");
+            assert!(
+                a_certifier.pending().eq(b_certifier.pending()),
+                "seed {seed} produced diverging checkpoints"
+            );
         }
     }
 }

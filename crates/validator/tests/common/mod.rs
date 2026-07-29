@@ -8,7 +8,7 @@
 
 use std::{fs, path::Path, time::Duration};
 
-use checkpoint::checkpoint::CheckpointChain;
+use checkpoint::certifier::CheckpointCertifier;
 use dag::{authority::Authority, context::TokioCtx};
 use execution::{fake::FakeExecutor, scheduler::SequentialScheduler, transaction::Transaction};
 use replica::{
@@ -62,6 +62,7 @@ impl Testbed {
             )
             .with_storage(storage)
             .build()
+            .expect("validator must build")
             .start::<TokioCtx>()
             .await
             .expect("validator must start");
@@ -88,8 +89,8 @@ impl Testbed {
     }
 
     /// Stops every validator and returns the schedulers with their executed state and
-    /// checkpoint chains.
-    pub async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointChain)> {
+    /// checkpoint certifiers.
+    pub async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
         let mut results = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
             results.push(validator.shutdown().await);

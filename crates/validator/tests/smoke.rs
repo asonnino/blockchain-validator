@@ -34,13 +34,15 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
     testbed.wait_for_transactions(2).await;
     let results = testbed.shutdown().await;
 
-    let (reference, chain) = &results[0];
+    let (reference, certifier) = &results[0];
     let store = reference.store();
-    for (scheduler, checkpoints) in &results {
+    // Without vote submission (arriving with the payload envelope), every minted checkpoint
+    // stays pending; equal pending chains are the divergence check.
+    for (scheduler, other) in &results {
         assert_eq!(scheduler.store(), store);
-        assert_eq!(checkpoints, chain);
+        assert!(other.pending().eq(certifier.pending()));
     }
-    assert!(!chain.checkpoints().is_empty());
+    assert!(certifier.pending().next().is_some());
     let latest = store.latest(&id).expect("object must exist");
     assert_eq!(latest.version(), Version::new(2));
     assert_eq!(latest.contents(), FakeExecutor::NEW_OBJECT_CONTENT);

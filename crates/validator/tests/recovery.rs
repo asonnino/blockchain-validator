@@ -44,7 +44,8 @@ async fn restarted_committee_recovers_execution_state() {
     let rebuilt = testbed.shutdown().await;
 
     assert_eq!(references.len(), rebuilt.len());
-    for ((reference, reference_chain), (rebuilt, rebuilt_chain)) in references.iter().zip(&rebuilt)
+    for ((reference, reference_certifier), (rebuilt, rebuilt_certifier)) in
+        references.iter().zip(&rebuilt)
     {
         // Replay reproduced the pre-restart history exactly...
         for version in 1..=total {
@@ -56,17 +57,22 @@ async fn restarted_committee_recovers_execution_state() {
         // ...and the post-restart update landed on top of it.
         let latest = rebuilt.store().latest(&id).expect("object must exist");
         assert_eq!(latest.version(), Version::new(total + 1));
-        // The reference chain is a prefix of the rebuilt one: replay reproduced it, then the
+        // Without vote submission every minted checkpoint stays pending. The reference
+        // checkpoints are a prefix of the rebuilt ones: replay reproduced them, then the
         // post-restart update appended. Prefix rather than equality guards the edge where the
         // WAL holds a final commit the pre-shutdown driver never received.
-        assert!(rebuilt_chain.checkpoints().len() > reference_chain.checkpoints().len());
-        let prefix = &rebuilt_chain.checkpoints()[..reference_chain.checkpoints().len()];
-        assert_eq!(reference_chain.checkpoints(), prefix);
+        let reference_count = reference_certifier.pending().count();
+        assert!(rebuilt_certifier.pending().count() > reference_count);
+        assert!(
+            reference_certifier
+                .pending()
+                .eq(rebuilt_certifier.pending().take(reference_count))
+        );
     }
-    let (first, first_chain) = &rebuilt[0];
+    let (first, first_certifier) = &rebuilt[0];
     let store = first.store();
-    for (scheduler, chain) in &rebuilt {
+    for (scheduler, certifier) in &rebuilt {
         assert_eq!(scheduler.store(), store);
-        assert_eq!(chain, first_chain);
+        assert!(certifier.pending().eq(first_certifier.pending()));
     }
 }

@@ -10,3 +10,6 @@ bincode.workspace = true
 blake2.workspace = true
 digest.workspace = true
 serde.workspace = true
+
+[features]
+test-utils = []

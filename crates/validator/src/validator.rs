@@ -5,7 +5,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use checkpoint::checkpoint::CheckpointChain;
+use checkpoint::certifier::CheckpointCertifier;
 use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
     consensus::CommittedSubDag, context::Ctx, crypto::AsBytes, metrics::Metrics, storage::Storage,
@@ -79,26 +79,33 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
         self
     }
 
-    /// Assembles the validator: builds the scheduler and the replica with its commit consumer.
-    /// No I/O happens until [`Validator::start`].
-    pub fn build(self) -> Validator<E> {
+    /// Assembles the validator: builds the scheduler, the certifier, and the replica with its
+    /// commit consumer. No I/O happens until [`Validator::start`].
+    pub fn build(self) -> eyre::Result<Validator<E>> {
         let (sender, receiver) = mpsc::channel(COMMIT_CHANNEL_CAPACITY);
-        Validator {
+        let committee = self.public_config.committee();
+        let protocol = self
+            .public_config
+            .parameters
+            .consensus
+            .to_protocol(&committee)?;
+        let certifier = CheckpointCertifier::new(committee, protocol.quorum_threshold);
+        Ok(Validator {
             scheduler: SequentialScheduler::new(self.engine),
-            checkpoints: CheckpointChain::default(),
+            certifier,
             authority: self.authority,
             public_config: self.public_config,
             wal: self.wal,
             replica: self.replica.with_commit_consumer(sender).build(),
             receiver,
-        }
+        })
     }
 }
 
 /// A fully configured validator, ready to [`start`](Validator::start).
 pub struct Validator<E> {
     scheduler: SequentialScheduler<E>,
-    checkpoints: CheckpointChain,
+    certifier: CheckpointCertifier,
     authority: Authority,
     public_config: PublicReplicaConfig,
     wal: Option<PathBuf>,
@@ -115,7 +122,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let replayed = self.replay()?;
         let Self {
             mut scheduler,
-            mut checkpoints,
+            mut certifier,
             replica,
             mut receiver,
             ..
@@ -126,10 +133,10 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let driver = C::spawn(async move {
             let mut count = replayed;
             while let Some(subdag) = receiver.recv().await {
-                count += Self::execute_subdag(&mut scheduler, &mut checkpoints, subdag) as u64;
+                count += Self::execute_subdag(&mut scheduler, &mut certifier, subdag) as u64;
                 let _ = executed_sender.send(count);
             }
-            (scheduler, checkpoints)
+            (scheduler, certifier)
         });
 
         Ok(ValidatorHandle {
@@ -164,7 +171,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 .collect::<eyre::Result<_>>()?;
             let subdag = CommittedSubDag::new(commit.leader, blocks);
             replayed +=
-                Self::execute_subdag(&mut self.scheduler, &mut self.checkpoints, subdag) as u64;
+                Self::execute_subdag(&mut self.scheduler, &mut self.certifier, subdag) as u64;
         }
         Ok(replayed)
     }
@@ -175,7 +182,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
     /// their count varies across validators at any executed-transaction cut.
     fn execute_subdag(
         scheduler: &mut SequentialScheduler<E>,
-        checkpoints: &mut CheckpointChain,
+        certifier: &mut CheckpointCertifier,
         mut subdag: CommittedSubDag,
     ) -> usize {
         let anchor = subdag.anchor;
@@ -191,7 +198,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             });
         let executed = scheduler.execute(transactions).len();
         if executed > 0 {
-            checkpoints.push(anchor, scheduler.store().commitment());
+            certifier.push(anchor, scheduler.store().commitment());
         }
         executed
     }
@@ -204,7 +211,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
 /// node runs unchanged under tokio and under the mysticeti simulator.
 pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     replica: ReplicaHandle<C>,
-    driver: C::JoinHandle<(SequentialScheduler<E>, CheckpointChain)>,
+    driver: C::JoinHandle<(SequentialScheduler<E>, CheckpointCertifier)>,
     executed: watch::Receiver<u64>,
 }
 
@@ -230,8 +237,8 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
     }
 
     /// Stops the replica, waits for the driver to drain the remaining commits, and returns the
-    /// scheduler with the executed state and the checkpoint chain.
-    pub async fn shutdown(self) -> (SequentialScheduler<E>, CheckpointChain) {
+    /// scheduler with the executed state and the checkpoint certifier.
+    pub async fn shutdown(self) -> (SequentialScheduler<E>, CheckpointCertifier) {
         // The returned syncer holds the consensus storage; the WAL outlives it on disk, which
         // is what replay on the next start relies on.
         let _syncer = self.replica.shutdown().await;
