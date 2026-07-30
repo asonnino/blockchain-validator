@@ -4,7 +4,7 @@
 //! Full-committee restart: execution state is rebuilt by replaying the consensus WAL.
 //!
 //! Port offsets across test binaries: mysticeti uses 0-500, smoke.rs uses 3000, and this file
-//! uses 3100/3200 (a fresh offset per start avoids rebinding ports still in TIME_WAIT).
+//! uses 3100-3400 (a fresh offset per start avoids rebinding ports still in TIME_WAIT).
 
 mod common;
 
@@ -84,6 +84,56 @@ async fn restarted_committee_recovers_execution_state() {
     }
     let (first, first_certifier) = &rebuilt[0];
     let store = first.store();
+    for (scheduler, certifier) in &rebuilt {
+        assert_eq!(scheduler.store(), store);
+        assert_eq!(
+            certifier.highest_certified(),
+            first_certifier.highest_certified()
+        );
+        assert!(certifier.pending().next().is_none());
+    }
+}
+
+// Todo: enable once asonnino/mysticeti#221 is fixed and the pinned rev is bumped — restarting
+// with unproposed payloads in the WAL currently panics the core thread (counter underflow).
+#[tokio::test]
+#[ignore = "blocked on asonnino/mysticeti#221: pending_transactions underflow on restart"]
+async fn restarted_committee_recertifies_lost_votes() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let id = ObjectId::new(1);
+    let total = (STATE_UPDATES + 1) as u64;
+
+    // First run: halt as soon as everything executed. Votes still in flight die with the
+    // transaction queue, leaving checkpoints that can never certify without re-attestation.
+    let mut testbed = Testbed::start_with_wal(dir.path(), 3300).await;
+    let mut transactions = vec![FakeTransaction::success(vec![], vec![id], vec![]).into()];
+    transactions.extend(
+        (0..STATE_UPDATES).map(|_| FakeTransaction::success(vec![], vec![], vec![id]).into()),
+    );
+    testbed.submit(0, transactions).await;
+    testbed.wait_for_transactions(total).await;
+    let references = testbed.shutdown().await;
+    // The scenario's precondition: at least one validator halted with an uncertified window,
+    // so the restart below cannot certify from replay alone.
+    assert!(
+        references
+            .iter()
+            .any(|(_, certifier)| certifier.pending().next().is_some())
+    );
+
+    // Restart: replay rebuilds the pending window, and re-attestation certifies it — waiting
+    // here stalls forever if any lost vote is not resubmitted.
+    let mut testbed = Testbed::start_with_wal(dir.path(), 3400).await;
+    testbed.wait_for_transactions(total).await;
+    testbed.wait_for_certified().await;
+    let rebuilt = testbed.shutdown().await;
+
+    let (first, first_certifier) = &rebuilt[0];
+    let store = first.store();
+    let certified = first_certifier
+        .highest_certified()
+        .expect("everything executed is certified");
+    assert_eq!(certified.checkpoint().commitment(), store.commitment());
     for (scheduler, certifier) in &rebuilt {
         assert_eq!(scheduler.store(), store);
         assert_eq!(

@@ -137,6 +137,22 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let (certified_sender, certified) =
             watch::channel(Self::certification_status(&certifier, &scheduler));
         let driver = C::spawn(async move {
+            // Re-attest checkpoints uncertified at replay: votes in flight at shutdown died
+            // with the transaction queue, and a validator otherwise attests only once, so an
+            // uncertified checkpoint could stall forever. The certifier's per-author dedupe
+            // makes resubmission idempotent — votes that did commit are simply ignored.
+            let pending: Vec<_> = certifier.pending().cloned().collect();
+            if !pending.is_empty() {
+                let timestamp_ms = C::timestamp_utc().as_millis() as u64;
+                let attestations = pending
+                    .into_iter()
+                    .map(|checkpoint| Self::attestation(timestamp_ms, checkpoint))
+                    .collect();
+                if client.submit(attestations).await.is_err() {
+                    tracing::debug!("re-attestation failed; shutting down");
+                }
+            }
+
             let mut count = replayed;
             while let Some(subdag) = receiver.recv().await {
                 let (executed, minted) =
@@ -149,8 +165,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 // down, and lost votes are resubmitted after replay.
                 if let Some(checkpoint) = minted {
                     let timestamp_ms = C::timestamp_utc().as_millis() as u64;
-                    let envelope = Envelope::new(timestamp_ms, Payload::Attest(checkpoint));
-                    let attestation = ConsensusTransaction::new(envelope.to_bytes().into());
+                    let attestation = Self::attestation(timestamp_ms, checkpoint);
                     if client.submit(vec![attestation]).await.is_err() {
                         tracing::debug!("attestation submission failed; shutting down");
                     }
@@ -249,6 +264,12 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             certifier.record(anchor, author, vote);
         }
         (executed, minted)
+    }
+
+    /// Wraps a checkpoint as this validator's timestamped attestation payload.
+    fn attestation(timestamp_ms: u64, checkpoint: Checkpoint) -> ConsensusTransaction {
+        let envelope = Envelope::new(timestamp_ms, Payload::Attest(checkpoint));
+        ConsensusTransaction::new(envelope.to_bytes().into())
     }
 
     /// The pair consumed by [`ValidatorHandle::wait_for_certified`]: the highest certified
