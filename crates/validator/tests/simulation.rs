@@ -153,11 +153,32 @@ fn run_once(seed: u64) -> RunOutcome {
         // Metric (b) observes every delivered sub-dag. Values are zero under simulated time
         // (execution advances no simulated clock), so only population is meaningful.
         let mut delivered = Vec::with_capacity(COMMITTEE_SIZE);
+        let mut certified_counts = Vec::with_capacity(COMMITTEE_SIZE);
         for validator in committee.validators() {
             let histogram = validator.metrics().subdag_execution_latency_s();
             assert!(histogram.get_sample_count() > 0);
             delivered.push(histogram.get_sample_count());
+
+            // Certification and end-to-end latencies derive from simulated clocks, so their
+            // magnitudes are meaningful; each certified checkpoint observes both once.
+            let certification = validator.metrics().checkpoint_certification_latency_s();
+            let end_to_end = validator.metrics().end_to_end_latency_s();
+            assert!(certification.get_sample_count() > 0);
+            assert_eq!(
+                end_to_end.get_sample_count(),
+                certification.get_sample_count()
+            );
+            for (name, histogram) in [("certification", certification), ("e2e", end_to_end)] {
+                let mean = histogram.get_sample_sum() / histogram.get_sample_count() as f64;
+                assert!(
+                    mean > 0.0 && mean < 10.0,
+                    "implausible {name} latency: {mean} s"
+                );
+            }
+            certified_counts.push(certification.get_sample_count());
         }
+        // Certified checkpoints are a deterministic function of the commit stream.
+        assert!(certified_counts.iter().all(|c| *c == certified_counts[0]));
         let metrics = committee.metrics.clone();
         (committee.shutdown().await, metrics, delivered)
     })

@@ -3,7 +3,7 @@
 
 //! Certification: tallying checkpoint votes into certified checkpoints.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use dag::{
     authority::{Authority, AuthoritySet},
@@ -56,11 +56,21 @@ impl CheckpointAccumulator {
     }
 }
 
+/// Timing constants carried from mint to certification, for the caller's latency metrics.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct CheckpointTimings {
+    /// The caller's clock at mint.
+    pub minted_at: Duration,
+    /// Mean submission stamp of the checkpointed transactions, in milliseconds since epoch.
+    pub mean_timestamp_ms: u64,
+}
+
 /// A minted checkpoint with its vote tally: this validator's own value, one accumulator per
 /// attested commitment, and the certificate once a quorum forms (held until the watermark
 /// passes it).
 struct PendingCheckpoint {
     local: Checkpoint,
+    timings: CheckpointTimings,
     accumulators: Vec<(Digest, CheckpointAccumulator)>,
     certificate: Option<CertifiedCheckpoint>,
 }
@@ -92,11 +102,19 @@ impl CheckpointCertifier {
     }
 
     /// Mints this validator's checkpoint for the sub-dag anchored at `anchor` and returns it,
-    /// ready to submit as this validator's vote. Certification can never outrun minting: a
-    /// vote only commits after the sub-dag it attests, which we process first.
-    pub fn push(&mut self, anchor: BlockReference, commitment: Digest) -> &Checkpoint {
+    /// ready to submit as this validator's vote. The timings ride along and are surrendered
+    /// by [`record`](CheckpointCertifier::record) when the certificate forms. Certification
+    /// can never outrun minting: a vote only commits after the sub-dag it attests, which we
+    /// process first.
+    pub fn push(
+        &mut self,
+        anchor: BlockReference,
+        commitment: Digest,
+        timings: CheckpointTimings,
+    ) -> &Checkpoint {
         self.pending.push_back(PendingCheckpoint {
             local: Checkpoint::new(anchor, commitment),
+            timings,
             accumulators: Vec::with_capacity(self.committee.len()),
             certificate: None,
         });
@@ -109,8 +127,14 @@ impl CheckpointCertifier {
     }
 
     /// Counts `author`'s vote for `checkpoint`, delivered in the committed sub-dag anchored at
-    /// `subdag`. The first vote per authority and checkpoint wins.
-    pub fn record(&mut self, subdag: BlockReference, author: Authority, checkpoint: Checkpoint) {
+    /// `subdag`. The first vote per authority and checkpoint wins. Returns the mint timings
+    /// exactly when this vote forms the certificate.
+    pub fn record(
+        &mut self,
+        subdag: BlockReference,
+        author: Authority,
+        checkpoint: Checkpoint,
+    ) -> Option<CheckpointTimings> {
         let voted_anchor = checkpoint.anchor();
         // A vote cannot be witnessed before its anchor's sub-dag committed by construction.
         // Window entries are in commit order, so anchor rounds are non-decreasing: binary
@@ -131,11 +155,11 @@ impl CheckpointCertifier {
             if voted_anchor.round > certified_round {
                 tracing::warn!(%author, ?voted_anchor, "checkpoint vote for an unknown anchor");
             }
-            return;
+            return None;
         };
         // Already certified, awaiting contiguity: an observed certificate can never change.
         if entry.certificate.is_some() {
-            return;
+            return None;
         }
 
         // One pass: dedupe the author and locate this commitment's accumulator.
@@ -146,7 +170,7 @@ impl CheckpointCertifier {
                 if *attested != commitment {
                     tracing::warn!(%author, ?voted_anchor, "conflicting checkpoint vote");
                 }
-                return;
+                return None;
             }
             if *attested == commitment {
                 target = Some(index);
@@ -162,7 +186,7 @@ impl CheckpointCertifier {
         };
         let (_, accumulator) = &mut entry.accumulators[index];
         if !accumulator.add(author, &self.committee, subdag) {
-            return;
+            return None;
         }
         let proof = accumulator.clear();
         // A disagreement with our own pending checkpoint means our execution diverged.
@@ -173,6 +197,7 @@ impl CheckpointCertifier {
             );
         }
         entry.certificate = Some(CertifiedCheckpoint::new(checkpoint, proof));
+        let timings = entry.timings;
 
         // Advance the watermark over the contiguously certified prefix, reclaiming it.
         while self
@@ -182,6 +207,7 @@ impl CheckpointCertifier {
         {
             self.watermark = self.pending.pop_front().and_then(|entry| entry.certificate);
         }
+        Some(timings)
     }
 
     /// The highest checkpoint such that it and all earlier checkpoints are certified.
@@ -197,7 +223,11 @@ impl CheckpointCertifier {
         let mut certifier = Self::new(Committee::new_test(stake), quorum);
         for n in 1..=minted {
             let checkpoint = Checkpoint::new_for_test(n);
-            certifier.push(checkpoint.anchor(), checkpoint.commitment());
+            certifier.push(
+                checkpoint.anchor(),
+                checkpoint.commitment(),
+                CheckpointTimings::default(),
+            );
         }
         certifier
     }
@@ -205,10 +235,15 @@ impl CheckpointCertifier {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use dag::{authority::Authority, block::BlockReference, committee::Committee};
     use execution::crypto::Digest;
 
-    use crate::{certifier::CheckpointCertifier, checkpoint::Checkpoint};
+    use crate::{
+        certifier::{CheckpointCertifier, CheckpointTimings},
+        checkpoint::Checkpoint,
+    };
 
     /// Shorthand for [`Checkpoint::new_for_test`]: the vote for the `n`-th checkpoint.
     fn vote(n: u64) -> Checkpoint {
@@ -224,8 +259,40 @@ mod tests {
     fn push_returns_the_minted_checkpoint() {
         // A non-empty window distinguishes the newly minted entry from the front.
         let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 1);
-        let minted = certifier.push(vote(2).anchor(), vote(2).commitment());
+        let minted = certifier.push(
+            vote(2).anchor(),
+            vote(2).commitment(),
+            CheckpointTimings::default(),
+        );
         assert_eq!(minted, &vote(2));
+    }
+
+    #[test]
+    fn certification_surrenders_the_mint_timings() {
+        let timings = CheckpointTimings {
+            minted_at: Duration::from_secs(1),
+            mean_timestamp_ms: 650,
+        };
+        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+        certifier.push(vote(1).anchor(), vote(1).commitment(), timings);
+
+        assert_eq!(
+            certifier.record(subdag(0), Authority::new(0), vote(1)),
+            None
+        );
+        assert_eq!(
+            certifier.record(subdag(0), Authority::new(1), vote(1)),
+            None
+        );
+        assert_eq!(
+            certifier.record(subdag(1), Authority::new(2), vote(1)),
+            Some(timings)
+        );
+        // The certificate never changes, and the timings surrender exactly once.
+        assert_eq!(
+            certifier.record(subdag(2), Authority::new(3), vote(1)),
+            None
+        );
     }
 
     #[test]
@@ -332,8 +399,16 @@ mod tests {
         let unminted = || Checkpoint::new(BlockReference::new_test(2, round), Digest::default());
 
         let mut certifier = CheckpointCertifier::new(Committee::new_test(vec![1; 4]), 3);
-        certifier.push(first().anchor(), Digest::default());
-        certifier.push(second().anchor(), Digest::default());
+        certifier.push(
+            first().anchor(),
+            Digest::default(),
+            CheckpointTimings::default(),
+        );
+        certifier.push(
+            second().anchor(),
+            Digest::default(),
+            CheckpointTimings::default(),
+        );
 
         // A same-round anchor that was never minted certifies nothing.
         for authority in 0..4 {
@@ -368,9 +443,12 @@ mod tests {
     #[test]
     fn watermark_is_contiguous() {
         let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 3);
+        let mut timings = None;
         for authority in 0..3 {
-            certifier.record(subdag(0), Authority::new(authority), vote(2));
+            timings = certifier.record(subdag(0), Authority::new(authority), vote(2));
         }
+        // The certificate formed — timings surrendered — although not yet contiguous.
+        assert!(timings.is_some());
         assert_eq!(certifier.highest_certified(), None);
 
         // A late vote for the certified-but-not-yet-contiguous checkpoint changes nothing.

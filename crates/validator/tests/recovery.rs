@@ -42,12 +42,22 @@ async fn restarted_committee_recovers_execution_state() {
     let mut testbed = Testbed::start_with_wal(dir.path(), 3200).await;
     testbed.wait_for_transactions(total).await;
     testbed.wait_for_certified().await;
+    // Replay records nothing: the pre-restart certifications must not re-observe.
+    for validator in testbed.validators() {
+        let certification = validator.metrics().checkpoint_certification_latency_s();
+        assert_eq!(certification.get_sample_count(), 0);
+    }
 
     // The restarted committee stays live: one more update commits and executes everywhere.
     let update = FakeTransaction::success(vec![], vec![], vec![id]).into();
     testbed.submit(0, vec![update]).await;
     testbed.wait_for_transactions(total + 1).await;
     testbed.wait_for_certified().await;
+    // Exactly the post-restart checkpoint observes.
+    for validator in testbed.validators() {
+        let certification = validator.metrics().checkpoint_certification_latency_s();
+        assert_eq!(certification.get_sample_count(), 1);
+    }
     let rebuilt = testbed.shutdown().await;
 
     assert_eq!(references.len(), rebuilt.len());

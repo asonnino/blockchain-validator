@@ -3,7 +3,10 @@
 
 //! Benchmarks the certifier's hot paths: minting pending checkpoints and tallying votes.
 
-use checkpoint::{certifier::CheckpointCertifier, checkpoint::Checkpoint};
+use checkpoint::{
+    certifier::{CheckpointCertifier, CheckpointTimings},
+    checkpoint::Checkpoint,
+};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use dag::{authority::Authority, block::BlockReference, committee::Committee};
 
@@ -23,7 +26,11 @@ fn mint(c: &mut Criterion) {
             |mut certifier| {
                 for n in 1..=CHECKPOINTS {
                     let checkpoint = Checkpoint::new_for_test(n);
-                    certifier.push(checkpoint.anchor(), checkpoint.commitment());
+                    certifier.push(
+                        checkpoint.anchor(),
+                        checkpoint.commitment(),
+                        CheckpointTimings::default(),
+                    );
                 }
                 certifier
             },

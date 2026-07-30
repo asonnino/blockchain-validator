@@ -3,9 +3,12 @@
 
 //! The validator node: a mysticeti replica wired to an execution engine.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use checkpoint::{certifier::CheckpointCertifier, checkpoint::Checkpoint};
+use checkpoint::{
+    certifier::{CheckpointCertifier, CheckpointTimings},
+    checkpoint::Checkpoint,
+};
 use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
     consensus::CommittedSubDag, context::Ctx, crypto::AsBytes, metrics::Metrics, storage::Storage,
@@ -107,8 +110,10 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             .to_protocol(&committee)?;
         let certifier = CheckpointCertifier::new(committee, protocol.quorum_threshold);
         Ok(Validator {
-            scheduler: SequentialScheduler::new(self.engine),
-            certifier,
+            state: ExecutionState {
+                scheduler: SequentialScheduler::new(self.engine),
+                certifier,
+            },
             authority: self.authority,
             public_config: self.public_config,
             wal: self.wal,
@@ -121,14 +126,20 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
 
 /// A fully configured validator, ready to [`start`](Validator::start).
 pub struct Validator<E> {
-    scheduler: SequentialScheduler<E>,
-    certifier: CheckpointCertifier,
+    state: ExecutionState<E>,
     authority: Authority,
     public_config: PublicReplicaConfig,
     wal: Option<PathBuf>,
     metrics: Arc<ValidatorMetrics>,
     replica: Replica,
     receiver: mpsc::Receiver<CommittedSubDag>,
+}
+
+/// The execution half of a validator — the scheduler and the certifier fed by the commit
+/// stream — owned by the driver task once started.
+struct ExecutionState<E> {
+    scheduler: SequentialScheduler<E>,
+    certifier: CheckpointCertifier,
 }
 
 impl<E: ExecutionEngine + Send + 'static> Validator<E> {
@@ -139,8 +150,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
     pub async fn start<C: Ctx>(mut self) -> eyre::Result<ValidatorHandle<C, E>> {
         let replayed = self.replay()?;
         let Self {
-            mut scheduler,
-            mut certifier,
+            mut state,
             replica,
             mut receiver,
             metrics,
@@ -150,15 +160,14 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let replica = replica.run::<C>().await?;
         let client = replica.transaction_client();
         let (executed_sender, executed) = watch::channel(replayed);
-        let (certified_sender, certified) =
-            watch::channel(Self::certification_status(&certifier, &scheduler));
+        let (certified_sender, certified) = watch::channel(state.certification_status());
         let driver_metrics = metrics.clone();
         let driver = C::spawn(async move {
             // Re-attest checkpoints uncertified at replay: votes in flight at shutdown died
             // with the transaction queue, and a validator otherwise attests only once, so an
             // uncertified checkpoint could stall forever. The certifier's per-author dedupe
             // makes resubmission idempotent — votes that did commit are simply ignored.
-            let pending: Vec<_> = certifier.pending().cloned().collect();
+            let pending: Vec<_> = state.certifier.pending().cloned().collect();
             if !pending.is_empty() {
                 let timestamp_ms = C::timestamp_utc().as_millis() as u64;
                 let attestations = pending
@@ -175,24 +184,23 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 // The clock starts at delivery (idle waiting is not latency) and stops after
                 // execution, checkpoint minting, and vote recording.
                 let start = C::now();
-                let (executed, minted) =
-                    Self::execute_subdag(&mut scheduler, &mut certifier, subdag);
+                let now = C::timestamp_utc();
+                let (executed, minted) = state.execute_subdag(&driver_metrics, now, subdag);
                 driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
                 count += executed as u64;
                 let _ = executed_sender.send(count);
-                let _ = certified_sender.send(Self::certification_status(&certifier, &scheduler));
+                let _ = certified_sender.send(state.certification_status());
                 // Attest to the minted checkpoint through consensus: the vote rides this
                 // validator's own signed blocks. Failure is benign — the replica is shutting
                 // down, and lost votes are resubmitted after replay.
                 if let Some(checkpoint) = minted {
-                    let timestamp_ms = C::timestamp_utc().as_millis() as u64;
-                    let attestation = Self::attestation(timestamp_ms, checkpoint);
+                    let attestation = Self::attestation(now.as_millis() as u64, checkpoint);
                     if client.submit(vec![attestation]).await.is_err() {
                         tracing::debug!("attestation submission failed; shutting down");
                     }
                 }
             }
-            (scheduler, certifier)
+            (state.scheduler, state.certifier)
         });
 
         Ok(ValidatorHandle {
@@ -212,8 +220,9 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             return Ok(0);
         };
         let committee = self.public_config.committee();
-        // An isolated registry: replay metrics are discarded with this read-only handle.
+        // Isolated metrics, discarded with these handles: replay records nothing.
         let metrics = Metrics::new_for_test(committee.len());
+        let replay_metrics = ValidatorMetrics::new(&Registry::new());
         let (storage, _recovered) = Storage::open(self.authority, wal, metrics, &committee)?;
 
         let mut replayed = 0;
@@ -229,22 +238,33 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 .collect::<eyre::Result<_>>()?;
             let subdag = CommittedSubDag::new(commit.leader, blocks);
             // The minted checkpoint is dropped: replay never submits votes.
-            let (executed, _) =
-                Self::execute_subdag(&mut self.scheduler, &mut self.certifier, subdag);
+            let (executed, _) = self
+                .state
+                .execute_subdag(&replay_metrics, Duration::ZERO, subdag);
             replayed += executed as u64;
         }
         Ok(replayed)
     }
 
+    /// Wraps a checkpoint as this validator's timestamped attestation payload.
+    fn attestation(timestamp_ms: u64, checkpoint: Checkpoint) -> ConsensusTransaction {
+        let envelope = Envelope::new(timestamp_ms, Payload::Attest(checkpoint));
+        ConsensusTransaction::new(envelope.to_bytes().into())
+    }
+}
+
+impl<E: ExecutionEngine> ExecutionState<E> {
     /// Executes every transaction of a committed sub-dag in canonical order, dispatches its
     /// checkpoint votes to the certifier, and returns how many transactions were executed
     /// together with the checkpoint this sub-dag minted, if any. Undecodable payloads are
     /// skipped; the choice is deterministic. Sub-dags that execute nothing are not
     /// checkpointed: their commitment is unchanged, and their count varies across validators
-    /// at any executed-transaction cut.
+    /// at any executed-transaction cut. `now` stamps the mint and closes the latency metrics
+    /// of checkpoints certified by this sub-dag's votes.
     fn execute_subdag(
-        scheduler: &mut SequentialScheduler<E>,
-        certifier: &mut CheckpointCertifier,
+        &mut self,
+        metrics: &ValidatorMetrics,
+        now: Duration,
         mut subdag: CommittedSubDag,
     ) -> (usize, Option<Checkpoint>) {
         let anchor = subdag.anchor;
@@ -252,6 +272,8 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         // Votes are attributed to the block author: they ride their author's own signed
         // blocks, so no authority can forge another's vote.
         let mut votes = Vec::new();
+        // Submission stamps reduce to their sum here, while the payloads are in hand.
+        let mut stamp_sum_ms = 0u64;
         let transactions = subdag
             .blocks
             .iter()
@@ -266,44 +288,50 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
                 let envelope = Envelope::from_bytes(payload.as_bytes())
                     .inspect_err(|error| tracing::warn!(?error, "skipping undecodable payload"))
                     .ok()?;
+                let stamp_ms = envelope.timestamp_ms();
                 match envelope.into_payload() {
-                    Payload::Execute(transaction) => Some(transaction),
+                    Payload::Execute(transaction) => {
+                        stamp_sum_ms += stamp_ms;
+                        Some(transaction)
+                    }
                     Payload::Attest(vote) => {
                         votes.push((author, vote));
                         None
                     }
                 }
             });
-        let executed = scheduler.execute(transactions).len();
+        let executed = self.scheduler.execute(transactions).len();
         let minted = (executed > 0).then(|| {
-            certifier
-                .push(anchor, scheduler.store().commitment())
+            let timings = CheckpointTimings {
+                minted_at: now,
+                mean_timestamp_ms: stamp_sum_ms / executed as u64,
+            };
+            self.certifier
+                .push(anchor, self.scheduler.store().commitment(), timings)
                 .clone()
         });
         // A vote can never reference its own delivering sub-dag's checkpoint (it is created
         // only after that sub-dag commits), so recording after minting loses nothing.
         for (author, vote) in votes {
-            certifier.record(anchor, author, vote);
+            if let Some(timings) = self.certifier.record(anchor, author, vote) {
+                metrics.observe_checkpoint_certification_latency(
+                    now.saturating_sub(timings.minted_at),
+                );
+                let submitted = Duration::from_millis(timings.mean_timestamp_ms);
+                metrics.observe_end_to_end_latency(now.saturating_sub(submitted));
+            }
         }
         (executed, minted)
     }
 
-    /// Wraps a checkpoint as this validator's timestamped attestation payload.
-    fn attestation(timestamp_ms: u64, checkpoint: Checkpoint) -> ConsensusTransaction {
-        let envelope = Envelope::new(timestamp_ms, Payload::Attest(checkpoint));
-        ConsensusTransaction::new(envelope.to_bytes().into())
-    }
-
     /// The pair consumed by [`ValidatorHandle::wait_for_certified`]: the highest certified
     /// commitment beside the store commitment at the same instant.
-    fn certification_status(
-        certifier: &CheckpointCertifier,
-        scheduler: &SequentialScheduler<E>,
-    ) -> (Option<Digest>, Digest) {
-        let certified = certifier
+    fn certification_status(&self) -> (Option<Digest>, Digest) {
+        let certified = self
+            .certifier
             .highest_certified()
             .map(|certificate| certificate.checkpoint().commitment());
-        (certified, scheduler.store().commitment())
+        (certified, self.scheduler.store().commitment())
     }
 }
 
@@ -381,6 +409,8 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use checkpoint::certifier::CheckpointCertifier;
     use dag::{
         authority::Authority,
@@ -393,11 +423,24 @@ mod tests {
         object::ObjectId,
         scheduler::SequentialScheduler,
     };
+    use prometheus::Registry;
 
     use crate::{
         envelope::{Envelope, Payload},
-        validator::Validator,
+        metrics::ValidatorMetrics,
+        validator::ExecutionState,
     };
+
+    fn state() -> ExecutionState<FakeExecutor> {
+        ExecutionState {
+            scheduler: SequentialScheduler::new(FakeExecutor),
+            certifier: CheckpointCertifier::new_for_test(vec![1; 4], 3, 0),
+        }
+    }
+
+    fn metrics() -> Arc<ValidatorMetrics> {
+        ValidatorMetrics::new(&Registry::new())
+    }
 
     /// A sub-dag at `round` with one block per `(author, payloads)` entry, anchored at the
     /// first block.
@@ -430,43 +473,48 @@ mod tests {
 
     #[test]
     fn undecodable_payloads_are_skipped() {
-        let mut scheduler = SequentialScheduler::new(FakeExecutor);
-        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+        let mut state = state();
         let transaction = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
         let valid = Envelope::new(0, Payload::Execute(transaction.into())).to_bytes();
 
-        let (executed, minted) = Validator::execute_subdag(
-            &mut scheduler,
-            &mut certifier,
+        let (executed, minted) = state.execute_subdag(
+            &metrics(),
+            Duration::ZERO,
             subdag(vec![vec![0xFF; 16], valid]),
         );
 
         assert_eq!(executed, 1);
         assert!(minted.is_some());
-        assert_eq!(certifier.pending().count(), 1);
+        assert_eq!(state.certifier.pending().count(), 1);
     }
 
     #[test]
     fn subdags_with_only_undecodable_payloads_mint_no_checkpoint() {
-        let mut scheduler = SequentialScheduler::new(FakeExecutor);
-        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+        let mut state = state();
 
         let (executed, minted) =
-            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag(vec![vec![0xFF; 16]]));
+            state.execute_subdag(&metrics(), Duration::ZERO, subdag(vec![vec![0xFF; 16]]));
 
         assert_eq!(executed, 0);
         assert!(minted.is_none());
-        assert_eq!(certifier.pending().count(), 0);
+        assert_eq!(state.certifier.pending().count(), 0);
     }
 
     #[test]
     fn a_quorum_of_attestations_certifies_and_mints_nothing() {
-        let mut scheduler = SequentialScheduler::new(FakeExecutor);
-        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
-        let transaction = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
-        let execute = Envelope::new(0, Payload::Execute(transaction.into())).to_bytes();
-        let (_, minted) =
-            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag(vec![execute]));
+        let mut state = state();
+        let metrics = metrics();
+        // Two transactions with distinct stamps pin the mean reduction: (1000 + 3000) / 2.
+        let executes = [1, 2]
+            .map(ObjectId::new)
+            .into_iter()
+            .zip([1000, 3000])
+            .map(|(id, stamp_ms)| {
+                let transaction = FakeTransaction::success(vec![], vec![id], vec![]);
+                Envelope::new(stamp_ms, Payload::Execute(transaction.into())).to_bytes()
+            })
+            .collect();
+        let (_, minted) = state.execute_subdag(&metrics, Duration::from_secs(1), subdag(executes));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
         // A quorum of votes delivered in a later sub-dag, one block per author.
@@ -478,45 +526,74 @@ mod tests {
             .collect();
         let delivering = subdag_at(2, votes);
         let anchor = delivering.anchor;
-        let (executed, minted) =
-            Validator::execute_subdag(&mut scheduler, &mut certifier, delivering);
+        let (executed, minted) = state.execute_subdag(&metrics, Duration::from_secs(4), delivering);
 
         assert_eq!(executed, 0);
         assert!(minted.is_none());
-        let certified = certifier.highest_certified().expect("quorum must certify");
+        let certified = state
+            .certifier
+            .highest_certified()
+            .expect("quorum must certify");
         assert_eq!(certified.checkpoint(), &checkpoint);
         // The proof records the delivering sub-dag's anchor per counted vote.
         assert_eq!(certified.proof(), [anchor; 3]);
-        assert!(certifier.pending().next().is_none());
+        assert!(state.certifier.pending().next().is_none());
+        // Certification closed the latency metrics: minted at 1s and certified at 4s, with a
+        // mean submission stamp of 2s.
+        let certification = metrics.checkpoint_certification_latency_s();
+        assert_eq!(certification.get_sample_count(), 1);
+        assert_eq!(certification.get_sample_sum(), 3.0);
+        let end_to_end = metrics.end_to_end_latency_s();
+        assert_eq!(end_to_end.get_sample_count(), 1);
+        assert_eq!(end_to_end.get_sample_sum(), 2.0);
     }
 
     #[test]
     fn mixed_subdags_execute_mint_and_certify_together() {
-        let mut scheduler = SequentialScheduler::new(FakeExecutor);
-        let mut certifier = CheckpointCertifier::new_for_test(vec![1; 4], 3, 0);
+        let mut state = state();
+        let metrics = metrics();
         let create = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
         let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
-        let (_, minted) =
-            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag(vec![execute]));
+        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, subdag(vec![execute]));
         let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
 
-        // Votes for the first checkpoint share the sub-dag with a fresh transaction.
-        let vote = || Envelope::new(0, Payload::Attest(checkpoint.clone())).to_bytes();
+        // Votes for the first checkpoint share the sub-dag with a fresh transaction; the vote
+        // stamps must stay out of the new checkpoint's mean.
+        let vote = || Envelope::new(7777, Payload::Attest(checkpoint.clone())).to_bytes();
         let update = FakeTransaction::success(vec![], vec![], vec![ObjectId::new(1)]);
-        let update = Envelope::new(0, Payload::Execute(update.into())).to_bytes();
+        let update = Envelope::new(500, Payload::Execute(update.into())).to_bytes();
         let blocks = vec![
             (0, vec![vote(), update]),
             (1, vec![vote()]),
             (2, vec![vote()]),
         ];
         let (executed, minted) =
-            Validator::execute_subdag(&mut scheduler, &mut certifier, subdag_at(2, blocks));
+            state.execute_subdag(&metrics, Duration::from_secs(2), subdag_at(2, blocks));
 
         assert_eq!(executed, 1);
-        assert!(minted.is_some());
-        let certified = certifier.highest_certified().expect("quorum must certify");
+        let second = minted.expect("the update must mint a second checkpoint");
+        let certified = state
+            .certifier
+            .highest_certified()
+            .expect("quorum must certify");
         assert_eq!(certified.checkpoint(), &checkpoint);
         // The prior checkpoint certified and was reclaimed; only the new mint is pending.
-        assert_eq!(certifier.pending().count(), 1);
+        assert_eq!(state.certifier.pending().count(), 1);
+
+        // Certifying the second checkpoint closes its metrics from the update's stamp alone:
+        // minted at 2s from a 0.5s submission, certified at 6s.
+        let votes = (0..3)
+            .map(|author| {
+                let vote = Envelope::new(0, Payload::Attest(second.clone())).to_bytes();
+                (author, vec![vote])
+            })
+            .collect();
+        state.execute_subdag(&metrics, Duration::from_secs(6), subdag_at(3, votes));
+        let certification = metrics.checkpoint_certification_latency_s();
+        assert_eq!(certification.get_sample_count(), 2);
+        assert_eq!(certification.get_sample_sum(), 2.0 + 4.0);
+        let end_to_end = metrics.end_to_end_latency_s();
+        assert_eq!(end_to_end.get_sample_count(), 2);
+        assert_eq!(end_to_end.get_sample_sum(), 2.0 + 5.5);
     }
 }

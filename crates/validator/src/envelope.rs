@@ -46,6 +46,11 @@ impl Envelope {
         self.payload
     }
 
+    /// The submission time stamped at [`new`](Envelope::new), in milliseconds since epoch.
+    pub(crate) fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
+
     /// Encodes the envelope into the opaque bytes carried by consensus.
     pub fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(self).expect("Serialization should not fail")

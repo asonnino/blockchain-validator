@@ -33,11 +33,21 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
         .await;
     testbed.wait_for_transactions(2).await;
     testbed.wait_for_certified().await;
-    // Metric (b) observes every delivered sub-dag with real durations on the tokio path.
+    // Metric (b) observes every delivered sub-dag with real durations on the tokio path;
+    // certification and end-to-end observe once per certified checkpoint.
     for validator in testbed.validators() {
         let histogram = validator.metrics().subdag_execution_latency_s();
         assert!(histogram.get_sample_count() > 0);
         assert!(histogram.get_sample_sum() > 0.0);
+        let certification = validator.metrics().checkpoint_certification_latency_s();
+        assert!(certification.get_sample_count() > 0);
+        assert!(certification.get_sample_sum() > 0.0);
+        let end_to_end = validator.metrics().end_to_end_latency_s();
+        assert_eq!(
+            end_to_end.get_sample_count(),
+            certification.get_sample_count()
+        );
+        assert!(end_to_end.get_sample_sum() > 0.0);
     }
     // The shared registry serves scraping: validator and replica metrics both land in it.
     for registry in testbed.registries() {
