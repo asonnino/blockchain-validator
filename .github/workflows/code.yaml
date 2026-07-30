@@ -86,7 +86,8 @@ jobs:
             --exclude-files "crates/**/benches/**/*" \
             --exclude-files "crates/**/tests/**/*" \
             --exclude-files "crates/**/test_utils/**/*" \
-            -- --include-ignored
+            -- --include-ignored \
+            --skip restarted_committee_recertifies_lost_votes # blocked on asonnino/mysticeti#221
   dependencies:
     name: Check dependencies
     needs: diff
