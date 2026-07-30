@@ -54,3 +54,6 @@ a rev in the workspace `Cargo.toml`; bump the rev everywhere at once.
 - When mysticeti internals are unclear, read the sister repo directly —
   `docs/architecture.md` there documents the crate seams and the
   transaction-input / commit-output contract.
+- Never modify the mysticeti sister repo without explicit consent. When an upstream bug or
+  missing feature blocks work here, instead (1) file an issue on `asonnino/mysticeti` and
+  (2) leave a todo referencing it, to be acted on at a future rev bump.
