@@ -33,6 +33,22 @@ async fn submitted_transactions_execute_identically_on_all_validators() {
         .await;
     testbed.wait_for_transactions(2).await;
     testbed.wait_for_certified().await;
+    // Metric (b) observes every delivered sub-dag with real durations on the tokio path.
+    for validator in testbed.validators() {
+        let histogram = validator.metrics().subdag_execution_latency_s();
+        assert!(histogram.get_sample_count() > 0);
+        assert!(histogram.get_sample_sum() > 0.0);
+    }
+    // The shared registry serves scraping: validator and replica metrics both land in it.
+    for registry in testbed.registries() {
+        let families: Vec<_> = registry.gather();
+        assert!(
+            families
+                .iter()
+                .any(|family| family.name() == "subdag_execution_latency_s")
+        );
+        assert!(families.iter().any(|family| family.name() == "latency_s"));
+    }
     let results = testbed.shutdown().await;
 
     let (reference, certifier) = &results[0];

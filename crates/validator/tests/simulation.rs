@@ -129,9 +129,11 @@ async fn submission_loop(
     }
 }
 
+/// Per-validator state, metrics, and delivered-sub-dag counts (the metric-(b) sample count).
 type RunOutcome = (
     Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)>,
     Vec<Arc<Metrics>>,
+    Vec<u64>,
 );
 
 fn run_once(seed: u64) -> RunOutcome {
@@ -148,14 +150,22 @@ fn run_once(seed: u64) -> RunOutcome {
         let total = (COMMITTEE_SIZE * (STATE_UPDATES + 1)) as u64;
         committee.wait_for_transactions(total).await;
         committee.wait_for_certified().await;
+        // Metric (b) observes every delivered sub-dag. Values are zero under simulated time
+        // (execution advances no simulated clock), so only population is meaningful.
+        let mut delivered = Vec::with_capacity(COMMITTEE_SIZE);
+        for validator in committee.validators() {
+            let histogram = validator.metrics().subdag_execution_latency_s();
+            assert!(histogram.get_sample_count() > 0);
+            delivered.push(histogram.get_sample_count());
+        }
         let metrics = committee.metrics.clone();
-        (committee.shutdown().await, metrics)
+        (committee.shutdown().await, metrics, delivered)
     })
 }
 
 #[test]
 fn validators_converge_under_simulation() {
-    let (results, metrics) = run_once(7);
+    let (results, metrics, _) = run_once(7);
 
     // Commit latency derives from the envelope timestamps: positive, and bounded well below
     // the several simulated seconds the submissions span — unstamped payloads would instead
@@ -196,8 +206,12 @@ fn validators_converge_under_simulation() {
 #[test]
 fn simulation_is_deterministic_per_seed() {
     for seed in [7, 42] {
-        let (first, _) = run_once(seed);
-        let (second, _) = run_once(seed);
+        let (first, _, first_delivered) = run_once(seed);
+        let (second, _, second_delivered) = run_once(seed);
+        assert_eq!(
+            first_delivered, second_delivered,
+            "seed {seed} produced diverging delivery counts"
+        );
         for ((a, a_certifier), (b, b_certifier)) in first.iter().zip(&second) {
             assert_eq!(
                 a.store(),

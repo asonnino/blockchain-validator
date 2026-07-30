@@ -11,6 +11,7 @@ checkpoint.workspace = true
 dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
+prometheus.workspace = true
 replica.workspace = true
 serde.workspace = true
 tokio.workspace = true

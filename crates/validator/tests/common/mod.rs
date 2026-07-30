@@ -11,6 +11,7 @@ use std::{fs, path::Path, time::Duration};
 use checkpoint::certifier::CheckpointCertifier;
 use dag::{authority::Authority, context::TokioCtx};
 use execution::{fake::FakeExecutor, scheduler::SequentialScheduler, transaction::Transaction};
+use prometheus::Registry;
 use replica::{
     builder::StorageKind,
     config::{PrivateReplicaConfig, PublicReplicaConfig},
@@ -24,6 +25,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// A committee of validators running on the local tokio network.
 pub struct Testbed {
     validators: Vec<ValidatorHandle<TokioCtx, FakeExecutor>>,
+    /// One registry per validator, shared between its replica and validator metrics.
+    registries: Vec<Registry>,
 }
 
 impl Testbed {
@@ -46,6 +49,7 @@ impl Testbed {
         );
 
         let mut validators = Vec::with_capacity(COMMITTEE_SIZE);
+        let mut registries = Vec::with_capacity(COMMITTEE_SIZE);
         for (index, private_config) in private_configs.into_iter().enumerate() {
             let storage = match dir {
                 Some(_) => {
@@ -54,6 +58,8 @@ impl Testbed {
                 }
                 None => StorageKind::Ephemeral,
             };
+            let registry = Registry::new();
+            registries.push(registry.clone());
             let validator = ValidatorBuilder::new(
                 FakeExecutor,
                 Authority::from(index),
@@ -61,6 +67,7 @@ impl Testbed {
                 private_config,
             )
             .with_storage(storage)
+            .with_registry(registry)
             .build()
             .expect("validator must build")
             .start::<TokioCtx>()
@@ -68,7 +75,18 @@ impl Testbed {
             .expect("validator must start");
             validators.push(validator);
         }
-        Self { validators }
+        Self {
+            validators,
+            registries,
+        }
+    }
+
+    pub fn registries(&self) -> &[Registry] {
+        &self.registries
+    }
+
+    pub fn validators(&self) -> &[ValidatorHandle<TokioCtx, FakeExecutor>] {
+        &self.validators
     }
 
     /// Submits transactions through the `validator`-th committee member.

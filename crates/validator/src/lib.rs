@@ -7,4 +7,5 @@
 //! sub-dags into the execution scheduler. Checkpointing comes later.
 
 pub mod envelope;
+pub mod metrics;
 pub mod validator;

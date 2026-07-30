@@ -15,6 +15,7 @@ use execution::{
     crypto::Digest, engine::ExecutionEngine, scheduler::SequentialScheduler,
     transaction::Transaction,
 };
+use prometheus::Registry;
 use replica::{
     builder::{ReplicaBuilder, StorageKind},
     config::{PrivateReplicaConfig, PublicReplicaConfig},
@@ -22,7 +23,10 @@ use replica::{
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::envelope::{Envelope, Payload};
+use crate::{
+    envelope::{Envelope, Payload},
+    metrics::ValidatorMetrics,
+};
 
 /// Capacity of the commit stream; a bounded channel is mandatory — a slow consumer must
 /// backpressure the replica rather than drop or reorder commits.
@@ -38,6 +42,7 @@ pub struct ValidatorBuilder<E> {
     public_config: PublicReplicaConfig,
     /// The consensus WAL to replay on start; `None` for ephemeral storage.
     wal: Option<PathBuf>,
+    registry: Registry,
     replica: ReplicaBuilder,
 }
 
@@ -54,8 +59,16 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             public_config: public_config.clone(),
             // The replica defaults to WAL storage at this path when `with_storage` is not called.
             wal: Some(private_config.wal()),
+            registry: Registry::new(),
             replica: ReplicaBuilder::new(authority, public_config, private_config),
         }
+    }
+
+    /// Share one Prometheus registry between the replica's and the validator's metrics.
+    pub fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = registry.clone();
+        self.replica = self.replica.with_registry(registry);
+        self
     }
 
     pub fn with_storage(mut self, storage: StorageKind) -> Self {
@@ -99,6 +112,7 @@ impl<E: ExecutionEngine + Send + 'static> ValidatorBuilder<E> {
             authority: self.authority,
             public_config: self.public_config,
             wal: self.wal,
+            metrics: ValidatorMetrics::new(&self.registry),
             replica: self.replica.with_commit_consumer(sender).build(),
             receiver,
         })
@@ -112,6 +126,7 @@ pub struct Validator<E> {
     authority: Authority,
     public_config: PublicReplicaConfig,
     wal: Option<PathBuf>,
+    metrics: Arc<ValidatorMetrics>,
     replica: Replica,
     receiver: mpsc::Receiver<CommittedSubDag>,
 }
@@ -128,6 +143,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             mut certifier,
             replica,
             mut receiver,
+            metrics,
             ..
         } = self;
 
@@ -136,6 +152,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
         let (executed_sender, executed) = watch::channel(replayed);
         let (certified_sender, certified) =
             watch::channel(Self::certification_status(&certifier, &scheduler));
+        let driver_metrics = metrics.clone();
         let driver = C::spawn(async move {
             // Re-attest checkpoints uncertified at replay: votes in flight at shutdown died
             // with the transaction queue, and a validator otherwise attests only once, so an
@@ -155,8 +172,12 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
 
             let mut count = replayed;
             while let Some(subdag) = receiver.recv().await {
+                // The clock starts at delivery (idle waiting is not latency) and stops after
+                // execution, checkpoint minting, and vote recording.
+                let start = C::now();
                 let (executed, minted) =
                     Self::execute_subdag(&mut scheduler, &mut certifier, subdag);
+                driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
                 count += executed as u64;
                 let _ = executed_sender.send(count);
                 let _ = certified_sender.send(Self::certification_status(&certifier, &scheduler));
@@ -179,6 +200,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             driver,
             executed,
             certified,
+            metrics,
         })
     }
 
@@ -295,6 +317,7 @@ pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     driver: C::JoinHandle<(SequentialScheduler<E>, CheckpointCertifier)>,
     executed: watch::Receiver<u64>,
     certified: watch::Receiver<(Option<Digest>, Digest)>,
+    metrics: Arc<ValidatorMetrics>,
 }
 
 impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
@@ -312,6 +335,11 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
             })
             .collect();
         self.replica.submit(transactions).await
+    }
+
+    /// The validator's metrics.
+    pub fn metrics(&self) -> &Arc<ValidatorMetrics> {
+        &self.metrics
     }
 
     /// Waits until at least `count` transactions have been executed. Returns early if the
