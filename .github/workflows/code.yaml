@@ -53,7 +53,7 @@ jobs:
     if: ${{ needs.diff.outputs.isRelevantForRustTests == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # pin@v2.85.2
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # pin@v2.85.4
         with:
           tool: cargo-nextest
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
@@ -72,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # pin@v2.9.1
         with:
           save-if: "true"
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # pin@v2.85.2
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # pin@v2.85.4
         with:
           tool: cargo-tarpaulin
       - name: Generate code coverage
@@ -95,7 +95,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # pin@v2.85.2
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # pin@v2.85.4
         with:
           tool: cargo-deny
       - name: Check bans, licenses, and sources
@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # pin@v2.85.2
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # pin@v2.85.4
         with:
           tool: cargo-deny
       - name: Check advisories
