@@ -7,5 +7,7 @@
 //! sub-dags into the execution scheduler. Checkpointing comes later.
 
 pub mod envelope;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod generator;
 pub mod metrics;
 pub mod validator;
