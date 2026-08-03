@@ -425,6 +425,12 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
         }
     }
 
+    /// Resolves when the replica crashes or stops; long-running deployments select on this.
+    /// The driver task is detached and dies with the process.
+    pub async fn await_completion(self) -> eyre::Result<()> {
+        self.replica.await_completion().await
+    }
+
     /// Stops the replica, waits for the driver to drain the remaining commits, and returns the
     /// scheduler with the executed state and the checkpoint certifier.
     pub async fn shutdown(self) -> (SequentialScheduler<E>, CheckpointCertifier) {

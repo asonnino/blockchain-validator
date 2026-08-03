@@ -11,12 +11,12 @@ use prometheus::{
     register_int_counter_with_registry,
 };
 
-// Metric names. The counter is prefixed because the replica already registers a
-// `submitted_transactions` in the same registry.
-const SUBMITTED_TRANSACTIONS: &str = "validator_submitted_transactions";
-const SUBDAG_EXECUTION_LATENCY_S: &str = "subdag_execution_latency_s";
-const CHECKPOINT_CERTIFICATION_LATENCY_S: &str = "checkpoint_certification_latency_s";
-const END_TO_END_LATENCY_S: &str = "end_to_end_latency_s";
+// Metric names, public for scrapers. The counter is prefixed because the replica already
+// registers a `submitted_transactions` in the same registry.
+pub const SUBMITTED_TRANSACTIONS: &str = "validator_submitted_transactions";
+pub const SUBDAG_EXECUTION_LATENCY_S: &str = "subdag_execution_latency_s";
+pub const CHECKPOINT_CERTIFICATION_LATENCY_S: &str = "checkpoint_certification_latency_s";
+pub const END_TO_END_LATENCY_S: &str = "end_to_end_latency_s";
 
 /// Mysticeti's consensus-latency buckets: dense around the expected commit latency.
 const LATENCY_SEC_BUCKETS: &[f64] = &[
