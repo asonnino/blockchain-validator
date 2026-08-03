@@ -16,7 +16,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use replica::client::TransactionClient;
 
 use crate::{
-    envelope::{Envelope, Payload},
+    envelope::{Envelope, MAX_PAYLOAD_SIZE, Payload},
     metrics::ValidatorMetrics,
 };
 
@@ -69,6 +69,12 @@ impl TransactionGenerator {
         assert!(
             config.transaction_size > overhead,
             "transaction_size must be greater than {overhead} bytes"
+        );
+        // Oversized envelopes fail to decode after commit and are silently skipped, so the
+        // generator would exercise nothing downstream.
+        assert!(
+            config.transaction_size as u64 <= MAX_PAYLOAD_SIZE,
+            "transaction_size must not exceed the {MAX_PAYLOAD_SIZE}-byte payload cap"
         );
         let args_len = config.transaction_size - overhead;
         tracing::info!(
@@ -152,7 +158,6 @@ impl TransactionGenerator {
             (self.max_block_size / config.transaction_size).min(transactions_per_interval);
 
         let mut counter = 0u64;
-        let mut transactions_to_report = 0u64;
 
         // Cache the context clock at startup and derive subsequent timestamps from a
         // monotonic instant, avoiding repeated clock reads in the hot loop. Works uniformly
@@ -189,12 +194,10 @@ impl TransactionGenerator {
                 return;
             }
 
-            transactions_to_report += transactions_per_interval as u64;
-            if counter.is_multiple_of(100) {
-                self.metrics
-                    .inc_submitted_transactions(transactions_to_report);
-                transactions_to_report = 0;
-            }
+            // Reported per tick, diverging from upstream's amortized flush: a counter must
+            // not under-report, and ten atomic adds per second cost nothing.
+            self.metrics
+                .inc_submitted_transactions(transactions_per_interval as u64);
         }
     }
 }
