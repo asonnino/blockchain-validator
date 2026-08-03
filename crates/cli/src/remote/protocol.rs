@@ -148,11 +148,16 @@ impl ProtocolCommands for ValidatorProtocol {
     fn node_command<I>(
         &self,
         instances: I,
-        _parameters: &BenchmarkParameters<Self::NodeParameters, Self::ClientParameters>,
+        parameters: &BenchmarkParameters<Self::NodeParameters, Self::ClientParameters>,
     ) -> Vec<(Instance, String)>
     where
         I: IntoIterator<Item = Instance>,
     {
+        // The per-node share of the total load; the generator rejects a zero load, so nodes
+        // without one to bear run without the flag (and without a generator).
+        // Todo: unit-test this builder once orchestrator's `Instance` has a test constructor
+        // (asonnino/mysticeti#225).
+        let load = parameters.load / parameters.nodes;
         instances
             .into_iter()
             .enumerate()
@@ -165,18 +170,20 @@ impl ProtocolCommands for ValidatorProtocol {
                 let load_generator_config_path =
                     self.working_dir.join(LOAD_GENERATOR_CONFIG_FILENAME);
 
-                let run = [
-                    &format!("./{BINARY_PATH}/validator"),
-                    "run",
-                    &format!("--authority {}", authority.index()),
-                    &format!("--public-config-path {}", public_config_path.display()),
-                    &format!("--private-config-path {}", private_config_path.display()),
-                    &format!(
+                let mut run = vec![
+                    format!("./{BINARY_PATH}/validator"),
+                    "run".into(),
+                    format!("--authority {}", authority.index()),
+                    format!("--public-config-path {}", public_config_path.display()),
+                    format!("--private-config-path {}", private_config_path.display()),
+                ];
+                if load > 0 {
+                    run.push(format!(
                         "--load-generator-config-path {}",
                         load_generator_config_path.display()
-                    ),
-                ]
-                .join(" ");
+                    ));
+                }
+                let run = run.join(" ");
 
                 let command = ["source $HOME/.cargo/env", &run].join(" && ");
                 (instance, command)

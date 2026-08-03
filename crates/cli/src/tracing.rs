@@ -62,7 +62,7 @@ impl ValidatorTracing {
         match self.log_file {
             Some(path) => {
                 let file = File::create(&path)
-                    .wrap_err_with(|| format!("opening log file {}", path.display()))?;
+                    .wrap_err_with(|| format!("creating log file {}", path.display()))?;
                 let (writer, guard) = tracing_appender::non_blocking(file);
                 fmt()
                     .with_env_filter(filter)
