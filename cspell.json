@@ -34,11 +34,14 @@
         "recertifies",
         "rngs",
         "roundtrips",
+        "russh",
+        "rustls",
         "rustc",
         "RUSTDOCFLAGS",
         "RUSTSEC",
         "RUSTUP",
         "seedable",
+        "sidechannel",
         "serde",
         "shellcheck",
         "stdlib",
@@ -54,7 +57,9 @@
         "ungated",
         "unminted",
         "venv",
+        "webpki",
         "worktrees",
+        "xlarge",
         "writebacks"
     ]
 }

@@ -10,6 +10,7 @@ use crate::args::{Args, Command};
 
 mod args;
 mod commands;
+mod remote;
 mod tracing;
 
 #[tokio::main]
@@ -21,6 +22,9 @@ async fn main() -> Result<()> {
     match args.command {
         Command::TestGenesis(sub) => commands::genesis::test_genesis(sub, log_level, log_file)?,
         Command::Run(sub) => commands::run::run(sub, log_level, log_file).await?,
+        Command::RemoteTestbed(sub) => {
+            commands::remote_testbed::remote_testbed(sub, log_level, log_file).await?
+        }
     }
 
     Ok(())

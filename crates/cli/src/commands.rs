@@ -2,4 +2,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod genesis;
+pub mod remote_testbed;
 pub mod run;

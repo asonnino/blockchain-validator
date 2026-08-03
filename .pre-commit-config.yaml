@@ -4,6 +4,9 @@ repos:
     hooks:
       - id: check-merge-conflict
       - id: check-yaml
+        # The orchestrator settings templates use provider tags (`!aws`) that the
+        # safe YAML loader rejects.
+        exclude: ^crates/cli/assets/
       - id: check-symlinks
       - id: end-of-file-fixer
       - id: mixed-line-ending

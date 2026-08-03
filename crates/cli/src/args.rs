@@ -34,6 +34,12 @@ pub enum Command {
 
     /// Run a single validator from config files.
     Run(RunArgs),
+
+    /// Manage a remote (cloud) testbed of validators and run benchmarks on it.
+    ///
+    /// Requires a settings file describing the cloud provider, regions, and repository to
+    /// deploy. See `crates/cli/assets/settings-aws-template.yml` for a starting point.
+    RemoteTestbed(RemoteTestbedArgs),
 }
 
 #[derive(clap::Args)]
@@ -64,4 +70,65 @@ pub struct RunArgs {
     /// generator.
     #[arg(long, value_name = "FILE")]
     pub load_generator_config_path: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct RemoteTestbedArgs {
+    /// Path to the YAML settings file (cloud provider, regions, repository, etc.).
+    #[arg(long, value_name = "FILE")]
+    pub settings_path: PathBuf,
+
+    #[command(subcommand)]
+    pub command: RemoteTestbedCommand,
+}
+
+#[derive(clap::Subcommand)]
+pub enum RemoteTestbedCommand {
+    /// Print the current testbed instances and SSH commands to reach them.
+    Status,
+
+    /// Create a given number of instances per region (or in a single specified region).
+    Create {
+        /// Number of instances to create (per region, unless `--region` is set).
+        #[arg(long)]
+        instances: usize,
+        /// Limit creation to this region. Omit to create instances in every configured region.
+        #[arg(long)]
+        region: Option<String>,
+    },
+
+    /// Boot the specified number of stopped instances per region.
+    Start {
+        /// Maximum number of instances to start per region.
+        #[arg(long, default_value_t = 10)]
+        instances: usize,
+    },
+
+    /// Stop all active instances (does not destroy them).
+    Stop,
+
+    /// Destroy the testbed and terminate every instance.
+    Destroy,
+
+    /// Deploy validators and run a benchmark sweep over the supplied loads.
+    Benchmark {
+        /// Committee size for the benchmark.
+        #[arg(long, value_name = "INT", default_value_t = 4)]
+        committee: usize,
+
+        /// Comma-separated list of loads to sweep (tx/s). One run per load.
+        /// A load of `0` runs the validators without load generators.
+        #[arg(long, value_name = "INT", value_delimiter = ',', default_value = "200")]
+        loads: Vec<usize>,
+
+        /// Skip `apt`/repo update on the testbed before benchmarking. Dangerous: may run
+        /// outdated validators. Useful only when iterating locally on the same commit.
+        #[arg(long)]
+        skip_testbed_update: bool,
+
+        /// Skip generating fresh genesis + per-validator configs. Dangerous: validators may
+        /// be misconfigured for the requested committee size.
+        #[arg(long)]
+        skip_testbed_configuration: bool,
+    },
 }

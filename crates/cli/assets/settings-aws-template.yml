@@ -1,0 +1,15 @@
+testbed_id: "${USER}-validator"
+cloud_provider: !aws
+  specs: m5d.8xlarge
+  token_file: "/Users/${USER}/.aws/credentials"
+ssh_private_key_file: "/Users/${USER}/.ssh/aws"
+regions:
+  - us-west-1
+repository:
+  url: https://github.com/asonnino/blockchain-validator.git
+  commit: main
+# Each benchmark runs for this long (seconds); 0 runs until Ctrl-C.
+benchmark_duration: 120
+# The benchmark's total load (tx/s) is split evenly across the committee, truncating.
+# node_parameters_path: replica-parameters.yaml
+# client_parameters_path: load-generator-config.yaml

@@ -14,7 +14,10 @@ clap.workspace = true
 dag.workspace = true
 execution = { workspace = true, features = ["test-utils"] }
 eyre.workspace = true
+orchestrator.workspace = true
 replica.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
 tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",
