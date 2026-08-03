@@ -9,33 +9,71 @@
 use std::{mem, sync::Arc, time::Duration};
 
 use dag::{
-    authority::Authority, block::transaction::Transaction as ConsensusTransaction, context::Ctx,
+    authority::Authority, block::transaction::Transaction as ConsensusTransaction,
+    config::ImportExport, context::Ctx,
 };
 use execution::{fake::FakeTransaction, object::ObjectId};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use replica::client::TransactionClient;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     envelope::{Envelope, MAX_PAYLOAD_SIZE, Payload},
     metrics::ValidatorMetrics,
 };
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LoadGeneratorConfig {
     /// Transactions to submit per second.
+    #[serde(default = "load_generator_defaults::default_load")]
     pub load: usize,
     /// Serialized envelope size per transaction, in bytes.
+    #[serde(default = "load_generator_defaults::default_transaction_size")]
     pub transaction_size: usize,
     /// Delay before the first submission.
+    /// Accepts humantime strings in YAML (e.g. `"0s"`, `"500ms"`, `"30s"`).
+    #[serde(default = "load_generator_defaults::default_initial_delay")]
+    #[serde(with = "humantime_serde")]
     pub initial_delay: Duration,
 }
 
 impl LoadGeneratorConfig {
+    pub const DEFAULT_FILENAME: &'static str = "load-generator-config.yaml";
+
     pub fn new_for_test() -> Self {
         Self {
             load: 100,
             transaction_size: 128,
             initial_delay: Duration::ZERO,
         }
+    }
+}
+
+impl Default for LoadGeneratorConfig {
+    fn default() -> Self {
+        Self {
+            load: load_generator_defaults::default_load(),
+            transaction_size: load_generator_defaults::default_transaction_size(),
+            initial_delay: load_generator_defaults::default_initial_delay(),
+        }
+    }
+}
+
+impl ImportExport for LoadGeneratorConfig {}
+
+mod load_generator_defaults {
+    use std::time::Duration;
+
+    pub fn default_load() -> usize {
+        10
+    }
+
+    pub fn default_transaction_size() -> usize {
+        512
+    }
+
+    pub fn default_initial_delay() -> Duration {
+        Duration::from_secs(30)
     }
 }
 
@@ -260,5 +298,36 @@ mod tests {
         };
         let (first, other) = (ids(batch(1, 1, 100)), ids(batch(1, 2, 100)));
         assert!(first.iter().all(|id| !other.contains(id)));
+    }
+
+    #[test]
+    fn config_roundtrips_through_yaml_files() {
+        let config = LoadGeneratorConfig {
+            load: 250,
+            transaction_size: 256,
+            initial_delay: Duration::from_secs(5),
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        config.print(file.path()).unwrap();
+        // Hand-edited and orchestrator-uploaded configs rely on the humantime disk format.
+        let written = std::fs::read_to_string(file.path()).unwrap();
+        assert!(written.contains("initial_delay: 5s"), "{written}");
+        let loaded = LoadGeneratorConfig::load(file.path()).unwrap();
+        assert_eq!(loaded.load, config.load);
+        assert_eq!(loaded.transaction_size, config.transaction_size);
+        assert_eq!(loaded.initial_delay, config.initial_delay);
+    }
+
+    #[test]
+    fn config_fills_defaults_and_parses_humantime_delays() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "initial_delay: 30s\n").unwrap();
+        let loaded = LoadGeneratorConfig::load(file.path()).unwrap();
+        assert_eq!(loaded.load, LoadGeneratorConfig::default().load);
+        assert_eq!(
+            loaded.transaction_size,
+            LoadGeneratorConfig::default().transaction_size
+        );
+        assert_eq!(loaded.initial_delay, Duration::from_secs(30));
     }
 }

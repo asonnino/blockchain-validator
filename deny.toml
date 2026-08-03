@@ -10,6 +10,14 @@ ignore = [
   # proc-macro-error2 is unmaintained; pulled in via tabled_derive through
   # mysticeti's dag crate.
   "RUSTSEC-2026-0173",
+  # rsa's Marvin timing sidechannel has no fixed release; pulled in via russh
+  # through mysticeti's orchestrator, used only by the benchmark tooling.
+  "RUSTSEC-2023-0071",
+  # rustls-webpki 0.101 certificate-validation advisories; pinned by the
+  # old-gen rustls 0.21 inside aws-smithy-http-client, benchmark tooling only.
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
 ]
 
 # This section is considered when running `cargo deny check licenses`
@@ -62,6 +70,14 @@ skip-tree = [
   # ed25519-consensus 2.1 pulls old sha2 0.9, digest 0.9, and rand_core 0.6
   # via curve25519-dalek-ng.
   { name = "ed25519-consensus" },
+  # aws-sdk-* still pulls old-gen http/hyper/rustls via aws-smithy-http-client
+  # alongside the new-gen stack; nothing we can fix downstream.
+  { name = "aws-config" },
+  { name = "aws-sdk-ec2" },
+  # russh pulls the RustCrypto release-candidate crypto crates while the rest
+  # of the tree uses the stable line. Nothing we can fix downstream until
+  # either side migrates.
+  { name = "russh" },
 ]
 
 # This section is considered when running `cargo deny check sources`.

@@ -26,7 +26,7 @@ use replica::{
 };
 use tokio::sync::{mpsc, watch};
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, feature = "benchmark"))]
 use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
@@ -387,7 +387,7 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
 
     /// Starts the built-in load generator; its transactions share the replica's submission
     /// channel with [`submit`](ValidatorHandle::submit). Stop it with [`Ctx::abort`].
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(any(test, feature = "benchmark"))]
     pub fn start_load_generator(&self, config: LoadGeneratorConfig) -> C::JoinHandle<()> {
         TransactionGenerator::start::<C>(
             self.replica.transaction_client(),
@@ -423,6 +423,12 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
                 return;
             }
         }
+    }
+
+    /// Resolves when the replica crashes or stops; long-running deployments select on this.
+    /// The driver task is detached and dies with the process.
+    pub async fn await_completion(self) -> eyre::Result<()> {
+        self.replica.await_completion().await
     }
 
     /// Stops the replica, waits for the driver to drain the remaining commits, and returns the
