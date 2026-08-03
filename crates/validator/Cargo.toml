@@ -11,6 +11,7 @@ checkpoint.workspace = true
 dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
+humantime-serde = { workspace = true, optional = true }
 prometheus.workspace = true
 rand = { workspace = true, optional = true }
 replica.workspace = true
@@ -19,12 +20,13 @@ tokio.workspace = true
 tracing.workspace = true
 
 [features]
-benchmark = ["dep:rand", "execution/test-utils"]
+benchmark = ["dep:humantime-serde", "dep:rand", "execution/test-utils"]
 
 [dev-dependencies]
 checkpoint = { workspace = true, features = ["test-utils"] }
 execution = { workspace = true, features = ["test-utils"] }
 futures.workspace = true
+humantime-serde.workspace = true
 rand.workspace = true
 simulator.workspace = true
 # Self-dependency turning on the gated load generator for the test targets.

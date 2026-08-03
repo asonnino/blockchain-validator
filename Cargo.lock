@@ -1792,6 +1792,7 @@ dependencies = [
  "execution",
  "eyre",
  "futures",
+ "humantime-serde",
  "prometheus",
  "rand",
  "replica",
