@@ -52,8 +52,10 @@ Flag both directions:
 
 - Constructors, methods, and impls used only by tests must be gated
   `#[cfg(any(test, feature = "test-utils"))]` (crate-external test users) or `#[cfg(test)]`
-  (in-crate only). Ungated test-only code ships in production builds.
-- A `test-utils` feature must exist in the crate's `Cargo.toml` when referenced, and must chain
+  (in-crate only). Ungated test-only code ships in production builds. Gated benchmark surface
+  (e.g. the validator's load generator) may live behind a `benchmark` feature instead — the
+  same rules apply to it.
+- A gating feature must exist in the crate's `Cargo.toml` when referenced, and must chain
   transitively (e.g. `test-utils = ["dag/test-utils", "execution/test-utils"]`) when the gated
   code calls another crate's gated code.
 - Dev-dependencies that enable a feature (`features = ["test-utils"]`) must actually need it;

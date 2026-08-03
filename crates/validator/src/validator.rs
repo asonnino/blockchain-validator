@@ -26,7 +26,7 @@ use replica::{
 };
 use tokio::sync::{mpsc, watch};
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, feature = "benchmark"))]
 use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
@@ -387,7 +387,7 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
 
     /// Starts the built-in load generator; its transactions share the replica's submission
     /// channel with [`submit`](ValidatorHandle::submit). Stop it with [`Ctx::abort`].
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(any(test, feature = "benchmark"))]
     pub fn start_load_generator(&self, config: LoadGeneratorConfig) -> C::JoinHandle<()> {
         TransactionGenerator::start::<C>(
             self.replica.transaction_client(),
