@@ -22,7 +22,7 @@ use crate::{
     metrics::ValidatorMetrics,
 };
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LoadGeneratorConfig {
     /// Transactions to submit per second.
     #[serde(default = "load_generator_defaults::default_load")]
@@ -309,6 +309,9 @@ mod tests {
         };
         let file = tempfile::NamedTempFile::new().unwrap();
         config.print(file.path()).unwrap();
+        // Hand-edited and orchestrator-uploaded configs rely on the humantime disk format.
+        let written = std::fs::read_to_string(file.path()).unwrap();
+        assert!(written.contains("initial_delay: 5s"), "{written}");
         let loaded = LoadGeneratorConfig::load(file.path()).unwrap();
         assert_eq!(loaded.load, config.load);
         assert_eq!(loaded.transaction_size, config.transaction_size);

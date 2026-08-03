@@ -26,7 +26,6 @@ benchmark = ["dep:humantime-serde", "dep:rand", "execution/test-utils"]
 checkpoint = { workspace = true, features = ["test-utils"] }
 execution = { workspace = true, features = ["test-utils"] }
 futures.workspace = true
-humantime-serde.workspace = true
 rand.workspace = true
 simulator.workspace = true
 # Self-dependency turning on the gated load generator for the test targets.
