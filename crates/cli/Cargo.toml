@@ -1,0 +1,27 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "validator"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+dag.workspace = true
+execution = { workspace = true, features = ["test-utils"] }
+eyre.workspace = true
+replica.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "time",
+] }
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+validator = { workspace = true, features = ["benchmark"] }
