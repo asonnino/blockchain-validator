@@ -161,8 +161,9 @@ impl TransactionGenerator {
         let base_instant = C::now();
 
         // Under tokio missed ticks are skipped (no catch-up burst after the initial delay);
-        // under the simulator the interval degrades to a fixed sleep between batches. Either
-        // way the rate never exceeds `load`.
+        // under the simulator the interval degrades to a fixed sleep between batches. Neither
+        // backend bursts, though `div_ceil` rounds the effective rate up to the next multiple
+        // of `intervals_per_second`, as upstream does.
         let mut interval = C::interval(Self::TARGET_BLOCK_INTERVAL);
         C::sleep(config.initial_delay).await;
         loop {
