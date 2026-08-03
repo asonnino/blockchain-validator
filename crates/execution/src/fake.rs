@@ -51,15 +51,22 @@ impl FakeTransaction {
         write_only: Vec<ObjectId>,
         read_write: Vec<ObjectId>,
     ) -> Self {
+        Self::success_with_args(read_only, write_only, read_write, Vec::new())
+    }
+
+    /// A [`FakeFunctionId::Success`] call carrying pure arguments; the engine ignores them, so
+    /// they act as payload padding.
+    pub fn success_with_args(
+        read_only: Vec<ObjectId>,
+        write_only: Vec<ObjectId>,
+        read_write: Vec<ObjectId>,
+        args: Vec<u8>,
+    ) -> Self {
         let mut inputs = Vec::with_capacity(read_only.len() + write_only.len() + read_write.len());
         inputs.extend(read_only.into_iter().map(|id| (id, AccessMode::ReadOnly)));
         inputs.extend(write_only.into_iter().map(|id| (id, AccessMode::WriteOnly)));
         inputs.extend(read_write.into_iter().map(|id| (id, AccessMode::ReadWrite)));
-        Self(Transaction::new(
-            FakeFunctionId::Success.id(),
-            inputs,
-            Vec::new(),
-        ))
+        Self(Transaction::new(FakeFunctionId::Success.id(), inputs, args))
     }
 
     /// A [`FakeFunctionId::Abort`] call.

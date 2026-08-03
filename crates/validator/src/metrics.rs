@@ -6,9 +6,14 @@
 
 use std::{sync::Arc, time::Duration};
 
-use prometheus::{Histogram, Registry, register_histogram_with_registry};
+use prometheus::{
+    Histogram, IntCounter, Registry, register_histogram_with_registry,
+    register_int_counter_with_registry,
+};
 
-// Metric names.
+// Metric names. The counter is prefixed because the replica already registers a
+// `submitted_transactions` in the same registry.
+const SUBMITTED_TRANSACTIONS: &str = "validator_submitted_transactions";
 const SUBDAG_EXECUTION_LATENCY_S: &str = "subdag_execution_latency_s";
 const CHECKPOINT_CERTIFICATION_LATENCY_S: &str = "checkpoint_certification_latency_s";
 const END_TO_END_LATENCY_S: &str = "end_to_end_latency_s";
@@ -19,6 +24,7 @@ const LATENCY_SEC_BUCKETS: &[f64] = &[
 ];
 
 pub struct ValidatorMetrics {
+    submitted_transactions: IntCounter,
     subdag_execution_latency_s: Histogram,
     checkpoint_certification_latency_s: Histogram,
     end_to_end_latency_s: Histogram,
@@ -27,6 +33,12 @@ pub struct ValidatorMetrics {
 impl ValidatorMetrics {
     pub fn new(registry: &Registry) -> Arc<Self> {
         Arc::new(Self {
+            submitted_transactions: register_int_counter_with_registry!(
+                SUBMITTED_TRANSACTIONS,
+                "Transactions submitted by the load generator",
+                registry,
+            )
+            .unwrap(),
             subdag_execution_latency_s: register_histogram_with_registry!(
                 SUBDAG_EXECUTION_LATENCY_S,
                 "Commit delivery to execution and checkpoint inclusion latency per sub-dag (s)",
@@ -53,6 +65,10 @@ impl ValidatorMetrics {
         })
     }
 
+    pub fn inc_submitted_transactions(&self, count: u64) {
+        self.submitted_transactions.inc_by(count);
+    }
+
     pub(crate) fn observe_subdag_execution_latency(&self, latency: Duration) {
         self.subdag_execution_latency_s
             .observe(latency.as_secs_f64());
@@ -67,7 +83,11 @@ impl ValidatorMetrics {
         self.end_to_end_latency_s.observe(latency.as_secs_f64());
     }
 
-    /// The raw histograms, for test assertions (`get_sample_count`/`get_sample_sum`).
+    /// The raw metrics, for test assertions (`get`/`get_sample_count`/`get_sample_sum`).
+    pub fn submitted_transactions(&self) -> &IntCounter {
+        &self.submitted_transactions
+    }
+
     pub fn subdag_execution_latency_s(&self) -> &Histogram {
         &self.subdag_execution_latency_s
     }

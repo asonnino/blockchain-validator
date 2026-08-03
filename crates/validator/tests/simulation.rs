@@ -22,12 +22,23 @@ use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
 };
 use simulator::{SimulatedNetwork, SimulatorContext, SimulatorExecutor};
-use validator::validator::{ValidatorBuilder, ValidatorHandle};
+use validator::{
+    generator::LoadGeneratorConfig,
+    validator::{ValidatorBuilder, ValidatorHandle},
+};
 
 const COMMITTEE_SIZE: usize = 4;
-const STATE_UPDATES: usize = 50;
-/// Spreads submissions across many consensus rounds (simulated time is free).
+/// Executed-transaction cut at which the load generators are stopped.
+const TARGET_TRANSACTIONS: u64 = 1_000;
+/// One quiescence window: long enough for any in-flight block to commit everywhere.
+const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Modifications each validator makes to its coupled object (simulated time is free).
+const COUPLED_UPDATES: usize = 20;
+/// Spreads the coupled submissions across many consensus rounds.
 const SUBMISSION_INTERVAL: Duration = Duration::from_millis(100);
+/// A few generated transactions per consensus block, so the generator's block-splitting path
+/// (mid-batch flushes plus a partial trailing block) is exercised on every tick.
+const MAX_BLOCK_SIZE: usize = 512;
 
 /// A committee of validators running under the simulator.
 struct SimulatedTestbed {
@@ -39,7 +50,8 @@ struct SimulatedTestbed {
 
 impl SimulatedTestbed {
     async fn start() -> Self {
-        let public_config = PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE);
+        let mut public_config = PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE);
+        public_config.parameters.dag.max_block_size = MAX_BLOCK_SIZE;
         let latency = Duration::from_millis(50)..Duration::from_millis(100);
         let (network, node_networks) = SimulatedNetwork::new(&public_config.committee(), latency);
         let private_configs =
@@ -106,8 +118,8 @@ impl SimulatedTestbed {
 
 /// Every validator creates its own object, then modifies it while reading its neighbor's: the
 /// read couples the Lamport versions across objects, so the final state encodes the commit
-/// interleaving.
-async fn submission_loop(
+/// interleaving — an ordering oracle the conflict-free generator load cannot provide.
+async fn coupled_workload(
     index: usize,
     validator: &ValidatorHandle<SimulatorContext, FakeExecutor>,
 ) {
@@ -118,7 +130,7 @@ async fn submission_loop(
         .submit(vec![create])
         .await
         .expect("submission must succeed");
-    for _ in 0..STATE_UPDATES {
+    for _ in 0..COUPLED_UPDATES {
         SimulatorContext::sleep(SUBMISSION_INTERVAL).await;
         // Aborts deterministically with a missing read until the neighbor's object is created.
         let modify = FakeTransaction::success(vec![neighbor], vec![], vec![id]).into();
@@ -139,22 +151,50 @@ type RunOutcome = (
 fn run_once(seed: u64) -> RunOutcome {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
         let mut committee = SimulatedTestbed::start().await;
-        let submissions = committee
+        let generators: Vec<_> = committee
+            .validators()
+            .iter()
+            .map(|validator| validator.start_load_generator(LoadGeneratorConfig::new_for_test()))
+            .collect();
+        let workloads = committee
             .validators()
             .iter()
             .enumerate()
-            .map(|(index, validator)| submission_loop(index, validator));
-        join_all(submissions).await;
+            .map(|(index, validator)| coupled_workload(index, validator));
+        join_all(workloads).await;
 
-        // Every submitted transaction executes (success or abort), so the cut is exact.
-        let total = (COMMITTEE_SIZE * (STATE_UPDATES + 1)) as u64;
-        committee.wait_for_transactions(total).await;
+        committee.wait_for_transactions(TARGET_TRANSACTIONS).await;
+        for generator in &generators {
+            SimulatorContext::abort(generator);
+        }
+        // Drain to a fixed point: submissions have stopped, but transactions already queued
+        // keep committing, and every validator must reach the same executed count and hold it
+        // for a full quiescence window before the stores are comparable.
+        loop {
+            let target = committee
+                .validators()
+                .iter()
+                .map(|v| v.executed())
+                .max()
+                .unwrap();
+            committee.wait_for_transactions(target).await;
+            SimulatorContext::sleep(DRAIN_INTERVAL).await;
+            if committee
+                .validators()
+                .iter()
+                .all(|v| v.executed() == target)
+            {
+                break;
+            }
+        }
         committee.wait_for_certified().await;
         // Metric (b) observes every delivered sub-dag. Values are zero under simulated time
         // (execution advances no simulated clock), so only population is meaningful.
         let mut delivered = Vec::with_capacity(COMMITTEE_SIZE);
         let mut certified_counts = Vec::with_capacity(COMMITTEE_SIZE);
         for validator in committee.validators() {
+            assert!(validator.executed() >= TARGET_TRANSACTIONS);
+            assert!(validator.metrics().submitted_transactions().get() > 0);
             let histogram = validator.metrics().subdag_execution_latency_s();
             assert!(histogram.get_sample_count() > 0);
             delivered.push(histogram.get_sample_count());
@@ -215,7 +255,7 @@ fn validators_converge_under_simulation() {
         assert_eq!(other.highest_certified(), Some(certified));
         assert!(other.pending().next().is_none());
     }
-    // Every submitter's object was created and modified at least once.
+    // Every validator's coupled object was created and modified at least once.
     for index in 0..COMMITTEE_SIZE {
         let latest = store
             .latest(&ObjectId::new(index as u64))

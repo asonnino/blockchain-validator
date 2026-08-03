@@ -12,10 +12,14 @@ dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
 prometheus.workspace = true
+rand = { workspace = true, optional = true }
 replica.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[features]
+test-utils = ["dep:rand", "execution/test-utils"]
 
 [dev-dependencies]
 checkpoint = { workspace = true, features = ["test-utils"] }
@@ -23,5 +27,7 @@ execution = { workspace = true, features = ["test-utils"] }
 futures.workspace = true
 rand.workspace = true
 simulator.workspace = true
+# Self-dependency turning on the gated load generator for the test targets.
+validator = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

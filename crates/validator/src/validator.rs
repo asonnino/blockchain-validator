@@ -26,6 +26,8 @@ use replica::{
 };
 use tokio::sync::{mpsc, watch};
 
+#[cfg(any(test, feature = "test-utils"))]
+use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
     metrics::ValidatorMetrics,
@@ -149,6 +151,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
     /// compose without overlap.
     pub async fn start<C: Ctx>(mut self) -> eyre::Result<ValidatorHandle<C, E>> {
         let replayed = self.replay()?;
+        let max_block_size = self.public_config.parameters.dag.max_block_size;
         let Self {
             mut state,
             replica,
@@ -209,6 +212,7 @@ impl<E: ExecutionEngine + Send + 'static> Validator<E> {
             executed,
             certified,
             metrics,
+            max_block_size,
         })
     }
 
@@ -346,6 +350,7 @@ pub struct ValidatorHandle<C: Ctx, E: ExecutionEngine + Send + 'static> {
     executed: watch::Receiver<u64>,
     certified: watch::Receiver<(Option<Digest>, Digest)>,
     metrics: Arc<ValidatorMetrics>,
+    max_block_size: usize,
 }
 
 impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
@@ -368,6 +373,29 @@ impl<C: Ctx, E: ExecutionEngine + Send + 'static> ValidatorHandle<C, E> {
     /// The validator's metrics.
     pub fn metrics(&self) -> &Arc<ValidatorMetrics> {
         &self.metrics
+    }
+
+    /// The replica's block-size cap, which bounds every submitted batch.
+    pub fn max_block_size(&self) -> usize {
+        self.max_block_size
+    }
+
+    /// The number of transactions executed so far.
+    pub fn executed(&self) -> u64 {
+        *self.executed.borrow()
+    }
+
+    /// Starts the built-in load generator; its transactions share the replica's submission
+    /// channel with [`submit`](ValidatorHandle::submit). Stop it with [`Ctx::abort`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn start_load_generator(&self, config: LoadGeneratorConfig) -> C::JoinHandle<()> {
+        TransactionGenerator::start::<C>(
+            self.replica.transaction_client(),
+            self.replica.authority(),
+            config,
+            self.max_block_size,
+            self.metrics.clone(),
+        )
     }
 
     /// Waits until at least `count` transactions have been executed. Returns early if the
