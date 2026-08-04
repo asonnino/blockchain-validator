@@ -33,3 +33,8 @@ tarpaulin-report.html
 # OS
 .DS_Store
 Thumbs.db
+
+# Benchmark orchestration (local settings and outputs)
+crates/cli/assets/settings.yml
+/results/
+/logs/

@@ -5,7 +5,8 @@
     "ignorePaths": [
         ".git",
         "Cargo.lock",
-        "LICENSE"
+        "LICENSE",
+        "crates/cli/assets/grafana-dashboard.json"
     ],
     "words": [
         "amannn",
