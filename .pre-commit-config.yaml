@@ -16,8 +16,6 @@ repos:
     hooks:
       - id: editorconfig-checker
         alias: ec
-        # Vendored Grafana-format JSON (long PromQL lines).
-        exclude: ^crates/cli/assets/grafana-dashboard\.json$
   - repo: https://github.com/google/yamlfmt
     rev: v0.21.0
     hooks:

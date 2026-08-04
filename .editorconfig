@@ -21,6 +21,10 @@ max_line_length = 200
 indent_size = 2
 max_line_length = 150
 
+# Vendored Grafana-format JSON (long PromQL expressions).
+[crates/cli/assets/grafana-dashboard.json]
+max_line_length = unset
+
 # Ignore paths
 [{.git/**/*,.claude/**/*,**/*.lock,LICENSE}]
 charset = unset

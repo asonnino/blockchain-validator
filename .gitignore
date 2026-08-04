@@ -36,5 +36,7 @@ Thumbs.db
 
 # Benchmark orchestration (local settings and outputs)
 crates/cli/assets/settings.yml
+crates/cli/assets/client-parameters.yml
+crates/cli/assets/node-parameters.yml
 /results/
 /logs/
