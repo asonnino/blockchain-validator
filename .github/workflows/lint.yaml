@@ -55,13 +55,13 @@ jobs:
     name: Check typos
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
-      - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # pin@v1.48.0
+      - uses: crate-ci/typos@4d9c206a77c041268485162b8e2579ad7a5cb9a3 # pin@v1.50.0
   cspell:
     runs-on: ubuntu-latest
     name: Check spelling
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
-      - uses: streetsidesoftware/cspell-action@de2a73e963e7443969755b648a1008f77033c5b2 # pin@v8.4.0
+      - uses: streetsidesoftware/cspell-action@e0668cf020899e887ee8ad4d173c31738a79eae8 # pin@v9.0.1
         with:
           incremental_files_only: false
   shellcheck:
@@ -77,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
       - name: Install licensesnip
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # pin@v2.85.2
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # pin@v2.87.1
         with:
           tool: licensesnip@1.7.0
       - run: licensesnip check
@@ -94,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Decide whether all needed jobs succeeded
-        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # pin@v1.2.2
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # pin@v1.3.0
         with:
           allowed-skips: ${{ toJSON(needs) }}
           jobs: ${{ toJSON(needs) }}
