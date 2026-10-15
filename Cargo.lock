@@ -696,6 +696,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1273,7 +1279,7 @@ name = "dag"
 version = "0.1.0"
 source = "git+https://github.com/asonnino/mysticeti?rev=5a093a2223bda5cca1d15ee6bee97438782ab32e#5a093a2223bda5cca1d15ee6bee97438782ab32e"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "blake2 0.10.6",
  "crc32fast",
  "digest 0.10.7",
@@ -1578,7 +1584,7 @@ dependencies = [
 name = "execution"
 version = "0.1.0"
 dependencies = [
- "bincode",
+ "bincode 3.0.0",
  "blake2 0.10.6",
  "digest 0.10.7",
  "serde",
@@ -4659,7 +4665,7 @@ dependencies = [
 name = "validator"
 version = "0.1.0"
 dependencies = [
- "bincode",
+ "bincode 3.0.0",
  "checkpoint",
  "dag",
  "execution",
