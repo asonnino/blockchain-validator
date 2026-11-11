@@ -6,7 +6,7 @@
 use std::vec::Drain;
 
 use crate::{
-    effects::{AbortReason, ExecutionStatus, TransactionOutcome},
+    effects::{AbortReason, ExecutionOutput, ExecutionStatus, TransactionOutcome},
     engine::ExecutionEngine,
     store::InMemoryStore,
     transaction::Transaction,
@@ -21,9 +21,12 @@ pub struct SequentialScheduler<E> {
 }
 
 impl<E: ExecutionEngine> SequentialScheduler<E> {
+    /// Starts from the engine's genesis objects.
     pub fn new(engine: E) -> Self {
+        let mut store = InMemoryStore::default();
+        store.apply(ExecutionOutput::success(engine.genesis()));
         Self {
-            store: InMemoryStore::default(),
+            store,
             engine,
             outcomes: Vec::new(),
         }
@@ -64,6 +67,7 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
 #[cfg(test)]
 mod tests {
     use crate::{
+        crypto::Digest,
         effects::{AbortReason, Event, ExecutionOutput, ExecutionStatus, TransactionOutcome},
         engine::ExecutionEngine,
         object::{Object, ObjectId, Version},
@@ -167,6 +171,27 @@ mod tests {
             }]
         );
         assert!(scheduler.store().latest(&id).is_none());
+    }
+
+    #[test]
+    fn stores_start_from_genesis() {
+        /// Has one genesis object and executes nothing.
+        struct Genesis;
+
+        impl ExecutionEngine for Genesis {
+            fn genesis(&self) -> Vec<Object> {
+                vec![Object::new(ObjectId::new(7), Version::new(1), vec![7])]
+            }
+
+            fn execute<V: StateView>(&self, _: &V, _: &Transaction) -> ExecutionOutput {
+                unreachable!()
+            }
+        }
+
+        let scheduler = SequentialScheduler::new(Genesis);
+        let object = scheduler.store().latest(&ObjectId::new(7));
+        assert_eq!(object.unwrap().contents(), [7]);
+        assert_ne!(scheduler.store().commitment(), Digest::default());
     }
 
     #[test]
