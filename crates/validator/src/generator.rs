@@ -12,7 +12,8 @@ use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
     config::ImportExport, context::Ctx,
 };
-use execution::{fake::FakeTransaction, object::ObjectId};
+use execution::object::ObjectId;
+use fake_engine::FakeTransaction;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use replica::client::TransactionClient;
 use serde::{Deserialize, Serialize};

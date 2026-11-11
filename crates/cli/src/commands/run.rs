@@ -4,8 +4,8 @@
 use std::{fs, path::PathBuf};
 
 use dag::{config::ImportExport, context::TokioCtx};
-use execution::fake::FakeExecutor;
 use eyre::{Result, WrapErr, eyre};
+use fake_engine::FakeExecutor;
 use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
     prometheus::{MetricsRegistry, PrometheusServer},

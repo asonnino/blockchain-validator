@@ -55,7 +55,7 @@ impl ExecutionOutput {
         self.status
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn writes(&self) -> &[Object] {
         &self.writes
     }

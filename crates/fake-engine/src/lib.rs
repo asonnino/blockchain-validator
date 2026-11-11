@@ -1,9 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A fake execution engine for tests and demos.
+//! The fake execution engine, interpreting two functions over opaque objects.
 
-use crate::{
+use execution::{
     effects::{AbortReason, ExecutionOutput},
     engine::ExecutionEngine,
     object::{Object, ObjectId},
@@ -46,6 +46,7 @@ pub struct FakeTransaction(Transaction);
 
 impl FakeTransaction {
     /// A [`FakeFunctionId::Success`] call.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn success(
         read_only: Vec<ObjectId>,
         write_only: Vec<ObjectId>,
@@ -70,6 +71,7 @@ impl FakeTransaction {
     }
 
     /// A [`FakeFunctionId::Abort`] call.
+    #[cfg(test)]
     pub fn abort() -> Self {
         Self(Transaction::new(
             FakeFunctionId::Abort.id(),
@@ -130,14 +132,15 @@ impl ExecutionEngine for FakeExecutor {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
+    use execution::{
         effects::{AbortReason, ExecutionOutput, ExecutionStatus},
         engine::ExecutionEngine,
-        fake::{FakeExecutor, FakeTransaction},
         object::{Object, ObjectId, Version},
         store::{InMemoryStore, StateView},
         transaction::{FunctionId, Transaction},
     };
+
+    use crate::{FakeExecutor, FakeTransaction};
 
     #[test]
     fn creations_land_in_the_output_not_in_the_store() {

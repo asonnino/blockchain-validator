@@ -10,11 +10,11 @@ use std::{path::Path, sync::Arc, time::Duration};
 use checkpoint::certifier::CheckpointCertifier;
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::{
-    fake::{FakeExecutor, FakeTransaction},
     object::{ObjectId, Version},
     scheduler::SequentialScheduler,
     store::StateView,
 };
+use fake_engine::{FakeExecutor, FakeTransaction};
 use futures::future::join_all;
 use rand::{SeedableRng, rngs::StdRng};
 use replica::{

@@ -10,10 +10,10 @@ mod common;
 
 use common::Testbed;
 use execution::{
-    fake::{FakeExecutor, FakeTransaction},
     object::{ObjectId, Version},
     store::StateView,
 };
+use fake_engine::{FakeExecutor, FakeTransaction};
 
 #[tokio::test]
 async fn submitted_transactions_execute_identically_on_all_validators() {

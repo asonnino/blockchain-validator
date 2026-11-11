@@ -1,0 +1,15 @@
+[package]
+name = "fake-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+execution.workspace = true
+
+[dev-dependencies]
+execution = { workspace = true, features = ["test-utils"] }
+
+[features]
+test-utils = []

@@ -14,10 +14,10 @@ use std::{iter, time::Duration};
 use common::Testbed;
 use dag::consensus::CommittedSubDag;
 use execution::{
-    fake::{FakeExecutor, FakeTransaction},
     object::{ObjectId, Version},
     store::StateView,
 };
+use fake_engine::{FakeExecutor, FakeTransaction};
 use validator::{
     envelope::{NoMessage, Payload},
     metrics::ValidatorMetrics,
