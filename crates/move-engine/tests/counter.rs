@@ -211,6 +211,24 @@ fn replayed_creations_abort() {
 }
 
 #[test]
+fn replayed_creations_abort_when_wrapped_at_birth() {
+    let (mut scheduler, package) = scheduler();
+    let parent = create(&mut scheduler, package, 0);
+    let inputs = || vec![(parent, AccessMode::ReadWrite)];
+    let stash = || call(package, "stash_new", inputs(), vec![Object(0)]);
+    let fresh = created(&stash());
+    assert_eq!(status(&mut scheduler, stash()), ExecutionStatus::Success);
+    assert!(scheduler.store().latest(&fresh).is_none());
+
+    // Retrieving frees the key, so only the fresh id's use stops a replay from minting it again.
+    let retrieve = call(package, "retrieve", inputs(), vec![Object(0)]);
+    assert_eq!(status(&mut scheduler, retrieve), ExecutionStatus::Success);
+    assert!(scheduler.store().latest(&fresh).is_some());
+    let in_use = ExecutionStatus::Aborted(AbortReason::IdInUse);
+    assert_eq!(status(&mut scheduler, stash()), in_use);
+}
+
+#[test]
 fn unknown_functions_abort() {
     let (mut scheduler, package) = scheduler();
     let missing = call(package, "missing", Vec::new(), Vec::new());

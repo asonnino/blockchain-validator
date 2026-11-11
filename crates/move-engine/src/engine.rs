@@ -31,7 +31,7 @@ use sui_types::{
     base_types::{ObjectID, SequenceNumber, SuiAddress, SystemObjectVersions},
     committee::EpochId,
     digests::{ObjectDigest, TransactionDigest},
-    effects::{TransactionEffects, TransactionEffectsAPI},
+    effects::{IDOperation, TransactionEffects, TransactionEffectsAPI},
     execution_params::ExecutionOrEarlyError,
     gas::SuiGasStatus,
     inner_temporary_store::InnerTemporaryStore,
@@ -81,7 +81,8 @@ pub struct MoveEngine {
 }
 
 impl MoveEngine {
-    /// Publishes `packages`, each a list of compiled modules, at genesis on top of Sui's framework.
+    /// Publishes `packages`, each a list of compiled modules depending only on Move's standard
+    /// library and the Sui framework, at genesis on top of Sui's framework.
     pub fn new(packages: Vec<Vec<Vec<u8>>>) -> Self {
         let protocol_config = ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown);
         assert_eq!(
@@ -144,7 +145,8 @@ impl MoveEngine {
         FunctionId::from_bytes(Blake2b::<U32>::digest(name).into())
     }
 
-    /// Every public or entry function of the genesis packages, by [`Self::function_id`].
+    /// Every public or entry function of the genesis packages, by [`Self::function_id`]. Calls
+    /// carry no type arguments, so generic functions are left out.
     fn index_functions(&self) -> HashMap<FunctionId, (ObjectID, Identifier, Identifier)> {
         let mut functions = HashMap::new();
         for package in self
@@ -160,6 +162,9 @@ impl MoveEngine {
                         continue;
                     }
                     let handle = module.function_handle_at(definition.function);
+                    if !handle.type_parameters.is_empty() {
+                        continue;
+                    }
                     let name = module.identifier_at(handle.name).to_owned();
                     let module_name = module.name().to_owned();
                     let id = Self::function_id(package.id(), module_name.as_str(), name.as_str());
@@ -307,29 +312,32 @@ impl ExecutionEngine for MoveEngine {
         if !effects.status().is_ok() {
             return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
         }
-        // A replayed transaction derives the same fresh ids again. Dynamic fields derive theirs
-        // from their parent and key instead, so a removed field may come back.
-        let reused = effects.created().iter().any(|((id, _, _), _)| {
-            let object = inner_store.written.get(id);
-            let field = object.and_then(|object| object.type_());
-            !field.is_some_and(|ty| ty.is_dynamic_field())
-                && view
-                    .latest_version(&ObjectId::from_bytes(id.into_bytes()))
-                    .is_some()
-        });
+        let changes = effects.object_changes();
+        // A replayed transaction derives the same fresh ids again, those it wraps at once
+        // included. Dynamic fields derive theirs from their parent and key instead, so a removed
+        // field may come back.
+        let reused = changes
+            .iter()
+            .filter(|change| change.id_operation == IDOperation::Created)
+            .any(|change| {
+                let object = inner_store.written.get(&change.id);
+                let field = object.and_then(|object| object.type_());
+                !field.is_some_and(|ty| ty.is_dynamic_field())
+                    && view
+                        .latest_version(&ObjectId::from_bytes(change.id.into_bytes()))
+                        .is_some()
+            });
         if reused {
             return ExecutionOutput::aborted(AbortReason::IdInUse);
         }
         let writes = inner_store.written.values().map(to_object).collect();
-        let deletes = effects
-            .deleted()
-            .into_iter()
-            .chain(effects.wrapped())
-            .chain(effects.unwrapped_then_deleted())
-            .map(|(id, version, _)| {
-                let id = ObjectId::from_bytes(id.into_bytes());
-                (id, Version::new(version.value()))
-            })
+        // Deleted and wrapped objects, fresh ones included, leave tombstones that keep their ids
+        // in use.
+        let version = Version::new(effects.lamport_version().value());
+        let deletes = changes
+            .iter()
+            .filter(|change| change.output_version.is_none())
+            .map(|change| (ObjectId::from_bytes(change.id.into_bytes()), version))
             .collect();
         let events = inner_store
             .events

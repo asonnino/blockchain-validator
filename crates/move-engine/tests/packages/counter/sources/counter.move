@@ -47,6 +47,11 @@ public fun stash(parent: &mut Counter, counter: Counter) {
     dynamic_field::add(&mut parent.id, 0u8, counter)
 }
 
+/// Stashes a fresh counter, wrapping it as it is created.
+public fun stash_new(parent: &mut Counter, ctx: &mut TxContext) {
+    stash(parent, Counter { id: object::new(ctx), value: 0 })
+}
+
 /// Unwraps the counter `stash` put in `parent`, back to the sender.
 public fun retrieve(parent: &mut Counter, ctx: &TxContext) {
     let counter: Counter = dynamic_field::remove(&mut parent.id, 0u8);
