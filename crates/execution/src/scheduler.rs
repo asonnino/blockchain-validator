@@ -195,6 +195,28 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_creations_land_in_the_store() {
+        /// Creates a fresh object without declaring it.
+        struct Creator;
+
+        impl ExecutionEngine for Creator {
+            fn execute<V: StateView>(
+                &self,
+                view: &V,
+                transaction: &Transaction,
+            ) -> ExecutionOutput {
+                let version = transaction.next_version(view).expect("no inputs to read");
+                ExecutionOutput::success(vec![Object::new(ObjectId::new(9), version, vec![])])
+            }
+        }
+
+        let mut scheduler = SequentialScheduler::new(Creator);
+        let outcomes: Vec<_> = scheduler.execute([write(Vec::new())]).collect();
+        assert_eq!(outcomes[0].status, ExecutionStatus::Success);
+        assert!(scheduler.store().latest(&ObjectId::new(9)).is_some());
+    }
+
+    #[test]
     fn deletions_apply_and_events_surface() {
         let id = ObjectId::new(1);
         let mut scheduler = SequentialScheduler::new(Stub);

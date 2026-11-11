@@ -46,7 +46,9 @@ impl Event {
 /// values (each self-describing: id, version, contents), the objects deleted or wrapped, and
 /// the emitted events.
 ///
-/// **Invariant:** aborted transactions write, delete, and emit nothing.
+/// **Invariant:** aborted transactions write, delete, and emit nothing. Unlike Sui, which bumps
+/// the versions of mutable inputs on abort, versions here derive from the view at execution time
+/// rather than being assigned at consensus, so an abort needs no writes.
 pub struct ExecutionOutput {
     status: ExecutionStatus,
     writes: Vec<Object>,
