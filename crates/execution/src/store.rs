@@ -15,59 +15,75 @@ use crate::{
 
 /// A read-only view of the store against which transactions execute.
 pub trait StateView {
-    /// The latest version of an object, or `None` if it was never written.
+    /// The latest version of an object, or `None` if it was never written or is deleted.
     fn latest(&self, id: &ObjectId) -> Option<&Object>;
 }
 
 /// An in-memory versioned object store.
 ///
-/// Every write creates a new `(id, version)` entry; existing entries are never overwritten. The
-/// store holds derived state only — durability is the job of the consensus WAL, which execution
-/// replays on restart.
+/// Every write or deletion creates a new `(id, version)` entry; existing entries are never
+/// overwritten. The store holds derived state only — durability is the job of the consensus
+/// WAL, which execution replays on restart.
 #[derive(Default, PartialEq, Debug)]
 pub struct InMemoryStore {
-    /// Every object version ever written.
-    objects: BTreeMap<(ObjectId, Version), Object>,
-    /// The highest written version of each object.
+    /// Every object version ever written, with `None` marking a deletion.
+    objects: BTreeMap<(ObjectId, Version), Option<Object>>,
+    /// The highest version of each object, written or deleted.
     latest: BTreeMap<ObjectId, Version>,
-    /// Rolling commitment to the full ordered write history; a persistent backend must persist
-    /// it in the same atomic batch as its delta's writes.
+    /// Rolling commitment to the full ordered history; a persistent backend must persist it in
+    /// the same atomic batch as its delta's entries.
     commitment: Digest,
 }
 
 impl InMemoryStore {
-    /// The object frozen at exactly `(id, version)`, or `None` if absent.
+    const WRITE: u8 = 0;
+    const DELETE: u8 = 1;
+
+    /// The object frozen at exactly `(id, version)`, or `None` if absent or deleted there.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn get(&self, id: &ObjectId, version: Version) -> Option<&Object> {
-        self.objects.get(&(*id, version))
+        self.objects.get(&(*id, version))?.as_ref()
     }
 
     /// Consumes an execution output: each written object moves into the store at its version,
-    /// which becomes the latest version of its id. Aborted outputs carry no writes, so applying
-    /// them is a no-op.
+    /// and each deletion leaves a tombstone at its version; either becomes the latest version
+    /// of its id. Aborted outputs carry no changes, so applying them is a no-op.
     pub fn apply(&mut self, output: ExecutionOutput) {
-        for object in output.into_writes() {
+        let (writes, deletes) = output.into_changes();
+        for object in writes {
             let (id, version) = (object.id(), object.version());
-            let previous = self.latest.insert(id, version);
-            assert!(
-                previous.is_none_or(|p| p < version),
-                "object versions must move forward"
-            );
-
-            // Only the trailing element is variable, so no length framing is needed.
-            let mut hasher = Hasher::new();
-            hasher.update(self.commitment.as_bytes());
-            hasher.update(id.as_bytes());
-            hasher.update(version.as_u64().to_be_bytes());
+            let mut hasher = self.advance(Self::WRITE, id, version);
             hasher.update(object.contents());
             self.commitment = Digest::new(hasher.finalize().into());
-
-            self.objects.insert((id, version), object);
+            self.objects.insert((id, version), Some(object));
+        }
+        for (id, version) in deletes {
+            let hasher = self.advance(Self::DELETE, id, version);
+            self.commitment = Digest::new(hasher.finalize().into());
+            self.objects.insert((id, version), None);
         }
     }
 
-    /// The commitment to the state: `H(previous ‖ id ‖ version ‖ contents)` folded over every
-    /// write in execution order.
+    /// Moves `id` to `version` and starts its commitment fold. Only a write's trailing contents
+    /// vary in length, so no framing is needed; the kind tag keeps a deletion from hashing like
+    /// an empty write.
+    fn advance(&mut self, kind: u8, id: ObjectId, version: Version) -> Hasher {
+        let previous = self.latest.insert(id, version);
+        assert!(
+            previous.is_none_or(|p| p < version),
+            "object versions must move forward"
+        );
+        let mut hasher = Hasher::new();
+        hasher.update(self.commitment.as_bytes());
+        hasher.update([kind]);
+        hasher.update(id.as_bytes());
+        hasher.update(version.as_u64().to_be_bytes());
+        hasher
+    }
+
+    /// The commitment to the state: `H(previous ‖ 0 ‖ id ‖ version ‖ contents)` per write and
+    /// `H(previous ‖ 1 ‖ id ‖ version)` per deletion, folded in execution order (each output's
+    /// writes, then its deletions).
     pub fn commitment(&self) -> Digest {
         self.commitment
     }
@@ -76,7 +92,7 @@ impl InMemoryStore {
 impl StateView for InMemoryStore {
     fn latest(&self, id: &ObjectId) -> Option<&Object> {
         let version = self.latest.get(id)?;
-        self.objects.get(&(*id, *version))
+        self.objects.get(&(*id, *version))?.as_ref()
     }
 }
 
@@ -124,6 +140,67 @@ mod tests {
         let object = || Object::new(ObjectId::new(1), Version::new(1), vec![1]);
         store.apply(ExecutionOutput::success(vec![object()]));
         store.apply(ExecutionOutput::success(vec![object()]));
+    }
+
+    #[test]
+    #[should_panic(expected = "versions must move forward")]
+    fn writing_over_a_tombstone_panics() {
+        let mut store = InMemoryStore::default();
+        let id = ObjectId::new(1);
+        let delete = vec![(id, Version::new(2))];
+        store.apply(ExecutionOutput::success(vec![]).with_deletes(delete));
+        store.apply(ExecutionOutput::success(vec![Object::new(
+            id,
+            Version::new(2),
+            vec![],
+        )]));
+    }
+
+    #[test]
+    #[should_panic(expected = "aborts delete nothing")]
+    fn aborted_outputs_cannot_delete() {
+        let delete = vec![(ObjectId::new(1), Version::new(1))];
+        let _ = ExecutionOutput::aborted(AbortReason::ExplicitAbort).with_deletes(delete);
+    }
+
+    #[test]
+    fn deletions_stop_latest_and_keep_the_history() {
+        let mut store = InMemoryStore::default();
+        let id = ObjectId::new(1);
+        let write = Object::new(id, Version::new(1), vec![1]);
+        store.apply(ExecutionOutput::success(vec![write]));
+        let delete = vec![(id, Version::new(2))];
+        store.apply(ExecutionOutput::success(vec![]).with_deletes(delete));
+
+        assert!(store.latest(&id).is_none());
+        assert_eq!(store.get(&id, Version::new(1)).unwrap().contents(), [1]);
+        assert!(store.get(&id, Version::new(2)).is_none());
+    }
+
+    #[test]
+    fn writes_after_a_deletion_revive_the_object() {
+        let mut store = InMemoryStore::default();
+        let id = ObjectId::new(1);
+        let delete = vec![(id, Version::new(1))];
+        store.apply(ExecutionOutput::success(vec![]).with_deletes(delete));
+        let write = Object::new(id, Version::new(2), vec![2]);
+        store.apply(ExecutionOutput::success(vec![write]));
+
+        assert_eq!(store.latest(&id).unwrap().version(), Version::new(2));
+    }
+
+    #[test]
+    fn deletions_and_empty_writes_commit_differently() {
+        let id = ObjectId::new(1);
+        let mut deleted = InMemoryStore::default();
+        let delete = vec![(id, Version::new(1))];
+        deleted.apply(ExecutionOutput::success(vec![]).with_deletes(delete));
+        let mut written = InMemoryStore::default();
+        let write = Object::new(id, Version::new(1), vec![]);
+        written.apply(ExecutionOutput::success(vec![write]));
+
+        assert_ne!(deleted.commitment(), Digest::default());
+        assert_ne!(deleted.commitment(), written.commitment());
     }
 
     #[test]
@@ -196,10 +273,13 @@ mod tests {
     #[test]
     fn commitments_are_stable_across_releases() {
         let mut store = InMemoryStore::default();
-        store.apply(ExecutionOutput::success(vec![
-            Object::new(ObjectId::new(1), Version::new(1), vec![1, 2, 3]),
-            Object::new(ObjectId::new(2), Version::new(7), vec![]),
-        ]));
+        store.apply(
+            ExecutionOutput::success(vec![
+                Object::new(ObjectId::new(1), Version::new(1), vec![1, 2, 3]),
+                Object::new(ObjectId::new(2), Version::new(7), vec![]),
+            ])
+            .with_deletes(vec![(ObjectId::new(3), Version::new(4))]),
+        );
 
         let hex: String = store
             .commitment()
@@ -209,7 +289,7 @@ mod tests {
             .collect();
         assert_eq!(
             hex,
-            "bc3d1e39e90374f882e0c4ecc1b5f7f3ed4638ad3eeaa165fd86a768ec5224df"
+            "983cba49622d6a0febc926c0e131b7730c5794d5e8c2003cceb7f3266dc6216b"
         );
     }
 }
