@@ -90,7 +90,7 @@ impl TransactionGenerator {
     const AUTHORITY_SHIFT: u32 = 56;
     const RANDOM_MASK: u64 = (1 << Self::AUTHORITY_SHIFT) - 1;
 
-    pub fn start<C: Ctx>(
+    pub fn start<C: Ctx, M: Serialize + 'static>(
         client: TransactionClient,
         seed: Authority,
         config: LoadGeneratorConfig,
@@ -101,7 +101,7 @@ impl TransactionGenerator {
         // Envelope overhead is invariant across ids and timestamps, so padding the arguments
         // by the probed difference makes every serialized envelope exactly `transaction_size`
         // bytes — the analog of upstream's fixed raw payload size.
-        let overhead = Self::transaction(0, ObjectId::new(0), Vec::new())
+        let overhead = Self::transaction::<M>(0, ObjectId::new(0), Vec::new())
             .to_bytes()
             .len();
         assert!(
@@ -128,17 +128,17 @@ impl TransactionGenerator {
                 max_block_size,
                 metrics,
             }
-            .run::<C>(config, seed.as_u64(), args_len, random),
+            .run::<C, M>(config, seed.as_u64(), args_len, random),
         )
     }
 
     /// One creation of a fresh object, padded with `args` and stamped into an envelope.
-    fn transaction(timestamp_ms: u64, id: ObjectId, args: Vec<u8>) -> Envelope {
+    fn transaction<M>(timestamp_ms: u64, id: ObjectId, args: Vec<u8>) -> Envelope<M> {
         let transaction = FakeTransaction::success_with_args(vec![], vec![id], vec![], args);
         Envelope::new(timestamp_ms, Payload::Execute(transaction.into()))
     }
 
-    fn fill_batch(
+    fn fill_batch<M: Serialize>(
         timestamp_ms: u64,
         transactions_per_interval: usize,
         args_len: usize,
@@ -154,7 +154,7 @@ impl TransactionGenerator {
             *counter += 1;
             let id =
                 ObjectId::new((namespace << Self::AUTHORITY_SHIFT) | (*random & Self::RANDOM_MASK));
-            let envelope = Self::transaction(timestamp_ms, id, vec![0; args_len]);
+            let envelope = Self::transaction::<M>(timestamp_ms, id, vec![0; args_len]);
             batch.push(ConsensusTransaction::new(envelope.to_bytes().into()));
         }
         batch
@@ -183,7 +183,7 @@ impl TransactionGenerator {
         block.is_empty() || self.client.submit(block).await.is_ok()
     }
 
-    async fn run<C: Ctx>(
+    async fn run<C: Ctx, M: Serialize>(
         self,
         config: LoadGeneratorConfig,
         namespace: u64,
@@ -215,7 +215,7 @@ impl TransactionGenerator {
 
             // Structured envelopes must be serialized per transaction, so the per-tick
             // allocations of upstream's reused flat buffer cannot be avoided here.
-            let batch = Self::fill_batch(
+            let batch = Self::fill_batch::<M>(
                 timestamp_ms,
                 transactions_per_interval,
                 args_len,
@@ -246,17 +246,19 @@ mod tests {
     use execution::transaction::AccessMode;
 
     use super::*;
+    use crate::envelope::NoMessage;
 
     const TRANSACTION_SIZE: usize = 128;
 
     fn batch(seed: u64, namespace: u64, count: usize) -> Vec<ConsensusTransaction> {
-        let overhead = TransactionGenerator::transaction(0, ObjectId::new(0), Vec::new())
-            .to_bytes()
-            .len();
+        let overhead =
+            TransactionGenerator::transaction::<NoMessage>(0, ObjectId::new(0), Vec::new())
+                .to_bytes()
+                .len();
         let mut rng = StdRng::seed_from_u64(seed);
         let mut random = rng.r#gen();
         let mut counter = 0;
-        TransactionGenerator::fill_batch(
+        TransactionGenerator::fill_batch::<NoMessage>(
             1234,
             count,
             TRANSACTION_SIZE - overhead,
@@ -271,7 +273,7 @@ mod tests {
         for transaction in batch(1, 1, 10) {
             let bytes = transaction.as_bytes();
             assert_eq!(bytes.len(), TRANSACTION_SIZE);
-            let envelope = Envelope::from_bytes(bytes).unwrap();
+            let envelope = Envelope::<NoMessage>::from_bytes(bytes).unwrap();
             assert_eq!(envelope.timestamp_ms(), 1234);
             let Payload::Execute(transaction) = envelope.into_payload() else {
                 panic!("expected an execution payload");
@@ -288,7 +290,8 @@ mod tests {
             batch
                 .iter()
                 .map(|transaction| {
-                    let envelope = Envelope::from_bytes(transaction.as_bytes()).unwrap();
+                    let envelope =
+                        Envelope::<NoMessage>::from_bytes(transaction.as_bytes()).unwrap();
                     let Payload::Execute(transaction) = envelope.into_payload() else {
                         panic!("expected an execution payload");
                     };

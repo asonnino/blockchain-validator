@@ -62,9 +62,9 @@ pub async fn run(
     // TCP, real crypto, WAL storage. The registry is shared between the replica's and the
     // validator's metrics and served over HTTP below.
     let registry = MetricsRegistry::new();
-    let handle = ValidatorBuilder::new(FakeExecutor, authority, public_config, private_config)
+    let handle = ValidatorBuilder::new(FakeExecutor, authority, public_config, private_config)?
         .with_registry(registry.clone())
-        .build()?
+        .build()
         .start::<TokioCtx>()
         .await?;
     // Keep the generator task bound to the command's scope so it isn't dropped mid-run.

@@ -6,7 +6,7 @@
 use bincode::Options;
 use checkpoint::checkpoint::Checkpoint;
 use execution::transaction::Transaction;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Payloads larger than this fail to decode. Bounds the allocations a malformed length prefix
 /// can request, since payload bytes come from untrusted clients via consensus.
@@ -20,29 +20,36 @@ pub const MAX_PAYLOAD_SIZE: u64 = 1024 * 1024;
 /// metric works with no upstream changes. Nesting the other way (enum outside) would put the
 /// variant tag there instead.
 #[derive(PartialEq, Serialize, Deserialize, Debug)]
-pub struct Envelope {
+pub struct Envelope<M> {
     timestamp_ms: u64,
-    payload: Payload,
+    payload: Payload<M>,
 }
 
-/// The payload proper, dispatched where the sub-dag consumer decodes it.
+/// The payload proper, dispatched where the sub-dag consumer decodes it. Variants encode as
+/// their index, so new ones go last to keep existing encodings stable.
 #[derive(PartialEq, Serialize, Deserialize, Debug)]
-pub enum Payload {
+pub enum Payload<M> {
     /// A client transaction bound for the execution engine.
     Execute(Transaction),
     /// A checkpoint vote bound for the certifier, attributed to the block author.
     Attest(Checkpoint),
+    /// A commit-processor message, attributed to the block author.
+    Message(M),
 }
 
-impl Envelope {
-    pub fn new(timestamp_ms: u64, payload: Payload) -> Self {
+/// The message type of processors that define none: such payloads fail to decode.
+#[derive(PartialEq, Serialize, Deserialize, Debug)]
+pub enum NoMessage {}
+
+impl<M> Envelope<M> {
+    pub fn new(timestamp_ms: u64, payload: Payload<M>) -> Self {
         Self {
             timestamp_ms,
             payload,
         }
     }
 
-    pub fn into_payload(self) -> Payload {
+    pub fn into_payload(self) -> Payload<M> {
         self.payload
     }
 
@@ -50,12 +57,16 @@ impl Envelope {
     pub(crate) fn timestamp_ms(&self) -> u64 {
         self.timestamp_ms
     }
+}
 
+impl<M: Serialize> Envelope<M> {
     /// Encodes the envelope into the opaque bytes carried by consensus.
     pub fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(self).expect("Serialization should not fail")
     }
+}
 
+impl<M: DeserializeOwned> Envelope<M> {
     /// Decodes an envelope from consensus payload bytes.
     pub fn from_bytes(bytes: &[u8]) -> bincode::Result<Self> {
         // Same format as `bincode::serialize` (fixint, trailing bytes tolerated), plus the
@@ -76,9 +87,9 @@ mod tests {
     use dag::block::transaction::Transaction as ConsensusTransaction;
     use execution::transaction::{FunctionId, Transaction};
 
-    use crate::envelope::{Envelope, Payload};
+    use crate::envelope::{Envelope, NoMessage, Payload};
 
-    fn envelope(timestamp_ms: u64, args: Vec<u8>) -> Envelope {
+    fn envelope(timestamp_ms: u64, args: Vec<u8>) -> Envelope<NoMessage> {
         let transaction = Transaction::new(FunctionId::new(7), vec![], args);
         Envelope::new(timestamp_ms, Payload::Execute(transaction))
     }
@@ -92,9 +103,36 @@ mod tests {
 
     #[test]
     fn attestations_roundtrip_through_bytes() {
-        let envelope = Envelope::new(1234, Payload::Attest(Checkpoint::new_for_test(1)));
+        let envelope: Envelope<NoMessage> =
+            Envelope::new(1234, Payload::Attest(Checkpoint::new_for_test(1)));
         let decoded = Envelope::from_bytes(&envelope.to_bytes()).unwrap();
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn messages_roundtrip_through_bytes() {
+        let envelope = Envelope::new(1234, Payload::Message(7u64));
+        let decoded = Envelope::from_bytes(&envelope.to_bytes()).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn messages_fail_to_decode_without_a_message_type() {
+        let bytes = Envelope::new(1234, Payload::Message(7u64)).to_bytes();
+        assert!(Envelope::<NoMessage>::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn variant_tags_are_stable() {
+        // The tag follows the 8-byte timestamp.
+        let tag = |payload: Payload<u64>| {
+            let bytes = Envelope::new(0, payload).to_bytes();
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+        };
+        let transaction = Transaction::new(FunctionId::new(7), vec![], vec![]);
+        assert_eq!(tag(Payload::Execute(transaction)), 0);
+        assert_eq!(tag(Payload::Attest(Checkpoint::new_for_test(1))), 1);
+        assert_eq!(tag(Payload::Message(7)), 2);
     }
 
     #[test]
@@ -110,12 +148,12 @@ mod tests {
 
     #[test]
     fn garbage_bytes_fail_to_decode() {
-        assert!(Envelope::from_bytes(&[0xFF; 16]).is_err());
+        assert!(Envelope::<NoMessage>::from_bytes(&[0xFF; 16]).is_err());
     }
 
     #[test]
     fn oversized_envelopes_fail_to_decode() {
         let args = vec![0; 2 * super::MAX_PAYLOAD_SIZE as usize];
-        assert!(Envelope::from_bytes(&envelope(1234, args).to_bytes()).is_err());
+        assert!(Envelope::<NoMessage>::from_bytes(&envelope(1234, args).to_bytes()).is_err());
     }
 }

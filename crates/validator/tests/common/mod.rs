@@ -17,14 +17,17 @@ use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
 };
 use tokio::time;
-use validator::validator::{ValidatorBuilder, ValidatorHandle};
+use validator::{
+    processor::SequentialProcessor,
+    validator::{ValidatorBuilder, ValidatorHandle},
+};
 
 const COMMITTEE_SIZE: usize = 4;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A committee of validators running on the local tokio network.
 pub struct Testbed {
-    validators: Vec<ValidatorHandle<TokioCtx, FakeExecutor>>,
+    validators: Vec<ValidatorHandle<TokioCtx, SequentialProcessor<FakeExecutor>>>,
     /// One registry per validator, shared between its replica and validator metrics.
     registries: Vec<Registry>,
 }
@@ -66,10 +69,10 @@ impl Testbed {
                 public_config.clone(),
                 private_config,
             )
+            .expect("validator must build")
             .with_storage(storage)
             .with_registry(registry)
             .build()
-            .expect("validator must build")
             .start::<TokioCtx>()
             .await
             .expect("validator must start");
@@ -85,7 +88,7 @@ impl Testbed {
         &self.registries
     }
 
-    pub fn validators(&self) -> &[ValidatorHandle<TokioCtx, FakeExecutor>] {
+    pub fn validators(&self) -> &[ValidatorHandle<TokioCtx, SequentialProcessor<FakeExecutor>>] {
         &self.validators
     }
 
@@ -121,7 +124,7 @@ impl Testbed {
     pub async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
         let mut results = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
-            results.push(validator.shutdown().await);
+            results.push(validator.shutdown().await.into_parts());
         }
         results
     }
