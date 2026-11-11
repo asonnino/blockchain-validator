@@ -1795,6 +1795,7 @@ dependencies = [
  "execution",
  "eyre",
  "fake-engine",
+ "move-engine",
  "orchestrator",
  "replica",
  "serde",
@@ -4593,17 +4594,23 @@ version = "0.1.0"
 dependencies = [
  "bcs",
  "blake2 0.11.0",
+ "checkpoint",
+ "dag",
  "execution",
  "move-binary-format",
  "move-core-types",
  "move-vm-runtime",
  "prometheus",
+ "rand 0.8.7",
+ "replica",
  "serde",
+ "simulator",
  "sui-adapter-latest",
  "sui-framework",
  "sui-move-natives-latest",
  "sui-protocol-config",
  "sui-types",
+ "validator",
 ]
 
 [[package]]

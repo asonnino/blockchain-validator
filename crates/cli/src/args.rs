@@ -79,6 +79,9 @@ pub struct RunArgs {
 pub enum Engine {
     /// Creates and updates opaque objects, ignoring the call arguments.
     Fake,
+    /// Runs the bundled counter Move package through Sui's execution layer.
+    #[cfg(feature = "move")]
+    Move,
 }
 
 #[derive(clap::Args)]

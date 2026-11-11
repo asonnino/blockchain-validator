@@ -8,5 +8,7 @@
 
 mod engine;
 mod store;
+mod workload;
 
 pub use engine::{MoveArgument, MoveCall, MoveEngine};
+pub use workload::{COUNTER, CounterWorkload};

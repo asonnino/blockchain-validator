@@ -1,12 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The counter package (`packages/counter`) through the scheduler. Its bytecode is committed;
-//! rebuild it with `sui move build` in that directory and copy
-//! `build/counter/bytecode_modules/counter.mv` next to the sources.
+//! The counter package through the scheduler.
 
 #![cfg(feature = "sui")]
 
+mod common;
+
+use common::{shared_counters, value};
 use execution::{
     effects::{AbortReason, ExecutionStatus},
     object::ObjectId,
@@ -15,12 +16,11 @@ use execution::{
     transaction::{AccessMode, Transaction},
 };
 use move_engine::{
+    COUNTER,
     MoveArgument::{self, Object},
     MoveCall, MoveEngine,
 };
-use sui_types::{base_types::ObjectID, digests::TransactionDigest};
-
-const COUNTER: &[u8] = include_bytes!("packages/counter/counter.mv");
+use sui_types::base_types::ObjectID;
 
 fn scheduler() -> (SequentialScheduler<MoveEngine>, ObjectID) {
     let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
@@ -43,12 +43,6 @@ fn pure(value: u64) -> MoveArgument {
     MoveArgument::Pure(bcs::to_bytes(&value).unwrap())
 }
 
-/// The first object `transaction` creates, as Move derives it from the transaction's digest.
-fn created(transaction: &Transaction) -> ObjectId {
-    let digest = TransactionDigest::new(*transaction.digest().as_bytes());
-    ObjectId::from_bytes(ObjectID::derive_id(digest, 0).into_bytes())
-}
-
 fn status(
     scheduler: &mut SequentialScheduler<MoveEngine>,
     transaction: Transaction,
@@ -64,17 +58,9 @@ fn create(
     nonce: u64,
 ) -> ObjectId {
     let create = call(package, "create", Vec::new(), Vec::new()).with_nonce(nonce);
-    let id = created(&create);
+    let id = MoveEngine::fresh_id(&create);
     assert_eq!(status(scheduler, create), ExecutionStatus::Success);
     id
-}
-
-/// The counter's value: the `u64` after its 32-byte `UID` in the Move object's contents.
-fn value<V: StateView>(view: &V, id: &ObjectId) -> u64 {
-    let object: sui_types::object::Object =
-        bcs::from_bytes(view.latest(id).unwrap().contents()).unwrap();
-    let contents = object.data.try_as_move().unwrap().contents();
-    u64::from_le_bytes(contents[32..40].try_into().unwrap())
 }
 
 #[test]
@@ -148,10 +134,9 @@ fn malformed_calls_fail_without_writing() {
 
 #[test]
 fn shared_counters_honour_read_only_access() {
-    let (mut scheduler, package) = scheduler();
-    let create = call(package, "create_shared", Vec::new(), Vec::new());
-    let id = created(&create);
-    assert_eq!(status(&mut scheduler, create), ExecutionStatus::Success);
+    let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
+    let (package, id) = (engine.packages()[0], shared_counters(&engine)[0]);
+    let mut scheduler = SequentialScheduler::new(engine);
     let write = vec![(id, AccessMode::ReadWrite)];
     let increment = call(package, "increment", write, vec![Object(0), pure(1)]);
     assert_eq!(status(&mut scheduler, increment), ExecutionStatus::Success);
@@ -216,7 +201,7 @@ fn replayed_creations_abort_when_wrapped_at_birth() {
     let parent = create(&mut scheduler, package, 0);
     let inputs = || vec![(parent, AccessMode::ReadWrite)];
     let stash = || call(package, "stash_new", inputs(), vec![Object(0)]);
-    let fresh = created(&stash());
+    let fresh = MoveEngine::fresh_id(&stash());
     assert_eq!(status(&mut scheduler, stash()), ExecutionStatus::Success);
     assert!(scheduler.store().latest(&fresh).is_none());
 

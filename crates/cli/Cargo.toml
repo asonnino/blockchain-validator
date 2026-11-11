@@ -15,6 +15,7 @@ dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
 fake-engine.workspace = true
+move-engine = { workspace = true, optional = true }
 orchestrator.workspace = true
 replica.workspace = true
 serde.workspace = true
@@ -24,3 +25,7 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 validator = { workspace = true, features = ["benchmark"] }
+
+[features]
+# `--engine move`, which builds Sui's execution layer.
+move = ["dep:move-engine", "move-engine/sui"]

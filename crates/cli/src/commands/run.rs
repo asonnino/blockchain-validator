@@ -58,6 +58,20 @@ pub async fn run(
             )
             .await
         }
+        #[cfg(feature = "move")]
+        Engine::Move => {
+            let engine = move_engine::MoveEngine::new(vec![vec![move_engine::COUNTER.to_vec()]]);
+            let workload = move_engine::CounterWorkload::new(&engine);
+            run_with(
+                engine,
+                workload,
+                authority,
+                public_config,
+                private_config,
+                load_generator_config,
+            )
+            .await
+        }
     }
 }
 

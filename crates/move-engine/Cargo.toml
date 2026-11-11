@@ -13,6 +13,7 @@ move-binary-format = { workspace = true, optional = true }
 move-core-types = { workspace = true, optional = true }
 move-vm-runtime = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sui-adapter-latest = { workspace = true, optional = true }
 sui-framework = { workspace = true, optional = true }
@@ -29,6 +30,7 @@ sui = [
   "dep:move-core-types",
   "dep:move-vm-runtime",
   "dep:prometheus",
+  "dep:rand",
   "dep:serde",
   "dep:sui-adapter-latest",
   "dep:sui-framework",
@@ -36,3 +38,11 @@ sui = [
   "dep:sui-protocol-config",
   "dep:sui-types",
 ]
+
+[dev-dependencies]
+checkpoint.workspace = true
+dag.workspace = true
+replica.workspace = true
+simulator.workspace = true
+# The gated load generator, for the simulation tests.
+validator = { workspace = true, features = ["benchmark"] }
