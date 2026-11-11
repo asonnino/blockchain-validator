@@ -20,6 +20,8 @@ pub enum AbortReason {
     UnknownFunction,
     /// The transaction failed static verification.
     InvalidTransaction,
+    /// The engine failed the call, for example on a Move abort.
+    ExecutionFailure,
 }
 
 /// The outcome of executing a transaction.

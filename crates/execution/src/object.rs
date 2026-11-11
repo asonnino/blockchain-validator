@@ -16,7 +16,11 @@ impl ObjectId {
         Self(bytes)
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
@@ -32,7 +36,6 @@ impl Version {
     /// The version at which objects never written to resolve.
     pub const ZERO: Self = Self(0);
 
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn new(version: u64) -> Self {
         Self(version)
     }
