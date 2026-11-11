@@ -88,9 +88,9 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
     ) -> (usize, Option<Checkpoint>) {
         let anchor = subdag.anchor;
         subdag.sort();
-        // Votes are attributed to the block author: they ride their author's own signed
-        // blocks, so no authority can forge another's vote.
-        let mut votes = Vec::new();
+        // Votes are recorded as they decode, before this sub-dag mints: none can reference its
+        // own delivering sub-dag's checkpoint, which only exists once that sub-dag committed.
+        let certifier = &mut self.certifier;
         // Submission stamps reduce to their sum here, while the payloads are in hand.
         let mut stamp_sum_ms = 0u64;
         let transactions = subdag
@@ -113,8 +113,16 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
                         stamp_sum_ms += stamp_ms;
                         Some(transaction)
                     }
+                    // Votes are attributed to the block author: they ride their author's own
+                    // signed blocks, so no authority can forge another's vote.
                     Payload::Attest(vote) => {
-                        votes.push((author, vote));
+                        if let Some(timings) = certifier.record(anchor, author, vote) {
+                            metrics.observe_checkpoint_certification_latency(
+                                now.saturating_sub(timings.minted_at),
+                            );
+                            let submitted = Duration::from_millis(timings.mean_timestamp_ms);
+                            metrics.observe_end_to_end_latency(now.saturating_sub(submitted));
+                        }
                         None
                     }
                     Payload::Message(message) => match message {},
@@ -130,17 +138,6 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
                 .push(anchor, self.scheduler.store().commitment(), timings)
                 .clone()
         });
-        // A vote can never reference its own delivering sub-dag's checkpoint (it is created
-        // only after that sub-dag commits), so recording after minting loses nothing.
-        for (author, vote) in votes {
-            if let Some(timings) = self.certifier.record(anchor, author, vote) {
-                metrics.observe_checkpoint_certification_latency(
-                    now.saturating_sub(timings.minted_at),
-                );
-                let submitted = Duration::from_millis(timings.mean_timestamp_ms);
-                metrics.observe_end_to_end_latency(now.saturating_sub(submitted));
-            }
-        }
         (executed, minted)
     }
 }
