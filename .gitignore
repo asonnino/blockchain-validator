@@ -25,6 +25,9 @@ tarpaulin-report.html
 *.sw?
 *~
 
+# Move build output
+crates/move-engine/tests/packages/*/build/
+
 # Claude Code
 .claude/worktrees/
 .claude/scheduled_tasks.lock

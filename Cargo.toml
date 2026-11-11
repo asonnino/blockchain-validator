@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/execution",
   "crates/fake-engine",
+  "crates/move-engine",
   "crates/checkpoint",
   "crates/validator",
   "crates/cli",
@@ -45,6 +46,19 @@ dag = { git = "https://github.com/asonnino/mysticeti", rev = "ce841202c7a69f7445
 orchestrator = { git = "https://github.com/asonnino/mysticeti", rev = "ce841202c7a69f7445e401676f7f32b2a025d7ca" }
 replica = { git = "https://github.com/asonnino/mysticeti", rev = "ce841202c7a69f7445e401676f7f32b2a025d7ca" }
 simulator = { git = "https://github.com/asonnino/mysticeti", rev = "ce841202c7a69f7445e401676f7f32b2a025d7ca" }
+
+# Sui's latest execution cut for the Move engine.
+# Todo: move to mainnet-v1.84.x once released; mainnet-v1.83.1 pins tokio =1.52.1, below the
+# floor mysticeti requires.
+bcs = "0.1.4"
+move-binary-format = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+move-core-types = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+move-vm-runtime = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+sui-adapter-latest = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+sui-framework = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+sui-move-natives-latest = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+sui-protocol-config = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+sui-types = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 
 [profile.release]
 panic = "abort"
