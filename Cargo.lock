@@ -959,6 +959,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dag",
+ "execution",
  "eyre",
  "fake-engine",
  "orchestrator",
@@ -1566,6 +1567,7 @@ dependencies = [
  "bincode",
  "blake2",
  "digest 0.11.3",
+ "rand 0.8.7",
  "serde",
 ]
 
@@ -1583,7 +1585,9 @@ dependencies = [
 name = "fake-engine"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "execution",
+ "rand 0.8.7",
 ]
 
 [[package]]

@@ -14,7 +14,7 @@ use execution::{
     scheduler::SequentialScheduler,
     store::StateView,
 };
-use fake_engine::{FakeExecutor, FakeTransaction};
+use fake_engine::{FakeExecutor, FakeTransaction, FakeWorkload};
 use futures::future::join_all;
 use rand::{SeedableRng, rngs::StdRng};
 use replica::{
@@ -156,7 +156,12 @@ fn run_once(seed: u64) -> RunOutcome {
         let generators: Vec<_> = committee
             .validators()
             .iter()
-            .map(|validator| validator.start_load_generator(LoadGeneratorConfig::new_for_test()))
+            .map(|validator| {
+                validator.start_load_generator(
+                    LoadGeneratorConfig::new_for_test(),
+                    FakeWorkload::default(),
+                )
+            })
             .collect();
         let workloads = committee
             .validators()

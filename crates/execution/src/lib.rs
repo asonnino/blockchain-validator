@@ -10,3 +10,4 @@ pub mod object;
 pub mod scheduler;
 pub mod store;
 pub mod transaction;
+pub mod workload;

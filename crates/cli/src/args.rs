@@ -3,7 +3,7 @@
 
 use std::{net::IpAddr, path::PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use dag::authority::Authority;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -70,6 +70,15 @@ pub struct RunArgs {
     /// generator.
     #[arg(long, value_name = "FILE")]
     pub load_generator_config_path: Option<String>,
+    /// Execution engine; the load generator submits the engine's own workload.
+    #[arg(long, value_enum, default_value_t = Engine::Fake)]
+    pub engine: Engine,
+}
+
+#[derive(Clone, ValueEnum)]
+pub enum Engine {
+    /// Creates and updates opaque objects, ignoring the call arguments.
+    Fake,
 }
 
 #[derive(clap::Args)]

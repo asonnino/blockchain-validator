@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 dag.workspace = true
+execution.workspace = true
 eyre.workspace = true
 fake-engine.workspace = true
 orchestrator.workspace = true

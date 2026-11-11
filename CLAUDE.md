@@ -14,7 +14,7 @@ Store memories for this project in the default location
 
 - `crates/execution` — `ExecutionEngine` trait consumed by the checkpoint and
   validator crates.
-- `crates/fake-engine` — the default `ExecutionEngine`.
+- `crates/fake-engine` — the default `ExecutionEngine` and its load-generator `Workload`.
 - `crates/checkpoint` — checkpoint engine modeled on Sui's
   Builder/Aggregator/Executor pipeline, collapsed to a single self-certifying
   flow; tracks `highest_synced` / `highest_executed` watermarks.

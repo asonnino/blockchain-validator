@@ -1,7 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The fake execution engine, interpreting two functions over opaque objects.
+//! The fake execution engine, interpreting two functions over opaque objects, and its workload.
+
+mod workload;
+
+pub use workload::FakeWorkload;
 
 use execution::{
     effects::{AbortReason, ExecutionOutput},
@@ -57,7 +61,7 @@ impl FakeTransaction {
 
     /// A [`FakeFunctionId::Success`] call carrying pure arguments; the engine ignores them, so
     /// they act as payload padding.
-    pub fn success_with_args(
+    pub(crate) fn success_with_args(
         read_only: Vec<ObjectId>,
         write_only: Vec<ObjectId>,
         read_write: Vec<ObjectId>,

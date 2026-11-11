@@ -11,7 +11,6 @@ checkpoint.workspace = true
 dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
-fake-engine = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }
 prometheus.workspace = true
 rand = { workspace = true, optional = true }
@@ -21,7 +20,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [features]
-benchmark = ["dep:fake-engine", "dep:humantime-serde", "dep:rand"]
+benchmark = ["dep:humantime-serde", "dep:rand"]
 
 [dev-dependencies]
 checkpoint = { workspace = true, features = ["test-utils"] }

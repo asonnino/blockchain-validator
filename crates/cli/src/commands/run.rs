@@ -3,9 +3,10 @@
 
 use std::{fs, path::PathBuf};
 
-use dag::{config::ImportExport, context::TokioCtx};
+use dag::{authority::Authority, config::ImportExport, context::TokioCtx};
+use execution::{engine::ExecutionEngine, workload::Workload};
 use eyre::{Result, WrapErr, eyre};
-use fake_engine::FakeExecutor;
+use fake_engine::{FakeExecutor, FakeWorkload};
 use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
     prometheus::{MetricsRegistry, PrometheusServer},
@@ -13,7 +14,10 @@ use replica::{
 use tracing_subscriber::filter::LevelFilter;
 use validator::{generator::LoadGeneratorConfig, validator::ValidatorBuilder};
 
-use crate::{args::RunArgs, tracing::ValidatorTracing};
+use crate::{
+    args::{Engine, RunArgs},
+    tracing::ValidatorTracing,
+};
 
 pub async fn run(
     args: RunArgs,
@@ -32,6 +36,7 @@ pub async fn run(
         public_config_path,
         private_config_path,
         load_generator_config_path,
+        engine,
     } = args;
     tracing::info!("Starting validator {authority}");
 
@@ -41,6 +46,29 @@ pub async fn run(
         .map(|path| LoadGeneratorConfig::load(&path))
         .transpose()?;
 
+    match engine {
+        Engine::Fake => {
+            run_with(
+                FakeExecutor,
+                FakeWorkload::default(),
+                authority,
+                public_config,
+                private_config,
+                load_generator_config,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_with<E: ExecutionEngine + Send + 'static, W: Workload>(
+    engine: E,
+    workload: W,
+    authority: Authority,
+    public_config: PublicReplicaConfig,
+    private_config: PrivateReplicaConfig,
+    load_generator_config: Option<LoadGeneratorConfig>,
+) -> Result<()> {
     // Resolve this authority's network and metrics addresses from the public config.
     let metrics_address = public_config
         .metrics_address(authority)
@@ -62,13 +90,14 @@ pub async fn run(
     // TCP, real crypto, WAL storage. The registry is shared between the replica's and the
     // validator's metrics and served over HTTP below.
     let registry = MetricsRegistry::new();
-    let handle = ValidatorBuilder::new(FakeExecutor, authority, public_config, private_config)?
+    let handle = ValidatorBuilder::new(engine, authority, public_config, private_config)?
         .with_registry(registry.clone())
         .build()
         .start::<TokioCtx>()
         .await?;
     // Keep the generator task bound to the command's scope so it isn't dropped mid-run.
-    let load_generator = load_generator_config.map(|config| handle.start_load_generator(config));
+    let load_generator =
+        load_generator_config.map(|config| handle.start_load_generator(config, workload));
 
     // Expose metrics over HTTP on all interfaces for external scraping.
     let metrics_server = PrometheusServer::new(metrics_address, &registry)
