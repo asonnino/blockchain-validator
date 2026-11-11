@@ -15,6 +15,7 @@
         "backpressures",
         "checkpointed",
         "checkpointing",
+        "CFLAGS",
         "CLICOLOR",
         "clippy",
         "dalek",

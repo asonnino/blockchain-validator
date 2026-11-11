@@ -67,6 +67,10 @@ jobs:
     needs: diff
     if: ${{ needs.diff.outputs.isRelevantForRustTests == 'true' }}
     runs-on: ubuntu-latest
+    env:
+      # The runner's C compiler targets AVX2 by default, which Sui's ML-DSA crate refuses: it
+      # keeps AVX2 behind a runtime CPU probe. Crates asking for AVX2 explicitly still get it.
+      CFLAGS: -march=x86-64-v2
     steps:
       - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # pin@v2.85.2
         with:
