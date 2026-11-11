@@ -80,7 +80,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
       - name: Lint using clippy (including tests)
-        run: cargo clippy -p move-engine --features sui --tests --no-deps -- -D warnings
+        run: cargo clippy -p move-engine -p cli --features cli/move --tests --no-deps -- -D warnings
       - name: Run tests
         run: cargo nextest run -p move-engine --features sui
   test-coverage:

@@ -15,9 +15,10 @@ Store memories for this project in the default location
 - `crates/execution` — `ExecutionEngine` trait consumed by the checkpoint and
   validator crates.
 - `crates/fake-engine` — the default `ExecutionEngine` and its load-generator `Workload`.
-- `crates/move-engine` — runs Sui Move packages through Sui's latest execution cut; empty
-  unless built with its `sui` feature. The Sui crates share one tag in the workspace
-  `Cargo.toml`; bump them together.
+- `crates/move-engine` — runs Sui Move packages through Sui's latest execution cut, with a
+  workload over its bundled counter package; empty unless built with its `sui` feature, which
+  the CLI's `move` feature turns on for `--engine move`. The Sui crates share one tag in the
+  workspace `Cargo.toml`; bump them together.
 - `crates/checkpoint` — checkpoint engine modeled on Sui's
   Builder/Aggregator/Executor pipeline, collapsed to a single self-certifying
   flow; tracks `highest_synced` / `highest_executed` watermarks.
