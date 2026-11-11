@@ -52,26 +52,54 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        effects::{AbortReason, ExecutionStatus},
-        fake::{FakeExecutor, FakeTransaction},
-        object::{ObjectId, Version},
+        effects::{AbortReason, ExecutionOutput, ExecutionStatus},
+        engine::ExecutionEngine,
+        object::{Object, ObjectId, Version},
         scheduler::SequentialScheduler,
         store::StateView,
-        transaction::Transaction,
+        transaction::{AccessMode, FunctionId, Transaction},
     };
+
+    const ABORT: FunctionId = FunctionId::new(1);
+
+    /// Aborts [`ABORT`] calls and writes every other call's non-read-only inputs at the next
+    /// version.
+    struct Stub;
+
+    impl ExecutionEngine for Stub {
+        fn execute<V: StateView>(&self, view: &V, transaction: &Transaction) -> ExecutionOutput {
+            if transaction.function() == ABORT {
+                return ExecutionOutput::aborted(AbortReason::ExplicitAbort);
+            }
+            let Some(version) = transaction.next_version(view) else {
+                return ExecutionOutput::aborted(AbortReason::MissingRead);
+            };
+            let writes = transaction
+                .inputs()
+                .iter()
+                .filter(|(_, mode)| *mode != AccessMode::ReadOnly)
+                .map(|(id, _)| Object::new(*id, version, Vec::new()))
+                .collect();
+            ExecutionOutput::success(writes)
+        }
+    }
+
+    fn write(inputs: Vec<(ObjectId, AccessMode)>) -> Transaction {
+        Transaction::new(FunctionId::new(0), inputs, Vec::new())
+    }
 
     fn batch() -> Vec<Transaction> {
         let id = ObjectId::new(1);
         vec![
-            FakeTransaction::success(vec![], vec![id], vec![]).into(),
-            FakeTransaction::abort().into(),
-            FakeTransaction::success(vec![], vec![], vec![id]).into(),
+            write(vec![(id, AccessMode::WriteOnly)]),
+            Transaction::new(ABORT, Vec::new(), Vec::new()),
+            write(vec![(id, AccessMode::ReadWrite)]),
         ]
     }
 
     #[test]
     fn transactions_execute_in_commit_order() {
-        let mut scheduler = SequentialScheduler::new(FakeExecutor);
+        let mut scheduler = SequentialScheduler::new(Stub);
         let statuses = scheduler.execute(batch());
 
         assert_eq!(statuses.len(), 3);
@@ -89,8 +117,11 @@ mod tests {
     #[test]
     fn invalid_transactions_abort_without_executing() {
         let id = ObjectId::new(1);
-        let transaction = FakeTransaction::success(vec![], vec![id, id], vec![]).into();
-        let mut scheduler = SequentialScheduler::new(FakeExecutor);
+        let transaction = write(vec![
+            (id, AccessMode::WriteOnly),
+            (id, AccessMode::WriteOnly),
+        ]);
+        let mut scheduler = SequentialScheduler::new(Stub);
         let statuses = scheduler.execute([transaction]);
 
         assert_eq!(

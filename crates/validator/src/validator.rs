@@ -21,6 +21,9 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 
 #[cfg(any(test, feature = "benchmark"))]
+use execution::workload::Workload;
+
+#[cfg(any(test, feature = "benchmark"))]
 use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
@@ -280,16 +283,22 @@ impl<C: Ctx, P: CommitProcessor> ValidatorHandle<C, P> {
         *self.executed.borrow()
     }
 
-    /// Starts the built-in load generator; its transactions share the replica's submission
-    /// channel with [`submit`](ValidatorHandle::submit). Stop it with [`Ctx::abort`].
+    /// Starts the built-in load generator, submitting `workload`'s transactions; they share the
+    /// replica's submission channel with [`submit`](ValidatorHandle::submit). Stop it with
+    /// [`Ctx::abort`].
     #[cfg(any(test, feature = "benchmark"))]
-    pub fn start_load_generator(&self, config: LoadGeneratorConfig) -> C::JoinHandle<()> {
-        TransactionGenerator::start::<C, P::Message>(
+    pub fn start_load_generator<W: Workload>(
+        &self,
+        config: LoadGeneratorConfig,
+        workload: W,
+    ) -> C::JoinHandle<()> {
+        TransactionGenerator::start::<C, P::Message, W>(
             self.replica.transaction_client(),
             self.replica.authority(),
             config,
             self.max_block_size,
             self.metrics.clone(),
+            workload,
         )
     }
 

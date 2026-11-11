@@ -961,6 +961,7 @@ dependencies = [
  "dag",
  "execution",
  "eyre",
+ "fake-engine",
  "orchestrator",
  "replica",
  "serde",
@@ -1566,6 +1567,7 @@ dependencies = [
  "bincode",
  "blake2",
  "digest 0.11.3",
+ "rand 0.8.7",
  "serde",
 ]
 
@@ -1577,6 +1579,15 @@ checksum = "7cd915d99f24784cdc19fd37ef22b97e3ff0ae756c7e492e9fbfe897d61e2aec"
 dependencies = [
  "indenter",
  "once_cell",
+]
+
+[[package]]
+name = "fake-engine"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "execution",
+ "rand 0.8.7",
 ]
 
 [[package]]
@@ -4539,6 +4550,7 @@ dependencies = [
  "dag",
  "execution",
  "eyre",
+ "fake-engine",
  "futures",
  "humantime-serde",
  "prometheus",

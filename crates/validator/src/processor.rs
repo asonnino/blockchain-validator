@@ -192,11 +192,8 @@ mod tests {
         consensus::CommittedSubDag,
         crypto::CryptoEngine,
     };
-    use execution::{
-        fake::{FakeExecutor, FakeTransaction},
-        object::ObjectId,
-        scheduler::SequentialScheduler,
-    };
+    use execution::{object::ObjectId, scheduler::SequentialScheduler};
+    use fake_engine::{FakeExecutor, FakeTransaction};
     use prometheus::Registry;
 
     use crate::{

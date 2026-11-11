@@ -10,7 +10,8 @@ use std::{fs, path::Path, time::Duration};
 
 use checkpoint::certifier::CheckpointCertifier;
 use dag::{authority::Authority, context::TokioCtx};
-use execution::{fake::FakeExecutor, scheduler::SequentialScheduler, transaction::Transaction};
+use execution::{scheduler::SequentialScheduler, transaction::Transaction};
+use fake_engine::FakeExecutor;
 use prometheus::Registry;
 use replica::{
     builder::StorageKind,

@@ -2,18 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A deterministic load generator, mirroring mysticeti's `replica::generator` — same pacing,
-//! seeding, clock caching, and block chunking — but emitting valid [`FakeTransaction`]
-//! payloads in timestamped [`Envelope`]s, so everything downstream of commit (execution,
-//! checkpoints, certification) fires.
+//! seeding, clock caching, and block chunking — but emitting an engine's [`Workload`] in
+//! timestamped [`Envelope`]s, so everything downstream of commit (execution, checkpoints,
+//! certification) fires.
 
 use std::{mem, sync::Arc, time::Duration};
 
 use dag::{
     authority::Authority, block::transaction::Transaction as ConsensusTransaction,
-    config::ImportExport, context::Ctx,
+    config::ImportExport, context::Ctx, crypto::AsBytes,
 };
-use execution::{fake::FakeTransaction, object::ObjectId};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use execution::{
+    transaction::{FunctionId, Transaction},
+    workload::Workload,
+};
+use rand::{SeedableRng, rngs::StdRng};
 use replica::client::TransactionClient;
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +30,7 @@ pub struct LoadGeneratorConfig {
     /// Transactions to submit per second.
     #[serde(default = "load_generator_defaults::default_load")]
     pub load: usize,
-    /// Serialized envelope size per transaction, in bytes.
+    /// Target serialized envelope size per transaction, in bytes.
     #[serde(default = "load_generator_defaults::default_transaction_size")]
     pub transaction_size: usize,
     /// Delay before the first submission.
@@ -77,6 +80,25 @@ mod load_generator_defaults {
     }
 }
 
+/// One authority's transaction stream: its workload, with the RNG and counter the generator
+/// owns.
+struct Stream<W> {
+    workload: W,
+    rng: StdRng,
+    namespace: u64,
+    counter: u64,
+}
+
+impl<W: Workload> Stream<W> {
+    fn next(&mut self, size: usize) -> Transaction {
+        let transaction =
+            self.workload
+                .transaction(self.namespace, self.counter, size, &mut self.rng);
+        self.counter += 1;
+        transaction
+    }
+}
+
 pub struct TransactionGenerator {
     client: TransactionClient,
     max_block_size: usize,
@@ -85,92 +107,92 @@ pub struct TransactionGenerator {
 
 impl TransactionGenerator {
     const TARGET_BLOCK_INTERVAL: Duration = Duration::from_millis(100);
-    /// Object-id split: authority in the top 8 bits, the random stream in the low 56, so
-    /// streams from different authorities can never collide.
-    const AUTHORITY_SHIFT: u32 = 56;
-    const RANDOM_MASK: u64 = (1 << Self::AUTHORITY_SHIFT) - 1;
 
-    pub fn start<C: Ctx, M: Serialize + 'static>(
+    pub fn start<C: Ctx, M: Serialize + 'static, W: Workload>(
         client: TransactionClient,
         seed: Authority,
         config: LoadGeneratorConfig,
         max_block_size: usize,
         metrics: Arc<ValidatorMetrics>,
+        workload: W,
     ) -> C::JoinHandle<()> {
         assert!(config.load > 0, "load must be positive");
-        // Envelope overhead is invariant across ids and timestamps, so padding the arguments
-        // by the probed difference makes every serialized envelope exactly `transaction_size`
-        // bytes — the analog of upstream's fixed raw payload size.
-        let overhead = Self::transaction::<M>(0, ObjectId::new(0), Vec::new())
-            .to_bytes()
-            .len();
-        assert!(
-            config.transaction_size > overhead,
-            "transaction_size must be greater than {overhead} bytes"
-        );
-        // Oversized envelopes fail to decode after commit and are silently skipped, so the
-        // generator would exercise nothing downstream.
-        assert!(
-            config.transaction_size as u64 <= MAX_PAYLOAD_SIZE,
-            "transaction_size must not exceed the {MAX_PAYLOAD_SIZE}-byte payload cap"
-        );
-        let args_len = config.transaction_size - overhead;
+        let size = Self::budget::<M>(config.transaction_size);
         tracing::info!(
             "Starting generator with {} transactions per second, initial delay {:?}",
             config.load,
             config.initial_delay
         );
-        let mut rng = StdRng::seed_from_u64(seed.as_u64());
-        let random = rng.r#gen();
+        let stream = Stream {
+            workload,
+            rng: StdRng::seed_from_u64(seed.as_u64()),
+            namespace: seed.as_u64(),
+            counter: 0,
+        };
         C::spawn(
             Self {
                 client,
                 max_block_size,
                 metrics,
             }
-            .run::<C, M>(config, seed.as_u64(), args_len, random),
+            .run::<C, M, W>(config, stream, size),
         )
     }
 
-    /// One creation of a fresh object, padded with `args` and stamped into an envelope.
-    fn transaction<M>(timestamp_ms: u64, id: ObjectId, args: Vec<u8>) -> Envelope<M> {
-        let transaction = FakeTransaction::success_with_args(vec![], vec![id], vec![], args);
-        Envelope::new(timestamp_ms, Payload::Execute(transaction.into()))
+    /// The serialized size each transaction may take for its envelope to be exactly
+    /// `transaction_size` bytes — the analog of upstream's fixed raw payload size. Envelope
+    /// overhead is invariant across transactions and timestamps, so one probe suffices.
+    fn budget<M: Serialize>(transaction_size: usize) -> usize {
+        let probe = Transaction::new(FunctionId::new(0), Vec::new(), Vec::new());
+        let probe_size = bincode::serialized_size(&probe).expect("transactions serialize");
+        let overhead = Envelope::<M>::new(0, Payload::Execute(probe))
+            .to_bytes()
+            .len()
+            - probe_size as usize;
+        assert!(
+            transaction_size > overhead,
+            "transaction_size must be greater than {overhead} bytes"
+        );
+        // Oversized envelopes fail to decode after commit and are silently skipped, so the
+        // generator would exercise nothing downstream.
+        assert!(
+            transaction_size as u64 <= MAX_PAYLOAD_SIZE,
+            "transaction_size must not exceed the {MAX_PAYLOAD_SIZE}-byte payload cap"
+        );
+        transaction_size - overhead
     }
 
-    fn fill_batch<M: Serialize>(
+    fn fill_batch<M: Serialize, W: Workload>(
+        stream: &mut Stream<W>,
         timestamp_ms: u64,
         transactions_per_interval: usize,
-        args_len: usize,
-        namespace: u64,
-        counter: &mut u64,
-        random: &mut u64,
+        size: usize,
     ) -> Vec<ConsensusTransaction> {
         let mut batch = Vec::with_capacity(transactions_per_interval);
+        let mut oversized = 0;
         for _ in 0..transactions_per_interval {
-            // Upstream's stream, wrapping: the initial `random` is uniform over `u64`, so a
-            // checked add could overflow.
-            *random = random.wrapping_add(*counter);
-            *counter += 1;
-            let id =
-                ObjectId::new((namespace << Self::AUTHORITY_SHIFT) | (*random & Self::RANDOM_MASK));
-            let envelope = Self::transaction::<M>(timestamp_ms, id, vec![0; args_len]);
-            batch.push(ConsensusTransaction::new(envelope.to_bytes().into()));
+            let envelope = Envelope::<M>::new(timestamp_ms, Payload::Execute(stream.next(size)));
+            let bytes = envelope.to_bytes();
+            // Workloads may ignore `size`, and an oversized envelope would only be dropped after
+            // commit, when it fails to decode.
+            if bytes.len() as u64 > MAX_PAYLOAD_SIZE {
+                oversized += 1;
+                continue;
+            }
+            batch.push(ConsensusTransaction::new(bytes.into()));
+        }
+        if oversized > 0 {
+            tracing::warn!("dropped {oversized} envelopes over the {MAX_PAYLOAD_SIZE}-byte cap");
         }
         batch
     }
 
-    async fn ship_blocks(
-        &self,
-        batch: Vec<ConsensusTransaction>,
-        transaction_size: usize,
-        block_capacity: usize,
-    ) -> bool {
+    async fn ship_blocks(&self, batch: Vec<ConsensusTransaction>, block_capacity: usize) -> bool {
         let mut block = Vec::with_capacity(block_capacity);
         let mut block_size = 0;
         for transaction in batch {
+            block_size += transaction.as_bytes().len();
             block.push(transaction);
-            block_size += transaction_size;
 
             if block_size >= self.max_block_size {
                 let full_block = mem::replace(&mut block, Vec::with_capacity(block_capacity));
@@ -183,19 +205,16 @@ impl TransactionGenerator {
         block.is_empty() || self.client.submit(block).await.is_ok()
     }
 
-    async fn run<C: Ctx, M: Serialize>(
+    async fn run<C: Ctx, M: Serialize, W: Workload>(
         self,
         config: LoadGeneratorConfig,
-        namespace: u64,
-        args_len: usize,
-        mut random: u64,
+        mut stream: Stream<W>,
+        size: usize,
     ) {
         let intervals_per_second = 1000 / Self::TARGET_BLOCK_INTERVAL.as_millis() as usize;
         let transactions_per_interval = config.load.div_ceil(intervals_per_second);
         let block_capacity =
             (self.max_block_size / config.transaction_size).min(transactions_per_interval);
-
-        let mut counter = 0u64;
 
         // Cache the context clock at startup and derive subsequent timestamps from a
         // monotonic instant, avoiding repeated clock reads in the hot loop. Works uniformly
@@ -215,62 +234,48 @@ impl TransactionGenerator {
 
             // Structured envelopes must be serialized per transaction, so the per-tick
             // allocations of upstream's reused flat buffer cannot be avoided here.
-            let batch = Self::fill_batch::<M>(
+            let batch = Self::fill_batch::<M, W>(
+                &mut stream,
                 timestamp_ms,
                 transactions_per_interval,
-                args_len,
-                namespace,
-                &mut counter,
-                &mut random,
+                size,
             );
+            let submitted = batch.len() as u64;
 
-            if !self
-                .ship_blocks(batch, config.transaction_size, block_capacity)
-                .await
-            {
+            if !self.ship_blocks(batch, block_capacity).await {
                 tracing::info!("Transaction channel closed, stopping generator");
                 return;
             }
 
             // Reported per tick, diverging from upstream's amortized flush: a counter must
             // not under-report, and ten atomic adds per second cost nothing.
-            self.metrics
-                .inc_submitted_transactions(transactions_per_interval as u64);
+            self.metrics.inc_submitted_transactions(submitted);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use dag::crypto::AsBytes;
     use execution::transaction::AccessMode;
+    use fake_engine::FakeWorkload;
 
     use super::*;
     use crate::envelope::NoMessage;
 
     const TRANSACTION_SIZE: usize = 128;
 
-    fn batch(seed: u64, namespace: u64, count: usize) -> Vec<ConsensusTransaction> {
-        let overhead =
-            TransactionGenerator::transaction::<NoMessage>(0, ObjectId::new(0), Vec::new())
-                .to_bytes()
-                .len();
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut random = rng.r#gen();
-        let mut counter = 0;
-        TransactionGenerator::fill_batch::<NoMessage>(
-            1234,
-            count,
-            TRANSACTION_SIZE - overhead,
-            namespace,
-            &mut counter,
-            &mut random,
-        )
-    }
-
     #[test]
-    fn payloads_decode_to_creations_of_exact_size() {
-        for transaction in batch(1, 1, 10) {
+    fn payloads_decode_to_distinct_creations_of_exact_size() {
+        let mut stream = Stream {
+            workload: FakeWorkload::default(),
+            rng: StdRng::seed_from_u64(1),
+            namespace: 1,
+            counter: 0,
+        };
+        let size = TransactionGenerator::budget::<NoMessage>(TRANSACTION_SIZE);
+        let batch = TransactionGenerator::fill_batch::<NoMessage, _>(&mut stream, 1234, 10, size);
+        let mut ids = Vec::with_capacity(batch.len());
+        for transaction in batch {
             let bytes = transaction.as_bytes();
             assert_eq!(bytes.len(), TRANSACTION_SIZE);
             let envelope = Envelope::<NoMessage>::from_bytes(bytes).unwrap();
@@ -278,29 +283,51 @@ mod tests {
             let Payload::Execute(transaction) = envelope.into_payload() else {
                 panic!("expected an execution payload");
             };
-            assert!(matches!(transaction.inputs(), [(_, AccessMode::WriteOnly)]));
+            let [(id, AccessMode::WriteOnly)] = transaction.inputs() else {
+                panic!("expected a single creation");
+            };
+            assert!(
+                !ids.contains(id),
+                "the stream must advance between transactions"
+            );
+            ids.push(*id);
         }
     }
 
-    /// Identical random streams under different namespaces stay disjoint: exactly the
-    /// namespacing guarantee, since without the authority bits every id would collide.
     #[test]
-    fn namespaces_separate_identical_random_streams() {
-        let ids = |batch: Vec<ConsensusTransaction>| -> Vec<ObjectId> {
-            batch
-                .iter()
-                .map(|transaction| {
-                    let envelope =
-                        Envelope::<NoMessage>::from_bytes(transaction.as_bytes()).unwrap();
-                    let Payload::Execute(transaction) = envelope.into_payload() else {
-                        panic!("expected an execution payload");
-                    };
-                    transaction.inputs()[0].0
-                })
-                .collect()
+    fn oversized_envelopes_are_dropped() {
+        /// Ignores the size target: its envelopes are exactly at the payload cap on even
+        /// counters and one byte over on odd ones.
+        struct Bloated;
+
+        impl Workload for Bloated {
+            fn transaction(
+                &mut self,
+                _: u64,
+                counter: u64,
+                _: usize,
+                _: &mut StdRng,
+            ) -> Transaction {
+                let empty = Transaction::new(FunctionId::new(0), Vec::new(), Vec::new());
+                let empty_len = Envelope::<NoMessage>::new(0, Payload::Execute(empty))
+                    .to_bytes()
+                    .len();
+                let args = vec![0; MAX_PAYLOAD_SIZE as usize - empty_len + (counter % 2) as usize];
+                Transaction::new(FunctionId::new(0), Vec::new(), args)
+            }
+        }
+
+        let mut stream = Stream {
+            workload: Bloated,
+            rng: StdRng::seed_from_u64(1),
+            namespace: 1,
+            counter: 0,
         };
-        let (first, other) = (ids(batch(1, 1, 100)), ids(batch(1, 2, 100)));
-        assert!(first.iter().all(|id| !other.contains(id)));
+        let batch = TransactionGenerator::fill_batch::<NoMessage, _>(&mut stream, 1234, 4, 0);
+        assert_eq!(batch.len(), 2);
+        for transaction in &batch {
+            assert!(Envelope::<NoMessage>::from_bytes(transaction.as_bytes()).is_ok());
+        }
     }
 
     #[test]

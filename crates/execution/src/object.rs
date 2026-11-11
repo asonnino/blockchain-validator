@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 pub struct ObjectId([u8; 32]);
 
 impl ObjectId {
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn new(value: u64) -> Self {
         let mut bytes = [0; 32];
         bytes[24..].copy_from_slice(&value.to_be_bytes());
