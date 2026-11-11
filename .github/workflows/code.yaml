@@ -62,6 +62,23 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
       - name: Run tests
         run: cargo nextest run --workspace --no-tests=warn
+  move-engine:
+    name: Lint and test the Move engine
+    needs: diff
+    if: ${{ needs.diff.outputs.isRelevantForRustTests == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # pin@v2.85.2
+        with:
+          tool: cargo-nextest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # pin@v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+      - name: Lint using clippy (including tests)
+        run: cargo clippy -p move-engine --features sui --tests --no-deps -- -D warnings
+      - name: Run tests
+        run: cargo nextest run -p move-engine --features sui
   test-coverage:
     name: Test coverage
     needs: diff
@@ -99,7 +116,7 @@ jobs:
         with:
           tool: cargo-deny
       - name: Check bans, licenses, and sources
-        run: cargo deny check bans licenses sources
+        run: cargo deny --all-features check bans licenses sources
   dependencies-schedule:
     name: Check dependencies (scheduled)
     if: ${{ github.event_name == 'schedule' }}
@@ -118,6 +135,7 @@ jobs:
       - diff
       - lint
       - test
+      - move-engine
       - test-coverage
       - dependencies
     runs-on: ubuntu-latest
