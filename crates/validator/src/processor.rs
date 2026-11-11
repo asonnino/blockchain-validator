@@ -202,7 +202,7 @@ mod tests {
     use crate::{
         envelope::{NoMessage, Payload},
         metrics::ValidatorMetrics,
-        processor::SequentialProcessor,
+        processor::{CommitProcessor, SequentialProcessor},
     };
 
     type Envelope = crate::envelope::Envelope<NoMessage>;
@@ -246,6 +246,34 @@ mod tests {
     /// A single-block sub-dag carrying the given raw payloads.
     fn subdag(payloads: Vec<Vec<u8>>) -> CommittedSubDag {
         subdag_at(1, vec![(0, payloads)])
+    }
+
+    #[test]
+    fn process_reports_progress_and_pending_attestations() {
+        let mut state = state();
+        let metrics = metrics();
+        let create = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
+        let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
+
+        let minted = state.process(subdag(vec![execute]), Duration::ZERO, &metrics);
+        let [Payload::Attest(checkpoint)] = minted.as_slice() else {
+            panic!("an executing sub-dag must attest to its checkpoint");
+        };
+        assert_eq!(state.executed(), 1);
+        assert!(!state.is_certified());
+        assert_eq!(state.after_replay(), minted);
+
+        let votes = (0..3)
+            .map(|author| {
+                let vote = Envelope::new(0, Payload::Attest(checkpoint.clone())).to_bytes();
+                (author, vec![vote])
+            })
+            .collect();
+        let payloads = state.process(subdag_at(2, votes), Duration::ZERO, &metrics);
+        assert!(payloads.is_empty());
+        assert_eq!(state.executed(), 1);
+        assert!(state.is_certified());
+        assert!(state.after_replay().is_empty());
     }
 
     #[test]
