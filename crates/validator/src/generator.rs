@@ -169,9 +169,20 @@ impl TransactionGenerator {
         size: usize,
     ) -> Vec<ConsensusTransaction> {
         let mut batch = Vec::with_capacity(transactions_per_interval);
+        let mut oversized = 0;
         for _ in 0..transactions_per_interval {
             let envelope = Envelope::<M>::new(timestamp_ms, Payload::Execute(stream.next(size)));
-            batch.push(ConsensusTransaction::new(envelope.to_bytes().into()));
+            let bytes = envelope.to_bytes();
+            // Workloads may ignore `size`, and an oversized envelope would only be dropped after
+            // commit, when it fails to decode.
+            if bytes.len() as u64 > MAX_PAYLOAD_SIZE {
+                oversized += 1;
+                continue;
+            }
+            batch.push(ConsensusTransaction::new(bytes.into()));
+        }
+        if oversized > 0 {
+            tracing::warn!("dropped {oversized} envelopes over the {MAX_PAYLOAD_SIZE}-byte cap");
         }
         batch
     }
@@ -229,6 +240,7 @@ impl TransactionGenerator {
                 transactions_per_interval,
                 size,
             );
+            let submitted = batch.len() as u64;
 
             if !self.ship_blocks(batch, block_capacity).await {
                 tracing::info!("Transaction channel closed, stopping generator");
@@ -237,8 +249,7 @@ impl TransactionGenerator {
 
             // Reported per tick, diverging from upstream's amortized flush: a counter must
             // not under-report, and ten atomic adds per second cost nothing.
-            self.metrics
-                .inc_submitted_transactions(transactions_per_interval as u64);
+            self.metrics.inc_submitted_transactions(submitted);
         }
     }
 }
@@ -280,6 +291,42 @@ mod tests {
                 "the stream must advance between transactions"
             );
             ids.push(*id);
+        }
+    }
+
+    #[test]
+    fn oversized_envelopes_are_dropped() {
+        /// Ignores the size target: its envelopes are exactly at the payload cap on even
+        /// counters and one byte over on odd ones.
+        struct Bloated;
+
+        impl Workload for Bloated {
+            fn transaction(
+                &mut self,
+                _: u64,
+                counter: u64,
+                _: usize,
+                _: &mut StdRng,
+            ) -> Transaction {
+                let empty = Transaction::new(FunctionId::new(0), Vec::new(), Vec::new());
+                let empty_len = Envelope::<NoMessage>::new(0, Payload::Execute(empty))
+                    .to_bytes()
+                    .len();
+                let args = vec![0; MAX_PAYLOAD_SIZE as usize - empty_len + (counter % 2) as usize];
+                Transaction::new(FunctionId::new(0), Vec::new(), args)
+            }
+        }
+
+        let mut stream = Stream {
+            workload: Bloated,
+            rng: StdRng::seed_from_u64(1),
+            namespace: 1,
+            counter: 0,
+        };
+        let batch = TransactionGenerator::fill_batch::<NoMessage, _>(&mut stream, 1234, 4, 0);
+        assert_eq!(batch.len(), 2);
+        for transaction in &batch {
+            assert!(Envelope::<NoMessage>::from_bytes(transaction.as_bytes()).is_ok());
         }
     }
 
