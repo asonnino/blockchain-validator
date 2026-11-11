@@ -23,8 +23,8 @@ impl ObjectId {
 
 /// The version of an object.
 ///
-/// Versions only move forward: every write creates a new `(id, version)` entry, so writebacks of
-/// different transactions never overwrite each other.
+/// Versions only move forward, so writebacks of different transactions never overwrite each
+/// other.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct Version(u64);
 

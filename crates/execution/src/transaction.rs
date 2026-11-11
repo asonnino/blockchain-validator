@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    effects::AbortReason,
     object::{ObjectId, Version},
     store::StateView,
 };
@@ -47,14 +48,20 @@ pub enum AccessMode {
 
 /// A transaction as understood by the execution layer: a function call.
 ///
-/// `inputs` declares upfront every object the call touches — each id exactly once, with its
-/// access mode; the scheduler orders transactions by these. `args` are the pure arguments,
+/// `inputs` declares upfront every existing object the call touches — each id exactly once,
+/// with its access mode — and optionally the objects it creates. Creations need not be declared:
+/// engines that learn them only during execution write them directly, keeping them fresh
+/// themselves, and the scheduler orders transactions by their existing inputs alone.
+/// Dynamic-field children are reached through a declared parent. `args` are the pure arguments,
 /// opaque to everything but the engine.
 #[derive(PartialEq, Serialize, Deserialize, Debug)]
 pub struct Transaction {
     function: FunctionId,
     inputs: Vec<(ObjectId, AccessMode)>,
     args: Vec<u8>,
+    /// Distinguishes transactions that are otherwise identical, whose identities (their
+    /// encodings) would collide; clients repeating a call must vary it.
+    nonce: u64,
 }
 
 impl Transaction {
@@ -63,7 +70,13 @@ impl Transaction {
             function,
             inputs,
             args,
+            nonce: 0,
         }
+    }
+
+    pub fn with_nonce(mut self, nonce: u64) -> Self {
+        self.nonce = nonce;
+        self
     }
 
     pub fn function(&self) -> FunctionId {
@@ -86,19 +99,23 @@ impl Transaction {
     }
 
     /// The version of every object this transaction writes: one past the highest version among
-    /// its existing inputs. Creations contribute nothing — `WriteOnly` ids are fresh by
-    /// construction. Returns `None` if a `ReadOnly` or `ReadWrite` input does not exist.
-    pub fn next_version<V: StateView>(&self, view: &V) -> Option<Version> {
+    /// its existing inputs; `WriteOnly` inputs contribute nothing. Fails if a `ReadOnly` or
+    /// `ReadWrite` input does not exist, or if a `WriteOnly` id exists or once did.
+    pub fn next_version<V: StateView>(&self, view: &V) -> Result<Version, AbortReason> {
         let mut highest = Version::ZERO;
         for (id, mode) in &self.inputs {
             match mode {
                 AccessMode::ReadOnly | AccessMode::ReadWrite => {
-                    highest = highest.max(view.latest(id)?.version());
+                    let object = view.latest(id).ok_or(AbortReason::MissingRead)?;
+                    highest = highest.max(object.version());
+                }
+                AccessMode::WriteOnly if view.latest_version(id).is_some() => {
+                    return Err(AbortReason::IdInUse);
                 }
                 AccessMode::WriteOnly => (),
             }
         }
-        Some(highest.next())
+        Ok(highest.next())
     }
 }
 
@@ -114,6 +131,14 @@ mod tests {
         let function = bincode::serialize(&FunctionId::new(0xA1B2C3)).unwrap();
         let object = bincode::serialize(&ObjectId::new(0xA1B2C3)).unwrap();
         assert_eq!(function, object);
+    }
+
+    #[test]
+    fn nonces_distinguish_identical_calls() {
+        let call = || Transaction::new(FunctionId::new(0), vec![], vec![1]);
+        let encode = |transaction: Transaction| bincode::serialize(&transaction).unwrap();
+        assert_eq!(encode(call()), encode(call()));
+        assert_ne!(encode(call()), encode(call().with_nonce(1)));
     }
 
     #[test]

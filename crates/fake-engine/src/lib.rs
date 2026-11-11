@@ -112,8 +112,9 @@ impl ExecutionEngine for FakeExecutor {
             }
             Some(FakeFunctionId::Success) => (),
         }
-        let Some(version) = transaction.next_version(view) else {
-            return ExecutionOutput::aborted(AbortReason::MissingRead);
+        let version = match transaction.next_version(view) {
+            Ok(version) => version,
+            Err(reason) => return ExecutionOutput::aborted(reason),
         };
 
         let objects = transaction
@@ -244,6 +245,25 @@ mod tests {
             );
             assert!(output.writes().is_empty());
         }
+    }
+
+    #[test]
+    fn creating_a_used_id_aborts() {
+        let mut store = InMemoryStore::default();
+        let id = ObjectId::new(1);
+        store.apply(ExecutionOutput::success(vec![Object::new(
+            id,
+            Version::new(1),
+            vec![],
+        )]));
+
+        let transaction = FakeTransaction::success(vec![], vec![id], vec![]).into();
+        let output = FakeExecutor.execute(&store, &transaction);
+        assert_eq!(
+            output.status(),
+            ExecutionStatus::Aborted(AbortReason::IdInUse)
+        );
+        assert!(output.writes().is_empty());
     }
 
     #[test]
