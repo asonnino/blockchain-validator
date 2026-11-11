@@ -4,7 +4,7 @@
 //! End-to-end validator test on the local tokio network.
 //!
 //! Port offsets across test binaries: mysticeti uses 0-500, this file uses 3000, and
-//! recovery.rs uses 3100/3200.
+//! recovery.rs uses 3100-3700.
 
 mod common;
 

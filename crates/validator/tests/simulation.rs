@@ -26,6 +26,7 @@ use simulator::{
 };
 use validator::{
     generator::LoadGeneratorConfig,
+    processor::SequentialProcessor,
     validator::{ValidatorBuilder, ValidatorHandle},
 };
 
@@ -46,9 +47,11 @@ const MAX_BLOCK_SIZE: usize = 512;
 struct SimulatedTestbed {
     /// Dropping the network silently severs all connections.
     _network: SimulatedNetwork,
-    validators: Vec<ValidatorHandle<SimulatorContext, FakeExecutor>>,
+    validators: Vec<SimulatedValidator>,
     metrics: Vec<Arc<Metrics>>,
 }
+
+type SimulatedValidator = ValidatorHandle<SimulatorContext, SequentialProcessor<FakeExecutor>>;
 
 impl SimulatedTestbed {
     async fn start() -> Self {
@@ -72,12 +75,12 @@ impl SimulatedTestbed {
                 public_config.clone(),
                 private_config,
             )
+            .expect("validator must build")
             .with_storage(StorageKind::Ephemeral)
             .with_simulated_crypto()
             .with_metrics(node_metrics)
             .with_network(node_network)
             .build()
-            .expect("validator must build")
             .start::<SimulatorContext>()
             .await
             .expect("validator must start");
@@ -92,7 +95,7 @@ impl SimulatedTestbed {
         }
     }
 
-    fn validators(&self) -> &[ValidatorHandle<SimulatorContext, FakeExecutor>] {
+    fn validators(&self) -> &[SimulatedValidator] {
         &self.validators
     }
 
@@ -112,7 +115,7 @@ impl SimulatedTestbed {
     async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
         let mut results = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
-            results.push(validator.shutdown().await);
+            results.push(validator.shutdown().await.into_parts());
         }
         results
     }
@@ -121,10 +124,7 @@ impl SimulatedTestbed {
 /// Every validator creates its own object, then modifies it while reading its neighbor's: the
 /// read couples the Lamport versions across objects, so the final state encodes the commit
 /// interleaving — an ordering oracle the conflict-free generator load cannot provide.
-async fn coupled_workload(
-    index: usize,
-    validator: &ValidatorHandle<SimulatorContext, FakeExecutor>,
-) {
+async fn coupled_workload(index: usize, validator: &SimulatedValidator) {
     let id = ObjectId::new(index as u64);
     let neighbor = ObjectId::new(((index + 1) % COMMITTEE_SIZE) as u64);
     let create = FakeTransaction::success(vec![], vec![id], vec![]).into();

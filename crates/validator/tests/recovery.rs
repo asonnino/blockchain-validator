@@ -4,18 +4,56 @@
 //! Full-committee restart: execution state is rebuilt by replaying the consensus WAL.
 //!
 //! Port offsets across test binaries: mysticeti uses 0-500, smoke.rs uses 3000, and this file
-//! uses 3100-3400 (a fresh offset per start avoids rebinding ports still in TIME_WAIT).
+//! uses 3100-3700 (a fresh offset per start avoids rebinding ports still in TIME_WAIT). It skips
+//! 3500, which lands on port 5000, held by the macOS AirPlay receiver.
 
 mod common;
 
+use std::{iter, time::Duration};
+
 use common::Testbed;
+use dag::consensus::CommittedSubDag;
 use execution::{
-    fake::FakeTransaction,
+    fake::{FakeExecutor, FakeTransaction},
     object::{ObjectId, Version},
     store::StateView,
 };
+use validator::{
+    envelope::{NoMessage, Payload},
+    metrics::ValidatorMetrics,
+    processor::{CommitProcessor, SequentialProcessor},
+};
 
 const STATE_UPDATES: usize = 3;
+
+/// The default processor with every vote withheld, so no checkpoint ever certifies.
+struct Mute(SequentialProcessor<FakeExecutor>);
+
+impl CommitProcessor for Mute {
+    type Message = NoMessage;
+
+    fn process(
+        &mut self,
+        subdag: CommittedSubDag,
+        now: Duration,
+        metrics: &ValidatorMetrics,
+    ) -> Vec<Payload<NoMessage>> {
+        self.0.process(subdag, now, metrics);
+        Vec::new()
+    }
+
+    fn after_replay(&mut self) -> Vec<Payload<NoMessage>> {
+        Vec::new()
+    }
+
+    fn executed(&self) -> u64 {
+        self.0.executed()
+    }
+
+    fn is_certified(&self) -> bool {
+        self.0.is_certified()
+    }
+}
 
 #[tokio::test]
 async fn restarted_committee_recovers_execution_state() {
@@ -104,9 +142,6 @@ async fn restarted_committee_recovers_execution_state() {
     }
 }
 
-// Todo: this does not guard re-attestation, since votes the replica took survive in its WAL and
-// a vote is lost only in a narrow race; a test that drops votes deterministically needs the
-// commit-processor seam of asonnino/blockchain-validator#44.
 #[tokio::test]
 async fn restarted_committee_certifies_the_pending_window() {
     let dir = tempfile::tempdir().expect("temporary directory");
@@ -149,6 +184,47 @@ async fn restarted_committee_certifies_the_pending_window() {
             certifier.highest_certified(),
             first_certifier.highest_certified()
         );
+        assert!(certifier.pending().next().is_none());
+    }
+}
+
+#[tokio::test]
+async fn restarted_committee_attests_replayed_checkpoints() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let id = ObjectId::new(1);
+    let total = (STATE_UPDATES + 1) as u64;
+
+    // First run: votes withheld. One transaction per sub-dag mints one checkpoint each, so a
+    // partial resubmission below leaves the contiguous watermark short.
+    let mute = |config: &_| Mute(common::default_processor(config));
+    let mut testbed = Testbed::boot(Some(dir.path()), 3600, mute).await;
+    let create = FakeTransaction::success(vec![], vec![id], vec![]);
+    let updates = (0..STATE_UPDATES).map(|_| FakeTransaction::success(vec![], vec![], vec![id]));
+    for (executed, transaction) in iter::once(create).chain(updates).enumerate() {
+        testbed.submit(0, vec![transaction.into()]).await;
+        testbed.wait_for_transactions(executed as u64 + 1).await;
+    }
+    for Mute(processor) in testbed.stop().await {
+        let (_, certifier) = processor.into_parts();
+        assert!(certifier.highest_certified().is_none());
+        assert_eq!(certifier.pending().count(), total as usize);
+    }
+
+    // Restart without new transactions: only re-attestation can certify the replayed window.
+    let mut testbed = Testbed::start_with_wal(dir.path(), 3700).await;
+    testbed.wait_for_transactions(total).await;
+    testbed.wait_for_certified().await;
+    let rebuilt = testbed.shutdown().await;
+
+    let (first, first_certifier) = &rebuilt[0];
+    let store = first.store();
+    let certified = first_certifier
+        .highest_certified()
+        .expect("everything executed is certified");
+    assert_eq!(certified.checkpoint().commitment(), store.commitment());
+    for (scheduler, certifier) in &rebuilt {
+        assert_eq!(scheduler.store(), store);
+        assert_eq!(certifier.highest_certified(), Some(certified));
         assert!(certifier.pending().next().is_none());
     }
 }

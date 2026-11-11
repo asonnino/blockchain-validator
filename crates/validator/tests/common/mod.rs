@@ -17,14 +17,17 @@ use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
 };
 use tokio::time;
-use validator::validator::{ValidatorBuilder, ValidatorHandle};
+use validator::{
+    processor::{CommitProcessor, SequentialProcessor},
+    validator::{ValidatorBuilder, ValidatorHandle},
+};
 
 const COMMITTEE_SIZE: usize = 4;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A committee of validators running on the local tokio network.
-pub struct Testbed {
-    validators: Vec<ValidatorHandle<TokioCtx, FakeExecutor>>,
+pub struct Testbed<P: CommitProcessor = SequentialProcessor<FakeExecutor>> {
+    validators: Vec<ValidatorHandle<TokioCtx, P>>,
     /// One registry per validator, shared between its replica and validator metrics.
     registries: Vec<Registry>,
 }
@@ -32,15 +35,33 @@ pub struct Testbed {
 impl Testbed {
     /// Boots a committee with ephemeral storage.
     pub async fn start(port_offset: u16) -> Self {
-        Self::boot(None, port_offset).await
+        Self::boot(None, port_offset, default_processor).await
     }
 
     /// Boots a committee persisting each replica's WAL under `dir`.
     pub async fn start_with_wal(dir: &Path, port_offset: u16) -> Self {
-        Self::boot(Some(dir), port_offset).await
+        Self::boot(Some(dir), port_offset, default_processor).await
     }
 
-    async fn boot(dir: Option<&Path>, port_offset: u16) -> Self {
+    /// Stops every validator and returns the schedulers with their executed state and
+    /// checkpoint certifiers.
+    pub async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
+        let processors = self.stop().await;
+        processors
+            .into_iter()
+            .map(SequentialProcessor::into_parts)
+            .collect()
+    }
+}
+
+impl<P: CommitProcessor> Testbed<P> {
+    /// Boots a committee running the processors `processor` builds, persisting each replica's
+    /// WAL under `dir` if any, or with ephemeral storage.
+    pub async fn boot(
+        dir: Option<&Path>,
+        port_offset: u16,
+        processor: impl Fn(&PublicReplicaConfig) -> P,
+    ) -> Self {
         let public_config =
             PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE).with_port_offset(port_offset);
         let private_configs = PrivateReplicaConfig::new_for_benchmarks(
@@ -60,8 +81,8 @@ impl Testbed {
             };
             let registry = Registry::new();
             registries.push(registry.clone());
-            let validator = ValidatorBuilder::new(
-                FakeExecutor,
+            let validator = ValidatorBuilder::with_processor(
+                processor(&public_config),
                 Authority::from(index),
                 public_config.clone(),
                 private_config,
@@ -69,7 +90,6 @@ impl Testbed {
             .with_storage(storage)
             .with_registry(registry)
             .build()
-            .expect("validator must build")
             .start::<TokioCtx>()
             .await
             .expect("validator must start");
@@ -85,7 +105,7 @@ impl Testbed {
         &self.registries
     }
 
-    pub fn validators(&self) -> &[ValidatorHandle<TokioCtx, FakeExecutor>] {
+    pub fn validators(&self) -> &[ValidatorHandle<TokioCtx, P>] {
         &self.validators
     }
 
@@ -116,13 +136,16 @@ impl Testbed {
         }
     }
 
-    /// Stops every validator and returns the schedulers with their executed state and
-    /// checkpoint certifiers.
-    pub async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
-        let mut results = Vec::with_capacity(self.validators.len());
+    /// Stops every validator and returns its processor.
+    pub async fn stop(self) -> Vec<P> {
+        let mut processors = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
-            results.push(validator.shutdown().await);
+            processors.push(validator.shutdown().await);
         }
-        results
+        processors
     }
+}
+
+pub fn default_processor(public_config: &PublicReplicaConfig) -> SequentialProcessor<FakeExecutor> {
+    SequentialProcessor::new(FakeExecutor, public_config).expect("processor must build")
 }

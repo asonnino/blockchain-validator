@@ -3,11 +3,12 @@
 
 //! Validator node.
 //!
-//! Glue in the spirit of sui-node: builds the consensus replica and wires its committed
-//! sub-dags into the execution scheduler. Checkpointing comes later.
+//! Glue in the spirit of sui-node: builds the consensus replica and feeds its committed
+//! sub-dags to a commit processor.
 
 pub mod envelope;
 #[cfg(any(test, feature = "benchmark"))]
 pub mod generator;
 pub mod metrics;
+pub mod processor;
 pub mod validator;
