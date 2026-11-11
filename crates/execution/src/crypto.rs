@@ -1,11 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cryptographic primitives for state commitments.
+//! Cryptographic primitives for state commitments and transaction digests.
 
 use serde::{Deserialize, Serialize};
 
-/// The concrete hasher used for state commitments (Blake2b truncated to 256 bits).
+/// The concrete hasher (Blake2b truncated to 256 bits).
 pub(crate) type Hasher = blake2::Blake2b<digest::consts::U32>;
 
 /// A 32-byte Blake2b-256 hash. The default value is the zero digest, the commitment of an empty
@@ -18,7 +18,7 @@ impl Digest {
         Self(bytes)
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 

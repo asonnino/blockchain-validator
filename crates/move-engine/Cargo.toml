@@ -1,0 +1,38 @@
+[package]
+name = "move-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bcs = { workspace = true, optional = true }
+blake2 = { workspace = true, optional = true }
+execution.workspace = true
+move-binary-format = { workspace = true, optional = true }
+move-core-types = { workspace = true, optional = true }
+move-vm-runtime = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+sui-adapter-latest = { workspace = true, optional = true }
+sui-framework = { workspace = true, optional = true }
+sui-move-natives-latest = { workspace = true, optional = true }
+sui-protocol-config = { workspace = true, optional = true }
+sui-types = { workspace = true, optional = true }
+
+[features]
+# Sui's execution layer, kept out of default builds for the weight of its dependency tree.
+sui = [
+  "dep:bcs",
+  "dep:blake2",
+  "dep:move-binary-format",
+  "dep:move-core-types",
+  "dep:move-vm-runtime",
+  "dep:prometheus",
+  "dep:serde",
+  "dep:sui-adapter-latest",
+  "dep:sui-framework",
+  "dep:sui-move-natives-latest",
+  "dep:sui-protocol-config",
+  "dep:sui-types",
+]

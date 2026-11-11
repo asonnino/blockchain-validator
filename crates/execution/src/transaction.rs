@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use digest::Digest as _;
+
 use crate::{
+    crypto::{Digest, Hasher},
     effects::AbortReason,
     object::{ObjectId, Version},
     store::StateView,
@@ -13,10 +16,8 @@ use crate::{
 
 /// A fixed-size reference to the function a transaction invokes.
 ///
-/// Resolution is the engine's job (eventually a digest of the fully qualified move-native entry
-/// point, resolved through its module cache); the rest of the pipeline treats it as an opaque
-/// 32-byte key.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
+/// Resolution is the engine's job; the rest of the pipeline treats it as an opaque 32-byte key.
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize, Debug)]
 pub struct FunctionId([u8; 32]);
 
 impl FunctionId {
@@ -29,6 +30,10 @@ impl FunctionId {
             bytes[24 + i] = value[i];
             i += 1;
         }
+        Self(bytes)
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 }
@@ -85,6 +90,16 @@ impl Transaction {
 
     pub fn inputs(&self) -> &[(ObjectId, AccessMode)] {
         &self.inputs
+    }
+
+    pub fn args(&self) -> &[u8] {
+        &self.args
+    }
+
+    /// The transaction's identity, a hash of its encoding.
+    pub fn digest(&self) -> Digest {
+        let bytes = bincode::serialize(self).expect("transactions serialize");
+        Digest::new(Hasher::digest(bytes).into())
     }
 
     /// Statically verifies the transaction, independently of any state.

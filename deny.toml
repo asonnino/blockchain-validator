@@ -40,6 +40,7 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Unicode-DFS-2016",
+  "Zlib",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the
@@ -78,6 +79,10 @@ skip-tree = [
   # of the tree uses the stable line. Nothing we can fix downstream until
   # either side migrates.
   { name = "russh" },
+  # Sui's execution layer, behind move-engine's `sui` feature, pins its own versions of much of
+  # the ecosystem; these two roots cover every Sui crate the engine depends on.
+  { name = "sui-adapter-latest" },
+  { name = "sui-framework" },
 ]
 
 # This section is considered when running `cargo deny check sources`.
@@ -93,6 +98,8 @@ unknown-git = "deny"
 allow-git = [
   # The mysticeti consensus crates (dag, replica, simulator) are pinned to a rev.
   "https://github.com/asonnino/mysticeti",
+  # Sui's fork, pulled in only by its msim simulator under `cfg(msim)`, which we never build.
+  "https://github.com/mystenmark/async-task",
 ]
 
 [sources.allow-org]
