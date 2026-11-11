@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /// A counter exercising pure and object arguments, owned and shared objects, writes, events,
-/// aborts, deletions, and dynamic fields in the move-engine tests. The engine runs one call per
-/// transaction, so objects go to the sender rather than back to a caller.
+/// aborts, deletions, and dynamic fields, for the move-engine tests and its workload. The engine
+/// runs one call per transaction, so objects go to the sender rather than back to a caller.
 #[allow(lint(self_transfer))]
 module counter::counter;
 
@@ -18,13 +18,16 @@ public struct Incremented has copy, drop {
     value: u64,
 }
 
+/// The counters `init` shares at publication, for every sender to contend on.
+const SHARED_COUNTERS: u64 = 4;
+
+fun init(ctx: &mut TxContext) {
+    SHARED_COUNTERS.do!(|_| transfer::share_object(Counter { id: object::new(ctx), value: 0 }))
+}
+
 /// Creates a counter owned by the sender.
 public fun create(ctx: &mut TxContext) {
     transfer::transfer(Counter { id: object::new(ctx), value: 0 }, ctx.sender())
-}
-
-public fun create_shared(ctx: &mut TxContext) {
-    transfer::share_object(Counter { id: object::new(ctx), value: 0 })
 }
 
 public fun increment(counter: &mut Counter, by: u64) {

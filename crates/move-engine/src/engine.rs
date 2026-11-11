@@ -145,6 +145,16 @@ impl MoveEngine {
         FunctionId::from_bytes(Blake2b::<U32>::digest(name).into())
     }
 
+    /// The id of the first `UID` that `transaction`'s call makes with `object::new`.
+    pub fn fresh_id(transaction: &Transaction) -> ObjectId {
+        let id = ObjectID::derive_id(sui_digest(transaction), 0);
+        ObjectId::from_bytes(id.into_bytes())
+    }
+
+    pub(crate) fn genesis_objects(&self) -> &[SuiObject] {
+        &self.genesis
+    }
+
     /// Every public or entry function of the genesis packages, by [`Self::function_id`]. Calls
     /// carry no type arguments, so generic functions are left out.
     fn index_functions(&self) -> HashMap<FunctionId, (ObjectID, Identifier, Identifier)> {
@@ -307,7 +317,7 @@ impl ExecutionEngine for MoveEngine {
             arguments,
         );
 
-        let digest = TransactionDigest::new(*transaction.digest().as_bytes());
+        let digest = sui_digest(transaction);
         let (inner_store, effects) = self.run(&store, builder.finish(), inputs, digest);
         if !effects.status().is_ok() {
             return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
@@ -349,6 +359,10 @@ impl ExecutionEngine for MoveEngine {
             .with_deletes(deletes)
             .with_events(events)
     }
+}
+
+fn sui_digest(transaction: &Transaction) -> TransactionDigest {
+    TransactionDigest::new(*transaction.digest().as_bytes())
 }
 
 fn to_object(object: &SuiObject) -> Object {
