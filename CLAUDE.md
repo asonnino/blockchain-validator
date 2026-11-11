@@ -37,7 +37,7 @@ a rev in the workspace `Cargo.toml`; bump the rev everywhere at once.
 
 ## Conventions
 
-- Toolchain pinned in `rust-toolchain.toml` (Rust 1.97, edition 2024).
+- Toolchain pinned in `rust-toolchain.toml` (Rust 1.98, edition 2024).
 - Format with `cargo fmt` (repo `rustfmt.toml`); lint with `cargo clippy`.
 - A pre-commit hook chain (`.pre-commit-config.yaml`) runs on every commit:
   whitespace/EOF fixers, editorconfig, yamlfmt, taplo, typos, licensesnip,
