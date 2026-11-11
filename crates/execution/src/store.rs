@@ -17,6 +17,9 @@ use crate::{
 pub trait StateView {
     /// The latest version of an object, or `None` if it was never written or is deleted.
     fn latest(&self, id: &ObjectId) -> Option<&Object>;
+
+    /// The latest version of an id, written or deleted, or `None` if it was never used.
+    fn latest_version(&self, id: &ObjectId) -> Option<Version>;
 }
 
 /// An in-memory versioned object store.
@@ -93,6 +96,10 @@ impl StateView for InMemoryStore {
     fn latest(&self, id: &ObjectId) -> Option<&Object> {
         let version = self.latest.get(id)?;
         self.objects.get(&(*id, *version))?.as_ref()
+    }
+
+    fn latest_version(&self, id: &ObjectId) -> Option<Version> {
+        self.latest.get(id).copied()
     }
 }
 

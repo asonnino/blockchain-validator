@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    effects::AbortReason,
     object::{ObjectId, Version},
     store::StateView,
 };
@@ -49,9 +50,10 @@ pub enum AccessMode {
 ///
 /// `inputs` declares upfront every existing object the call touches — each id exactly once,
 /// with its access mode — and optionally the objects it creates. Creations need not be declared:
-/// engines that learn them only during execution write them directly, and the scheduler orders
-/// transactions by their existing inputs alone. Dynamic-field children are reached through a
-/// declared parent. `args` are the pure arguments, opaque to everything but the engine.
+/// engines that learn them only during execution write them directly, keeping them fresh
+/// themselves, and the scheduler orders transactions by their existing inputs alone.
+/// Dynamic-field children are reached through a declared parent. `args` are the pure arguments,
+/// opaque to everything but the engine.
 #[derive(PartialEq, Serialize, Deserialize, Debug)]
 pub struct Transaction {
     function: FunctionId,
@@ -97,19 +99,23 @@ impl Transaction {
     }
 
     /// The version of every object this transaction writes: one past the highest version among
-    /// its existing inputs; `WriteOnly` inputs contribute nothing. Returns `None` if a
-    /// `ReadOnly` or `ReadWrite` input does not exist.
-    pub fn next_version<V: StateView>(&self, view: &V) -> Option<Version> {
+    /// its existing inputs; `WriteOnly` inputs contribute nothing. Fails if a `ReadOnly` or
+    /// `ReadWrite` input does not exist, or if a `WriteOnly` id exists or once did.
+    pub fn next_version<V: StateView>(&self, view: &V) -> Result<Version, AbortReason> {
         let mut highest = Version::ZERO;
         for (id, mode) in &self.inputs {
             match mode {
                 AccessMode::ReadOnly | AccessMode::ReadWrite => {
-                    highest = highest.max(view.latest(id)?.version());
+                    let object = view.latest(id).ok_or(AbortReason::MissingRead)?;
+                    highest = highest.max(object.version());
+                }
+                AccessMode::WriteOnly if view.latest_version(id).is_some() => {
+                    return Err(AbortReason::IdInUse);
                 }
                 AccessMode::WriteOnly => (),
             }
         }
-        Some(highest.next())
+        Ok(highest.next())
     }
 }
 

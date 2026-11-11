@@ -14,6 +14,8 @@ pub enum AbortReason {
     ExplicitAbort,
     /// The call read an object that does not exist.
     MissingRead,
+    /// The call created an object whose id exists or once did.
+    IdInUse,
     /// The engine does not know the called function.
     UnknownFunction,
     /// The transaction failed static verification.

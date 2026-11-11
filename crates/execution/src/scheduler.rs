@@ -88,8 +88,9 @@ mod tests {
             if transaction.function() == ABORT {
                 return ExecutionOutput::aborted(AbortReason::ExplicitAbort);
             }
-            let Some(version) = transaction.next_version(view) else {
-                return ExecutionOutput::aborted(AbortReason::MissingRead);
+            let version = match transaction.next_version(view) {
+                Ok(version) => version,
+                Err(reason) => return ExecutionOutput::aborted(reason),
             };
             let touched = transaction
                 .inputs()
@@ -214,6 +215,27 @@ mod tests {
         let outcomes: Vec<_> = scheduler.execute([write(Vec::new())]).collect();
         assert_eq!(outcomes[0].status, ExecutionStatus::Success);
         assert!(scheduler.store().latest(&ObjectId::new(9)).is_some());
+    }
+
+    #[test]
+    fn creating_a_used_id_aborts_instead_of_rewriting_it() {
+        let id = ObjectId::new(1);
+        let create = || write(vec![(id, AccessMode::WriteOnly)]);
+        let mut scheduler = SequentialScheduler::new(Stub);
+        let statuses: Vec<_> = scheduler
+            .execute([
+                create(),
+                create(),
+                Transaction::new(DELETE, vec![(id, AccessMode::ReadWrite)], Vec::new()),
+                create(),
+            ])
+            .map(|outcome| outcome.status)
+            .collect();
+
+        // A live id is in use, and so is a deleted one.
+        let in_use = ExecutionStatus::Aborted(AbortReason::IdInUse);
+        let success = ExecutionStatus::Success;
+        assert_eq!(statuses, [success, in_use, success, in_use]);
     }
 
     #[test]
