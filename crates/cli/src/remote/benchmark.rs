@@ -6,7 +6,7 @@
 
 use std::fs;
 
-use eyre::{Context, Result};
+use eyre::{Context, Result, bail};
 use orchestrator::{
     benchmark::{BenchmarkParameters, Parameters},
     orchestrator::Orchestrator,
@@ -17,16 +17,24 @@ use orchestrator::{
     settings::Settings,
 };
 
-use crate::remote::protocol::{ClientParameters, NodeParameters, ValidatorProtocol};
+use crate::{
+    args::Engine,
+    remote::protocol::{ClientParameters, NodeParameters, ValidatorProtocol},
+};
 
 pub(crate) struct RemoteBenchmarkDriver {
     settings: Settings,
     username: String,
+    engine: Engine,
 }
 
 impl RemoteBenchmarkDriver {
-    pub(crate) fn new(settings: Settings, username: String) -> Self {
-        Self { settings, username }
+    pub(crate) fn new(settings: Settings, username: String, engine: Engine) -> Self {
+        Self {
+            settings,
+            username,
+            engine,
+        }
     }
 
     pub(crate) async fn benchmark(
@@ -38,7 +46,14 @@ impl RemoteBenchmarkDriver {
         skip_testbed_update: bool,
         skip_testbed_configuration: bool,
     ) -> Result<()> {
-        let protocol_commands = ValidatorProtocol::new(&self.settings);
+        // Todo: build the testbed with the `move` feature (and the C flags Sui's crypto needs)
+        // once the orchestrator lets protocols choose their build command
+        // (asonnino/mysticeti#340), and name the measurement files by engine so runs of
+        // different engines don't overwrite each other.
+        if matches!(self.engine, Engine::Move) {
+            bail!("testbed builds lack the Move engine until asonnino/mysticeti#340");
+        }
+        let protocol_commands = ValidatorProtocol::new(&self.settings, self.engine);
         let node_parameters = match &self.settings.node_parameters_path {
             Some(path) => {
                 NodeParameters::load(path).wrap_err("Failed to load node's parameters")?
