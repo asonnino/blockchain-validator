@@ -9,7 +9,7 @@ use execution::{
     workload::Workload,
 };
 use rand::{Rng, rngs::StdRng, seq::SliceRandom};
-use sui_types::base_types::ObjectID;
+use sui_types::{SUI_CLOCK_OBJECT_ID, base_types::ObjectID};
 
 use crate::{MoveArgument, MoveCall, MoveEngine};
 
@@ -17,10 +17,10 @@ use crate::{MoveArgument, MoveCall, MoveEngine};
 /// in that directory and copy `build/counter/bytecode_modules/counter.mv` next to the sources.
 pub const COUNTER: &[u8] = include_bytes!("../packages/counter/counter.mv");
 
-/// Calls into the counter package. Each authority's stream first creates a few counters, then
-/// increments its own counters on half its calls and the shared ones on most of the rest, by
-/// random steps; the remaining calls only read a shared counter. A stream's transactions commit
-/// in submission order, so its counters exist before it uses them.
+/// Calls into the counter package. Each authority's stream first creates a few counters. Then
+/// 40% of its calls increment its own counters and 40% the shared ones, by random steps; 10%
+/// stamp one of its counters with the clock's time, and the rest only read a shared counter. A
+/// stream's transactions commit in submission order, so its counters exist before it uses them.
 pub struct CounterWorkload {
     /// Shared by the package's `init` at genesis.
     shared: Vec<ObjectId>,
@@ -28,6 +28,7 @@ pub struct CounterWorkload {
     create: Call,
     /// One per step, from 1 to `MAX_STEP`.
     increments: Vec<Call>,
+    stamp: Call,
     read: Call,
 }
 
@@ -86,12 +87,24 @@ impl CounterWorkload {
             owned: Vec::with_capacity(Self::OWNED as usize),
             create: Call::new(package, "create", Vec::new()),
             increments,
+            stamp: Call::new(
+                package,
+                "stamp",
+                vec![MoveArgument::Object(0), MoveArgument::Object(1)],
+            ),
             read: Call::new(package, "assert_incremented", vec![MoveArgument::Object(0)]),
         }
     }
 
     fn increment(&self, rng: &mut StdRng) -> &Call {
         self.increments.choose(rng).expect("steps start at one")
+    }
+
+    fn owned(&self, rng: &mut StdRng) -> ObjectId {
+        *self
+            .owned
+            .choose(rng)
+            .expect("the stream created its counters")
     }
 
     fn shared(&self, rng: &mut StdRng) -> ObjectId {
@@ -113,19 +126,26 @@ impl Workload for CounterWorkload {
             self.owned.push(MoveEngine::fresh_id(&create));
             return create;
         }
-        let (call, input) = match rng.gen_range(0..10) {
-            0..5 => {
-                let owned = self.owned.choose(rng);
-                let owned = *owned.expect("the stream created its counters");
-                (self.increment(rng), (owned, AccessMode::ReadWrite))
-            }
-            5..9 => (
+        let (call, inputs) = match rng.gen_range(0..10) {
+            0..4 => (
                 self.increment(rng),
-                (self.shared(rng), AccessMode::ReadWrite),
+                vec![(self.owned(rng), AccessMode::ReadWrite)],
             ),
-            _ => (&self.read, (self.shared(rng), AccessMode::ReadOnly)),
+            4..8 => (
+                self.increment(rng),
+                vec![(self.shared(rng), AccessMode::ReadWrite)],
+            ),
+            8 => {
+                let clock = ObjectId::from_bytes(SUI_CLOCK_OBJECT_ID.into_bytes());
+                let inputs = vec![
+                    (self.owned(rng), AccessMode::ReadWrite),
+                    (clock, AccessMode::ReadOnly),
+                ];
+                (&self.stamp, inputs)
+            }
+            _ => (&self.read, vec![(self.shared(rng), AccessMode::ReadOnly)]),
         };
-        call.transaction(vec![input], nonce)
+        call.transaction(inputs, nonce)
     }
 }
 

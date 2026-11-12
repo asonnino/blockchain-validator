@@ -1,13 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-/// A counter exercising pure and object arguments, owned and shared objects, writes, events,
-/// aborts, deletions, and dynamic fields, for the move-engine tests and its workload. The engine
-/// runs one call per transaction, so objects go to the sender rather than back to a caller.
+/// A counter exercising pure and object arguments, owned and shared objects, the clock, writes,
+/// events, aborts, deletions, and dynamic fields, for the move-engine tests and its workload. The
+/// engine runs one call per transaction, so objects go to the sender rather than back to a caller.
 #[allow(lint(self_transfer))]
 module counter::counter;
 
-use sui::{dynamic_field, event};
+use sui::{clock::Clock, dynamic_field, event};
 
 public struct Counter has key, store {
     id: UID,
@@ -33,6 +33,10 @@ public fun create(ctx: &mut TxContext) {
 public fun increment(counter: &mut Counter, by: u64) {
     counter.value = counter.value + by;
     event::emit(Incremented { value: counter.value })
+}
+
+public fun stamp(counter: &mut Counter, clock: &Clock) {
+    counter.value = clock.timestamp_ms()
 }
 
 /// Aborts with code 7 while the counter is zero.

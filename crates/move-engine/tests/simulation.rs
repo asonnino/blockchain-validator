@@ -11,7 +11,7 @@ mod common;
 use std::{path::Path, time::Duration};
 
 use checkpoint::certifier::CheckpointCertifier;
-use common::{shared_counters, value};
+use common::{clock, shared_counters, value};
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::scheduler::SequentialScheduler;
 use move_engine::{COUNTER, CounterWorkload, MoveEngine};
@@ -125,6 +125,8 @@ fn validators_converge_on_the_counter_workload() {
     for id in &shared {
         assert!(value(store, id) > 0);
     }
+    // The clock took its time from the committed anchors.
+    assert!(value(store, &clock()) > 0);
 }
 
 #[test]
