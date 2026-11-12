@@ -50,6 +50,17 @@ impl<V: StateView> BackingPackageStore for SuiView<'_, V> {
     }
 }
 
+/// The packages among the genesis objects.
+pub(crate) struct GenesisPackages<'g>(pub(crate) &'g [Object]);
+
+impl BackingPackageStore for GenesisPackages<'_> {
+    fn get_package_object(&self, id: &ObjectID) -> SuiResult<Option<PackageObject>> {
+        let package = self.0.iter().find(|object| object.id() == *id);
+        let package = package.filter(|object| object.is_package());
+        Ok(package.cloned().map(PackageObject::new))
+    }
+}
+
 impl<V: StateView> RuntimeObjectResolver for SuiView<'_, V> {
     fn read_child_object(
         &self,

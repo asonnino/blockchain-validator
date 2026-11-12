@@ -4,7 +4,9 @@
 //! Sui's latest execution cut behind [`ExecutionEngine`].
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -20,13 +22,16 @@ use eyre::{bail, eyre};
 use move_binary_format::{
     CompiledModule, compatibility::Compatibility, file_format::Visibility, normalized::RcPool,
 };
-use move_bytecode_verifier::verify_module_with_config_unmetered;
 use move_core_types::{ident_str, identifier::Identifier};
-use move_vm_runtime::runtime::MoveRuntime;
+use move_vm_runtime::{
+    natives::extensions::NativeContextExtensions, runtime::MoveRuntime,
+    shared::gas::UnmeteredGasMeter,
+};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use sui_adapter_latest::{
     adapter::{new_move_runtime, substitute_package_id},
+    data_store::transaction_package_store::TransactionPackageStore,
     execution_engine::execute_transaction_to_effects,
     execution_mode::{ExecutionMode, Genesis, Normal},
 };
@@ -60,7 +65,7 @@ use sui_types::{
 };
 use sui_verifier_latest::verifier::sui_verify_module_unmetered;
 
-use crate::store::SuiView;
+use crate::store::{GenesisPackages, SuiView};
 
 /// The execution cut this engine calls, which the pinned protocol version must select.
 const LATEST_EXECUTION_VERSION: u64 = 4;
@@ -224,10 +229,44 @@ impl MoveEngine {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| eyre!("substitute modules do not deserialize: {error:?}"))?;
         substitute_package_id(&mut compiled, package).map_err(|error| eyre!("{error:?}"))?;
+        let mut module_map = BTreeMap::new();
+        for module in &compiled {
+            let mut bytes = Vec::new();
+            module
+                .serialize_with_version(module.version, &mut bytes)
+                .expect("deserialized modules serialize");
+            module_map.insert(module.name().to_string(), bytes);
+        }
+        let substitute = MovePackage::new(
+            package,
+            published_package.version(),
+            module_map,
+            self.protocol_config.max_move_package_size(),
+            published_package.type_origin_table().clone(),
+            published_package.linkage_table().clone(),
+        )
+        .map_err(|error| eyre!("{error:?}"))?;
+
+        // Verified and linked as at publication, on a fresh runtime: the current one caches the
+        // published package, which genesis loaded to run its `init`.
+        let runtime = runtime(&self.protocol_config);
+        let serialized = substitute
+            .into_serialized_move_package()
+            .map_err(|error| eyre!("{error:?}"))?;
+        let genesis = GenesisPackages(&self.genesis);
+        let dependencies = TransactionPackageStore::new(&genesis);
+        let extensions = Rc::new(RefCell::new(NativeContextExtensions::default()));
+        runtime
+            .validate_package(
+                dependencies,
+                *package,
+                serialized,
+                &mut UnmeteredGasMeter,
+                extensions,
+            )
+            .map_err(|error| eyre!("substitute package fails verification: {error:?}"))?;
         let verifier_config = self.protocol_config.verifier_config(None);
         for module in &compiled {
-            verify_module_with_config_unmetered(&verifier_config, module)
-                .map_err(|error| eyre!("substitute module fails verification: {error:?}"))?;
             sui_verify_module_unmetered(module, &BTreeMap::new(), &verifier_config)
                 .map_err(|error| eyre!("substitute module fails Sui's checks: {error:?}"))?;
         }
@@ -251,27 +290,9 @@ impl MoveEngine {
                 })?;
         }
 
-        let mut module_map = BTreeMap::new();
-        for module in &compiled {
-            let mut bytes = Vec::new();
-            module
-                .serialize_with_version(module.version, &mut bytes)
-                .expect("verified modules serialize");
-            module_map.insert(module.name().to_string(), bytes);
-        }
-        let substitute = MovePackage::new(
-            package,
-            published_package.version(),
-            module_map,
-            self.protocol_config.max_move_package_size(),
-            published_package.type_origin_table().clone(),
-            published_package.linkage_table().clone(),
-        )
-        .map_err(|error| eyre!("{error:?}"))?;
         let object = SuiObject::new_from_package(substitute, published.previous_transaction);
         self.substitutes.insert(package, PackageObject::new(object));
-        // The runtime caches the packages it loaded, the published one included.
-        self.runtime = runtime(&self.protocol_config);
+        self.runtime = runtime;
         Ok(())
     }
 

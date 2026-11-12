@@ -4599,7 +4599,6 @@ dependencies = [
  "execution",
  "eyre",
  "move-binary-format",
- "move-bytecode-verifier",
  "move-core-types",
  "move-vm-runtime",
  "prometheus",

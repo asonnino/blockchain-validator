@@ -11,7 +11,6 @@ blake2 = { workspace = true, optional = true }
 eyre = { workspace = true, optional = true }
 execution.workspace = true
 move-binary-format = { workspace = true, optional = true }
-move-bytecode-verifier = { workspace = true, optional = true }
 move-core-types = { workspace = true, optional = true }
 move-vm-runtime = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
@@ -31,7 +30,6 @@ sui = [
   "dep:blake2",
   "dep:eyre",
   "dep:move-binary-format",
-  "dep:move-bytecode-verifier",
   "dep:move-core-types",
   "dep:move-vm-runtime",
   "dep:prometheus",

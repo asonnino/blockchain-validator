@@ -18,6 +18,7 @@ use move_binary_format::{
     CompiledModule,
     file_format::{Bytecode, FunctionDefinition, Visibility},
 };
+use move_core_types::identifier::Identifier;
 use move_engine::{COUNTER, MoveArgument, MoveCall, MoveEngine};
 use sui_types::{SUI_FRAMEWORK_PACKAGE_ID, base_types::ObjectID};
 
@@ -97,9 +98,21 @@ fn incompatible_substitutes_are_rejected() {
 }
 
 #[test]
-fn substitutes_must_pass_both_verifiers() {
+fn substitutes_are_verified_as_at_publication() {
     let mut engine = engine(None);
     let package = engine.packages()[0];
+    // Calling a function the framework lacks passes every check a module meets alone.
+    let unlinked = edited(|module| {
+        let emit = module
+            .function_handles
+            .iter()
+            .find(|handle| module.identifier_at(handle.name).as_str() == "emit");
+        let name = emit.unwrap().name;
+        module.identifiers[name.0 as usize] = Identifier::new("nowhere").unwrap();
+    });
+    let error = engine.substitute(package, vec![unlinked]).unwrap_err();
+    assert!(error.to_string().contains("fails verification"), "{error}");
+
     // A public `init` satisfies Move's verifier but not Sui's.
     let public_init = edited(|module| definition(module, "init").visibility = Visibility::Public);
     let error = engine.substitute(package, vec![public_init]).unwrap_err();
