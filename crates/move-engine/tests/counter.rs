@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{clock, shared_counters, value};
+use common::{clock, failure, shared_counters, value};
 use execution::{
     effects::{AbortReason, ExecutionStatus},
     engine::CommitInfo,
@@ -16,12 +16,17 @@ use execution::{
     store::StateView,
     transaction::{AccessMode, Transaction},
 };
+use move_core_types::{ident_str, language_storage::ModuleId, vm_status::StatusCode};
 use move_engine::{
     COUNTER,
     MoveArgument::{self, Object},
-    MoveCall, MoveEngine,
+    MoveCall, MoveEngine, MoveFailure,
 };
-use sui_types::{SUI_FRAMEWORK_PACKAGE_ID, base_types::ObjectID};
+use sui_types::{
+    SUI_FRAMEWORK_ADDRESS, SUI_FRAMEWORK_PACKAGE_ID,
+    base_types::ObjectID,
+    execution_status::{CommandArgumentError, ExecutionErrorKind as Kind, MoveLocationOpt},
+};
 
 fn scheduler() -> (SequentialScheduler<MoveEngine>, ObjectID) {
     let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
@@ -38,6 +43,10 @@ fn call(
     let function = MoveEngine::function_id(package, "counter", function);
     let call = MoveCall { arguments };
     Transaction::new(function, inputs, bcs::to_bytes(&call).unwrap())
+}
+
+fn counter_module(package: ObjectID) -> ModuleId {
+    ModuleId::new(package.into(), ident_str!("counter").to_owned())
 }
 
 fn pure(value: u64) -> MoveArgument {
@@ -87,16 +96,64 @@ fn counters_are_created_incremented_and_destroyed() {
 }
 
 #[test]
-fn move_aborts_write_nothing() {
+fn move_aborts_report_their_code_and_write_nothing() {
     let (mut scheduler, package) = scheduler();
     let id = create(&mut scheduler, package, 0);
     let version = scheduler.store().latest(&id).unwrap().version();
 
     let inputs = vec![(id, AccessMode::ReadWrite)];
     let check = call(package, "assert_incremented", inputs, vec![Object(0)]);
-    let aborted = ExecutionStatus::Aborted(AbortReason::ExecutionFailure);
-    assert_eq!(status(&mut scheduler, check), aborted);
+    let failure = failure(status(&mut scheduler, check)).unwrap();
+    let Kind::MoveAbort(location, 7) = failure.status else {
+        panic!("not abort code 7: {failure:?}");
+    };
+    assert_eq!(location.module, counter_module(package));
+    assert_eq!(
+        location.function_name.as_deref(),
+        Some("assert_incremented")
+    );
+    assert_eq!(failure.vm_status, Some(StatusCode::ABORTED));
     assert_eq!(scheduler.store().latest(&id).unwrap().version(), version);
+}
+
+#[test]
+fn framework_aborts_report_the_framework_module() {
+    let (mut scheduler, package) = scheduler();
+    let id = create(&mut scheduler, package, 0);
+    let inputs = vec![(id, AccessMode::ReadWrite)];
+    let retrieve = call(package, "retrieve", inputs, vec![Object(0)]);
+    let failure = failure(status(&mut scheduler, retrieve)).unwrap();
+    // `dynamic_field::remove` aborts with `EFieldDoesNotExist`.
+    let Kind::MoveAbort(location, 1) = failure.status else {
+        panic!("not abort code 1: {failure:?}");
+    };
+    let module = ModuleId::new(
+        SUI_FRAMEWORK_ADDRESS,
+        ident_str!("dynamic_field").to_owned(),
+    );
+    assert_eq!(location.module, module);
+}
+
+#[test]
+fn arithmetic_errors_report_their_kind() {
+    let (mut scheduler, package) = scheduler();
+    let id = create(&mut scheduler, package, 0);
+    let increment = |by| {
+        let inputs = vec![(id, AccessMode::ReadWrite)];
+        call(package, "increment", inputs, vec![Object(0), pure(by)])
+    };
+    assert_eq!(
+        status(&mut scheduler, increment(1)),
+        ExecutionStatus::Success
+    );
+    let failure = failure(status(&mut scheduler, increment(u64::MAX))).unwrap();
+    let Kind::MovePrimitiveRuntimeError(MoveLocationOpt(Some(location))) = failure.status else {
+        panic!("not a located primitive runtime error: {failure:?}");
+    };
+    assert_eq!(location.module, counter_module(package));
+    assert_eq!(location.function_name.as_deref(), Some("increment"));
+    assert_eq!(failure.vm_status, Some(StatusCode::ARITHMETIC_ERROR));
+    assert_eq!(value(scheduler.store(), &id), 1);
 }
 
 #[test]
@@ -114,11 +171,10 @@ fn malformed_calls_fail_without_writing() {
     );
     let fresh = vec![(ObjectId::from_bytes([7; 32]), AccessMode::WriteOnly)];
     let increment = |inputs, arguments| call(package, "increment", inputs, arguments);
-    let calls = [
+    let rejections = [
         undecodable,
         call(package, "create", fresh, Vec::new()),
         increment(owned(), vec![Object(1), pure(1)]),
-        increment(owned(), vec![Object(0), MoveArgument::Pure(vec![1, 2, 3])]),
         // Sui writes every owned input, so it cannot be declared read-only.
         increment(vec![(id, AccessMode::ReadOnly)], vec![Object(0), pure(1)]),
         increment(
@@ -136,10 +192,21 @@ fn malformed_calls_fail_without_writing() {
             vec![Object(0), Object(1)],
         ),
     ];
-    let failure = ExecutionStatus::Aborted(AbortReason::ExecutionFailure);
-    for transaction in calls {
-        assert_eq!(status(&mut scheduler, transaction), failure);
+    for transaction in rejections {
+        assert_eq!(failure(status(&mut scheduler, transaction)), None);
     }
+    // Sui decodes pure arguments itself.
+    let malformed = increment(owned(), vec![Object(0), MoveArgument::Pure(vec![1, 2, 3])]);
+    let failure = failure(status(&mut scheduler, malformed)).unwrap();
+    let invalid = Kind::CommandArgumentError {
+        arg_idx: 1,
+        kind: CommandArgumentError::InvalidBCSBytes,
+    };
+    let invalid = MoveFailure {
+        status: invalid,
+        vm_status: None,
+    };
+    assert_eq!(failure, invalid);
     assert_eq!(scheduler.store().commitment(), commitment);
 }
 
@@ -155,8 +222,16 @@ fn shared_counters_honour_read_only_access() {
 
     let read = || vec![(id, AccessMode::ReadOnly)];
     let increment = call(package, "increment", read(), vec![Object(0), pure(1)]);
-    let failure = ExecutionStatus::Aborted(AbortReason::ExecutionFailure);
-    assert_eq!(status(&mut scheduler, increment), failure);
+    let failure = failure(status(&mut scheduler, increment)).unwrap();
+    let immutable = Kind::CommandArgumentError {
+        arg_idx: 0,
+        kind: CommandArgumentError::InvalidObjectByMutRef,
+    };
+    let immutable = MoveFailure {
+        status: immutable,
+        vm_status: None,
+    };
+    assert_eq!(failure, immutable);
     let check = call(package, "assert_incremented", read(), vec![Object(0)]);
     assert_eq!(status(&mut scheduler, check), ExecutionStatus::Success);
     assert_eq!(scheduler.store().latest(&id).unwrap().version(), version);

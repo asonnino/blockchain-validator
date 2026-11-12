@@ -6,8 +6,13 @@
 // Each test binary compiles its own copy of this module and uses a subset of it.
 #![allow(dead_code)]
 
-use execution::{engine::ExecutionEngine, object::ObjectId, store::StateView};
-use move_engine::MoveEngine;
+use execution::{
+    effects::{AbortReason, ExecutionStatus},
+    engine::ExecutionEngine,
+    object::ObjectId,
+    store::StateView,
+};
+use move_engine::{MoveEngine, MoveFailure};
 use sui_types::{SUI_CLOCK_OBJECT_ID, base_types::ObjectID, object::Object};
 
 /// The counters the package's `init` shared at genesis.
@@ -29,6 +34,14 @@ pub fn shared_counters(engine: &MoveEngine) -> Vec<ObjectId> {
 /// Sui's clock.
 pub fn clock() -> ObjectId {
     ObjectId::from_bytes(SUI_CLOCK_OBJECT_ID.into_bytes())
+}
+
+/// What Sui reported about a failed call.
+pub fn failure(status: ExecutionStatus) -> Option<MoveFailure> {
+    let ExecutionStatus::Aborted(AbortReason::ExecutionFailure(detail)) = &status else {
+        panic!("not an execution failure: {status:?}");
+    };
+    MoveFailure::decode(detail)
 }
 
 /// The counter's value: the `u64` after its 32-byte `UID` in the Move object's contents.

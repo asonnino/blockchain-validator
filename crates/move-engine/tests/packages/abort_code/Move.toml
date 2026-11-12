@@ -1,0 +1,6 @@
+[package]
+name = "abort_code"
+edition = "2024"
+
+[addresses]
+counter = "0x0"
