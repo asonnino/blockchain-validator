@@ -8,7 +8,7 @@ use std::mem;
 use crate::object::{Object, ObjectId, Version};
 
 /// Why a transaction aborted.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum AbortReason {
     /// The payload requested an abort.
     ExplicitAbort,
@@ -21,11 +21,26 @@ pub enum AbortReason {
     /// The transaction failed static verification.
     InvalidTransaction,
     /// The engine failed the call, for example on a Move abort.
-    ExecutionFailure,
+    ExecutionFailure(FailureDetail),
+}
+
+/// How an engine failed a call, in the engine's own encoding; empty when the engine adds
+/// nothing.
+#[derive(Clone, PartialEq, Default, Debug)]
+pub struct FailureDetail(Vec<u8>);
+
+impl FailureDetail {
+    pub fn new(contents: Vec<u8>) -> Self {
+        Self(contents)
+    }
+
+    pub fn contents(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// The outcome of executing a transaction.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ExecutionStatus {
     Success,
     Aborted(AbortReason),
@@ -98,8 +113,8 @@ impl ExecutionOutput {
         self
     }
 
-    pub fn status(&self) -> ExecutionStatus {
-        self.status
+    pub fn status(&self) -> &ExecutionStatus {
+        &self.status
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<Event> {

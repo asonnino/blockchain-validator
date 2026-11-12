@@ -36,7 +36,7 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
     pub fn begin_commit(&mut self, commit: &CommitInfo) {
         let output = self.engine.begin_commit(&self.store, commit);
         assert_eq!(
-            output.status(),
+            *output.status(),
             ExecutionStatus::Success,
             "commits must begin"
         );
@@ -54,7 +54,7 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
             let outcome = if transaction.verify() {
                 let mut output = self.engine.execute(&self.store, &transaction);
                 let outcome = TransactionOutcome {
-                    status: output.status(),
+                    status: output.status().clone(),
                     events: output.take_events(),
                 };
                 self.store.apply(output);
@@ -244,9 +244,9 @@ mod tests {
             .collect();
 
         // A live id is in use, and so is a deleted one.
-        let in_use = ExecutionStatus::Aborted(AbortReason::IdInUse);
-        let success = ExecutionStatus::Success;
-        assert_eq!(statuses, [success, in_use, success, in_use]);
+        let in_use = || ExecutionStatus::Aborted(AbortReason::IdInUse);
+        let success = || ExecutionStatus::Success;
+        assert_eq!(statuses, [success(), in_use(), success(), in_use()]);
     }
 
     #[test]

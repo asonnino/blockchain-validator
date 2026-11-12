@@ -9,7 +9,7 @@ mod common;
 
 use common::{clock, shared_counters, value};
 use execution::{
-    effects::{AbortReason, ExecutionStatus},
+    effects::{AbortReason, ExecutionStatus, FailureDetail},
     engine::CommitInfo,
     object::ObjectId,
     scheduler::SequentialScheduler,
@@ -94,7 +94,7 @@ fn move_aborts_write_nothing() {
 
     let inputs = vec![(id, AccessMode::ReadWrite)];
     let check = call(package, "assert_incremented", inputs, vec![Object(0)]);
-    let aborted = ExecutionStatus::Aborted(AbortReason::ExecutionFailure);
+    let aborted = ExecutionStatus::Aborted(AbortReason::ExecutionFailure(FailureDetail::default()));
     assert_eq!(status(&mut scheduler, check), aborted);
     assert_eq!(scheduler.store().latest(&id).unwrap().version(), version);
 }
@@ -136,7 +136,7 @@ fn malformed_calls_fail_without_writing() {
             vec![Object(0), Object(1)],
         ),
     ];
-    let failure = ExecutionStatus::Aborted(AbortReason::ExecutionFailure);
+    let failure = ExecutionStatus::Aborted(AbortReason::ExecutionFailure(FailureDetail::default()));
     for transaction in calls {
         assert_eq!(status(&mut scheduler, transaction), failure);
     }
@@ -155,7 +155,7 @@ fn shared_counters_honour_read_only_access() {
 
     let read = || vec![(id, AccessMode::ReadOnly)];
     let increment = call(package, "increment", read(), vec![Object(0), pure(1)]);
-    let failure = ExecutionStatus::Aborted(AbortReason::ExecutionFailure);
+    let failure = ExecutionStatus::Aborted(AbortReason::ExecutionFailure(FailureDetail::default()));
     assert_eq!(status(&mut scheduler, increment), failure);
     let check = call(package, "assert_incremented", read(), vec![Object(0)]);
     assert_eq!(status(&mut scheduler, check), ExecutionStatus::Success);

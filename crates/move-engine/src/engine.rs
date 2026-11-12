@@ -12,7 +12,7 @@ use std::{
 
 use blake2::{Blake2b, Digest as _, digest::consts::U32};
 use execution::{
-    effects::{AbortReason, Event, ExecutionOutput},
+    effects::{AbortReason, Event, ExecutionOutput, FailureDetail},
     engine::{CommitInfo, ExecutionEngine},
     object::{Object, ObjectId, Version},
     store::{InMemoryStore, StateView},
@@ -437,7 +437,9 @@ impl ExecutionEngine for MoveEngine {
             return ExecutionOutput::aborted(AbortReason::UnknownFunction);
         };
         let Ok(call) = bcs::from_bytes::<MoveCall>(transaction.args()) else {
-            return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
+            return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
+                FailureDetail::default(),
+            ));
         };
 
         let store = SuiView(view, &self.substitutes);
@@ -447,13 +449,17 @@ impl ExecutionEngine for MoveEngine {
         for (id, mode) in transaction.inputs() {
             // Move derives created ids from the transaction digest, so it declares no creations.
             if *mode == AccessMode::WriteOnly {
-                return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
+                return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
+                    FailureDetail::default(),
+                ));
             }
             let id = ObjectID::new(*id.as_bytes());
             // Only commits advance the clock: Sui's input checks, which this engine replaces, let
             // transactions read it and nothing more.
             if id == SUI_CLOCK_OBJECT_ID && *mode != AccessMode::ReadOnly {
-                return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
+                return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
+                    FailureDetail::default(),
+                ));
             }
             let Some(object) = store.object(&id) else {
                 return ExecutionOutput::aborted(AbortReason::MissingRead);
@@ -490,14 +496,20 @@ impl ExecutionEngine for MoveEngine {
                 }
                 // Sui rewrites every owned input, so the call must declare it writable.
                 Owner::AddressOwner(_) if *mode != AccessMode::ReadWrite => {
-                    return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
+                    return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
+                        FailureDetail::default(),
+                    ));
                 }
                 Owner::AddressOwner(_) | Owner::Immutable if !object.is_package() => {
                     let reference = object.compute_object_reference();
                     let kind = InputObjectKind::ImmOrOwnedMoveObject(reference);
                     (ObjectArg::ImmOrOwnedObject(reference), kind)
                 }
-                _ => return ExecutionOutput::aborted(AbortReason::ExecutionFailure),
+                _ => {
+                    return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
+                        FailureDetail::default(),
+                    ));
+                }
             };
             objects.push(builder.obj(argument).expect("inputs are unique"));
             inputs.push(ObjectReadResult {
@@ -511,7 +523,11 @@ impl ExecutionEngine for MoveEngine {
                 MoveArgument::Pure(bytes) => builder.pure_bytes(bytes, false),
                 MoveArgument::Object(index) => match objects.get(usize::from(index)) {
                     Some(object) => *object,
-                    None => return ExecutionOutput::aborted(AbortReason::ExecutionFailure),
+                    None => {
+                        return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
+                            FailureDetail::default(),
+                        ));
+                    }
                 },
             });
         }
@@ -528,7 +544,9 @@ impl ExecutionEngine for MoveEngine {
         let digest = sui_digest(transaction);
         let (inner_store, effects) = self.run::<Normal, _>(&store, kind, sender, inputs, digest);
         if !effects.status().is_ok() {
-            return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
+            return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
+                FailureDetail::default(),
+            ));
         }
         let changes = effects.object_changes();
         // A replayed transaction derives the same fresh ids again, those it wraps at once

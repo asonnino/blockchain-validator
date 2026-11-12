@@ -154,7 +154,7 @@ mod tests {
         let transaction = FakeTransaction::success(vec![], vec![id], vec![]).into();
         let output = FakeExecutor.execute(&store, &transaction);
 
-        assert_eq!(output.status(), ExecutionStatus::Success);
+        assert_eq!(*output.status(), ExecutionStatus::Success);
         let contents = FakeExecutor::NEW_OBJECT_CONTENT.to_vec();
         assert_eq!(
             output.writes(),
@@ -211,7 +211,7 @@ mod tests {
         let transaction =
             FakeTransaction::success(vec![], vec![created_a, created_b], vec![modified]).into();
         let output = FakeExecutor.execute(&store, &transaction);
-        assert_eq!(output.status(), ExecutionStatus::Success);
+        assert_eq!(*output.status(), ExecutionStatus::Success);
         assert_eq!(output.writes().len(), 3);
 
         store.apply(output);
@@ -225,7 +225,7 @@ mod tests {
         let transaction = FakeTransaction::abort().into();
         let output = FakeExecutor.execute(&InMemoryStore::default(), &transaction);
         assert_eq!(
-            output.status(),
+            *output.status(),
             ExecutionStatus::Aborted(AbortReason::ExplicitAbort)
         );
         assert!(output.writes().is_empty());
@@ -240,7 +240,7 @@ mod tests {
         ] {
             let output = FakeExecutor.execute(&InMemoryStore::default(), &transaction.into());
             assert_eq!(
-                output.status(),
+                *output.status(),
                 ExecutionStatus::Aborted(AbortReason::MissingRead)
             );
             assert!(output.writes().is_empty());
@@ -260,7 +260,7 @@ mod tests {
         let transaction = FakeTransaction::success(vec![], vec![id], vec![]).into();
         let output = FakeExecutor.execute(&store, &transaction);
         assert_eq!(
-            output.status(),
+            *output.status(),
             ExecutionStatus::Aborted(AbortReason::IdInUse)
         );
         assert!(output.writes().is_empty());
@@ -271,7 +271,7 @@ mod tests {
         let transaction = Transaction::new(FunctionId::new(9), vec![], vec![]);
         let output = FakeExecutor.execute(&InMemoryStore::default(), &transaction);
         assert_eq!(
-            output.status(),
+            *output.status(),
             ExecutionStatus::Aborted(AbortReason::UnknownFunction)
         );
     }
