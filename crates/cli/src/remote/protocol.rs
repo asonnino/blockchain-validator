@@ -10,6 +10,7 @@ use std::{
     path::PathBuf,
 };
 
+use clap::ValueEnum;
 use dag::authority::Authority;
 use orchestrator::{
     benchmark::BenchmarkParameters,
@@ -21,6 +22,8 @@ use orchestrator::{
 use replica::config::{PublicReplicaConfig, ReplicaParameters};
 use serde::{Deserialize, Serialize};
 use validator::generator::LoadGeneratorConfig;
+
+use crate::args::Engine;
 
 const PUBLIC_REPLICA_CONFIG_FILENAME: &str = PublicReplicaConfig::DEFAULT_FILENAME;
 const LOAD_GENERATOR_CONFIG_FILENAME: &str = LoadGeneratorConfig::DEFAULT_FILENAME;
@@ -71,12 +74,14 @@ impl ProtocolParameters for ClientParameters {}
 
 pub struct ValidatorProtocol {
     working_dir: PathBuf,
+    engine: Engine,
 }
 
 impl ValidatorProtocol {
-    pub fn new(settings: &Settings) -> Self {
+    pub fn new(settings: &Settings, engine: Engine) -> Self {
         Self {
             working_dir: settings.working_dir.clone(),
+            engine,
         }
     }
 }
@@ -155,8 +160,6 @@ impl ProtocolCommands for ValidatorProtocol {
     {
         // The per-node share of the total load; the generator rejects a zero load, so nodes
         // without one to bear run without the flag (and without a generator).
-        // Todo: unit-test this builder once orchestrator's `Instance` has a test constructor
-        // (asonnino/mysticeti#225).
         let load = parameters.load / parameters.nodes;
         instances
             .into_iter()
@@ -170,12 +173,14 @@ impl ProtocolCommands for ValidatorProtocol {
                 let load_generator_config_path =
                     self.working_dir.join(LOAD_GENERATOR_CONFIG_FILENAME);
 
+                let engine = self.engine.to_possible_value().expect("engines are named");
                 let mut run = vec![
                     format!("./{BINARY_PATH}/validator"),
                     "run".into(),
                     format!("--authority {}", authority.index()),
                     format!("--public-config-path {}", public_config_path.display()),
                     format!("--private-config-path {}", private_config_path.display()),
+                    format!("--engine {}", engine.get_name()),
                 ];
                 if load > 0 {
                     run.push(format!(
@@ -290,5 +295,50 @@ impl ProtocolMetrics for ValidatorProtocol {
     {
         // The load generators live inside the nodes, which are scraped already.
         self.nodes_metrics_path(instances, parameters)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use dag::authority::Authority;
+    use orchestrator::{
+        benchmark::BenchmarkParameters, protocol::ProtocolCommands, provider::Instance,
+        settings::Settings,
+    };
+
+    use super::{ClientParameters, NodeParameters, ValidatorProtocol};
+    use crate::args::{Args, Command, Engine};
+
+    #[test]
+    fn validators_parse_their_node_commands() {
+        // Todo: use `Instance::new_for_test` once it leaves `cfg(test)` (asonnino/mysticeti#225).
+        let instance: Instance = serde_yaml::from_str(
+            "{id: '0', region: '', main_ip: 127.0.0.1, tags: [], specs: '', status: Active}",
+        )
+        .unwrap();
+        let protocol = ValidatorProtocol::new(&Settings::default(), Engine::Move);
+        // Below one transaction per node, validators run without a load generator.
+        for (load, generates) in [(400, true), (3, false)] {
+            let parameters = BenchmarkParameters {
+                settings: Settings::default(),
+                node_parameters: NodeParameters::default(),
+                client_parameters: ClientParameters::default(),
+                nodes: 4,
+                load,
+            };
+            let commands = protocol.node_command(vec![instance.clone(); 4], &parameters);
+            assert_eq!(commands.len(), 4);
+            for (i, (_, command)) in commands.into_iter().enumerate() {
+                let run = command.rsplit(" && ").next().unwrap();
+                let parsed = Args::try_parse_from(run.split_whitespace()).unwrap();
+                let Command::Run(args) = parsed.command else {
+                    panic!("not a run command: {run}");
+                };
+                assert_eq!(args.authority, Authority::from(i));
+                assert!(matches!(args.engine, Engine::Move));
+                assert_eq!(args.load_generator_config_path.is_some(), generates);
+            }
+        }
     }
 }

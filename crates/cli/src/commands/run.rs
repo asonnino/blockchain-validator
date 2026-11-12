@@ -72,6 +72,8 @@ pub async fn run(
             )
             .await
         }
+        #[cfg(not(feature = "move"))]
+        Engine::Move => Err(eyre!("--engine move needs a build with the `move` feature")),
     }
 }
 

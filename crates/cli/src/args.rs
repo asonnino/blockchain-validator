@@ -75,12 +75,11 @@ pub struct RunArgs {
     pub engine: Engine,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum)]
 pub enum Engine {
     /// Creates and updates opaque objects, ignoring the call arguments.
     Fake,
     /// Runs the bundled counter Move package through Sui's execution layer.
-    #[cfg(feature = "move")]
     Move,
 }
 
@@ -142,5 +141,9 @@ pub enum RemoteTestbedCommand {
         /// be misconfigured for the requested committee size.
         #[arg(long)]
         skip_testbed_configuration: bool,
+
+        /// Execution engine the validators run.
+        #[arg(long, value_enum, default_value_t = Engine::Fake)]
+        engine: Engine,
     },
 }

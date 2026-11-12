@@ -38,6 +38,7 @@
         "recertifies",
         "rngs",
         "roundtrips",
+        "rsplit",
         "russh",
         "rustls",
         "rustc",
