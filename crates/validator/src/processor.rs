@@ -30,15 +30,15 @@ pub trait CommitProcessor: Send + 'static {
     /// The processor's own consensus messages, carried as [`Payload::Message`].
     type Message: Serialize;
 
-    /// Processes one committed sub-dag and returns the payloads this validator must submit
-    /// through consensus. During replay the payloads are dropped, `now` is zero, and `metrics`
-    /// is a throwaway sink; otherwise `now` is the validator's clock as time since epoch.
+    /// Processes one committed sub-dag. During replay the result is dropped, `now` is zero, and
+    /// `metrics` is a throwaway sink; otherwise `now` is the validator's clock as time since
+    /// epoch.
     fn process(
         &mut self,
         subdag: CommittedSubDag,
         now: Duration,
         metrics: &ValidatorMetrics,
-    ) -> Vec<Payload<Self::Message>>;
+    ) -> Processed<Self::Message>;
 
     /// The payloads to submit once replay is done, before the first live sub-dag. Submissions
     /// still queued when the replica stopped are lost, so this is where to resubmit any that
@@ -50,6 +50,17 @@ pub trait CommitProcessor: Send + 'static {
 
     /// Whether everything executed so far is certified.
     fn is_certified(&self) -> bool;
+}
+
+/// What processing one committed sub-dag produced.
+pub struct Processed<M> {
+    /// The payloads this validator must submit through consensus.
+    pub payloads: Vec<Payload<M>>,
+    /// How long the processor was busy with the sub-dag. The driver sleeps it through `Ctx`
+    /// before submitting and taking the next sub-dag, modelling processing cost under the
+    /// simulator, where processing takes no time; under tokio the work already took real time,
+    /// so report zero.
+    pub busy: Duration,
 }
 
 /// The default processor: executes each sub-dag through a [`SequentialScheduler`], mints
@@ -163,10 +174,13 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for SequentialProcesso
         subdag: CommittedSubDag,
         now: Duration,
         metrics: &ValidatorMetrics,
-    ) -> Vec<Payload<NoMessage>> {
+    ) -> Processed<NoMessage> {
         let (executed, minted) = self.execute_subdag(metrics, now, subdag);
         self.executed += executed as u64;
-        minted.map(Payload::Attest).into_iter().collect()
+        Processed {
+            payloads: minted.map(Payload::Attest).into_iter().collect(),
+            busy: Duration::ZERO,
+        }
     }
 
     /// Re-attests the checkpoints still uncertified after replay: a validator otherwise attests
@@ -279,7 +293,9 @@ mod tests {
         let create = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
         let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
 
-        let minted = state.process(subdag(vec![execute]), Duration::ZERO, &metrics);
+        let minted = state
+            .process(subdag(vec![execute]), Duration::ZERO, &metrics)
+            .payloads;
         let [Payload::Attest(checkpoint)] = minted.as_slice() else {
             panic!("an executing sub-dag must attest to its checkpoint");
         };
@@ -293,7 +309,9 @@ mod tests {
                 (author, vec![vote])
             })
             .collect();
-        let payloads = state.process(subdag_at(2, votes), Duration::ZERO, &metrics);
+        let payloads = state
+            .process(subdag_at(2, votes), Duration::ZERO, &metrics)
+            .payloads;
         assert!(payloads.is_empty());
         assert_eq!(state.executed(), 1);
         assert!(state.is_certified());
