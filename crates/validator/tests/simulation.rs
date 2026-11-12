@@ -8,7 +8,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use checkpoint::certifier::CheckpointCertifier;
-use dag::{authority::Authority, context::Ctx, metrics::Metrics};
+use dag::{authority::Authority, consensus::CommittedSubDag, context::Ctx, metrics::Metrics};
 use execution::{
     object::{ObjectId, Version},
     scheduler::SequentialScheduler,
@@ -16,6 +16,7 @@ use execution::{
 };
 use fake_engine::{FakeExecutor, FakeTransaction, FakeWorkload};
 use futures::future::join_all;
+use prometheus::Histogram;
 use rand::{SeedableRng, rngs::StdRng};
 use replica::{
     builder::StorageKind,
@@ -25,8 +26,10 @@ use simulator::{
     LatencyModel, SimulatedNetwork, SimulatorContext, SimulatorExecutor, UniformLatency,
 };
 use validator::{
+    envelope::{NoMessage, Payload},
     generator::LoadGeneratorConfig,
-    processor::SequentialProcessor,
+    metrics::ValidatorMetrics,
+    processor::{CommitProcessor, Processed, SequentialProcessor},
     validator::{ValidatorBuilder, ValidatorHandle},
 };
 
@@ -44,17 +47,15 @@ const SUBMISSION_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BLOCK_SIZE: usize = 512;
 
 /// A committee of validators running under the simulator.
-struct SimulatedTestbed {
+struct SimulatedTestbed<P: CommitProcessor> {
     /// Dropping the network silently severs all connections.
     _network: SimulatedNetwork,
-    validators: Vec<SimulatedValidator>,
+    validators: Vec<ValidatorHandle<SimulatorContext, P>>,
     metrics: Vec<Arc<Metrics>>,
 }
 
-type SimulatedValidator = ValidatorHandle<SimulatorContext, SequentialProcessor<FakeExecutor>>;
-
-impl SimulatedTestbed {
-    async fn start() -> Self {
+impl<P: CommitProcessor> SimulatedTestbed<P> {
+    async fn start(processor: impl Fn(&PublicReplicaConfig) -> P) -> Self {
         let mut public_config = PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE);
         public_config.parameters.dag.max_block_size = MAX_BLOCK_SIZE;
         let latency = LatencyModel::Uniform(UniformLatency { range_ms: 50..100 });
@@ -69,13 +70,12 @@ impl SimulatedTestbed {
         {
             let node_metrics = Metrics::new_for_test(COMMITTEE_SIZE);
             metrics.push(node_metrics.clone());
-            let validator = ValidatorBuilder::new(
-                FakeExecutor,
+            let validator = ValidatorBuilder::with_processor(
+                processor(&public_config),
                 Authority::from(index),
                 public_config.clone(),
                 private_config,
             )
-            .expect("validator must build")
             .with_storage(StorageKind::Ephemeral)
             .with_simulated_crypto()
             .with_metrics(node_metrics)
@@ -95,7 +95,7 @@ impl SimulatedTestbed {
         }
     }
 
-    fn validators(&self) -> &[SimulatedValidator] {
+    fn validators(&self) -> &[ValidatorHandle<SimulatorContext, P>] {
         &self.validators
     }
 
@@ -112,19 +112,66 @@ impl SimulatedTestbed {
         }
     }
 
-    async fn shutdown(self) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
-        let mut results = Vec::with_capacity(self.validators.len());
+    async fn shutdown(self) -> Vec<P> {
+        let mut processors = Vec::with_capacity(self.validators.len());
         for validator in self.validators {
-            results.push(validator.shutdown().await.into_parts());
+            processors.push(validator.shutdown().await);
         }
-        results
+        processors
     }
+}
+
+/// The default processor, busy for [`BUSY`] with every sub-dag.
+struct Busy(SequentialProcessor<FakeExecutor>);
+
+const BUSY: Duration = Duration::from_millis(50);
+
+impl CommitProcessor for Busy {
+    type Message = NoMessage;
+
+    fn process(
+        &mut self,
+        subdag: CommittedSubDag,
+        now: Duration,
+        metrics: &ValidatorMetrics,
+    ) -> Processed<NoMessage> {
+        // The driver submits once the busy time is over, so no payload carries a stamp later
+        // than its block's.
+        for block in &subdag.blocks {
+            for transaction in block.transactions() {
+                assert!(transaction.extract_timestamp() <= Some(block.timestamp()));
+            }
+        }
+        Processed {
+            busy: BUSY,
+            ..self.0.process(subdag, now + BUSY, metrics)
+        }
+    }
+
+    fn after_replay(&mut self) -> Vec<Payload<NoMessage>> {
+        self.0.after_replay()
+    }
+
+    fn executed(&self) -> u64 {
+        self.0.executed()
+    }
+
+    fn is_certified(&self) -> bool {
+        self.0.is_certified()
+    }
+}
+
+fn sequential(public_config: &PublicReplicaConfig) -> SequentialProcessor<FakeExecutor> {
+    SequentialProcessor::new(FakeExecutor, public_config).expect("processor must build")
 }
 
 /// Every validator creates its own object, then modifies it while reading its neighbor's: the
 /// read couples the Lamport versions across objects, so the final state encodes the commit
 /// interleaving — an ordering oracle the conflict-free generator load cannot provide.
-async fn coupled_workload(index: usize, validator: &SimulatedValidator) {
+async fn coupled_workload<P: CommitProcessor>(
+    index: usize,
+    validator: &ValidatorHandle<SimulatorContext, P>,
+) {
     let id = ObjectId::new(index as u64);
     let neighbor = ObjectId::new(((index + 1) % COMMITTEE_SIZE) as u64);
     let create = FakeTransaction::success(vec![], vec![id], vec![]).into();
@@ -143,16 +190,15 @@ async fn coupled_workload(index: usize, validator: &SimulatedValidator) {
     }
 }
 
-/// Per-validator state, metrics, and delivered-sub-dag counts (the metric-(b) sample count).
-type RunOutcome = (
-    Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)>,
-    Vec<Arc<Metrics>>,
-    Vec<u64>,
-);
+/// Per-validator processors, replica metrics, and validator metrics.
+type RunOutcome<P> = (Vec<P>, Vec<Arc<Metrics>>, Vec<Arc<ValidatorMetrics>>);
 
-fn run_once(seed: u64) -> RunOutcome {
+fn run_once<P: CommitProcessor>(
+    seed: u64,
+    processor: impl Fn(&PublicReplicaConfig) -> P + Send + 'static,
+) -> RunOutcome<P> {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
-        let mut committee = SimulatedTestbed::start().await;
+        let mut committee = SimulatedTestbed::start(processor).await;
         let generators: Vec<_> = committee
             .validators()
             .iter()
@@ -195,16 +241,13 @@ fn run_once(seed: u64) -> RunOutcome {
             }
         }
         committee.wait_for_certified().await;
-        // Metric (b) observes every delivered sub-dag. Values are zero under simulated time
-        // (execution advances no simulated clock), so only population is meaningful.
-        let mut delivered = Vec::with_capacity(COMMITTEE_SIZE);
+        // Metric (b) observes every delivered sub-dag.
         let mut certified_counts = Vec::with_capacity(COMMITTEE_SIZE);
         for validator in committee.validators() {
             assert!(validator.executed() >= TARGET_TRANSACTIONS);
             assert!(validator.metrics().submitted_transactions().get() > 0);
             let histogram = validator.metrics().subdag_execution_latency_s();
             assert!(histogram.get_sample_count() > 0);
-            delivered.push(histogram.get_sample_count());
 
             // Certification and end-to-end latencies derive from simulated clocks, so their
             // magnitudes are meaningful; each certified checkpoint observes both once.
@@ -216,7 +259,7 @@ fn run_once(seed: u64) -> RunOutcome {
                 certification.get_sample_count()
             );
             for (name, histogram) in [("certification", certification), ("e2e", end_to_end)] {
-                let mean = histogram.get_sample_sum() / histogram.get_sample_count() as f64;
+                let mean = mean(histogram);
                 assert!(
                     mean > 0.0 && mean < 10.0,
                     "implausible {name} latency: {mean} s"
@@ -227,13 +270,32 @@ fn run_once(seed: u64) -> RunOutcome {
         // Certified checkpoints are a deterministic function of the commit stream.
         assert!(certified_counts.iter().all(|c| *c == certified_counts[0]));
         let metrics = committee.metrics.clone();
-        (committee.shutdown().await, metrics, delivered)
+        let validator_metrics = committee
+            .validators()
+            .iter()
+            .map(|validator| validator.metrics().clone())
+            .collect();
+        (committee.shutdown().await, metrics, validator_metrics)
     })
+}
+
+fn parts(
+    processors: Vec<SequentialProcessor<FakeExecutor>>,
+) -> Vec<(SequentialScheduler<FakeExecutor>, CheckpointCertifier)> {
+    processors
+        .into_iter()
+        .map(SequentialProcessor::into_parts)
+        .collect()
+}
+
+fn mean(histogram: &Histogram) -> f64 {
+    histogram.get_sample_sum() / histogram.get_sample_count() as f64
 }
 
 #[test]
 fn validators_converge_under_simulation() {
-    let (results, metrics, _) = run_once(7);
+    let (processors, metrics, _) = run_once(7, sequential);
+    let results = parts(processors);
 
     // Commit latency derives from the envelope timestamps: positive, and bounded well below
     // the several simulated seconds the submissions span — unstamped payloads would instead
@@ -273,14 +335,21 @@ fn validators_converge_under_simulation() {
 
 #[test]
 fn simulation_is_deterministic_per_seed() {
+    let delivered = |metrics: &[Arc<ValidatorMetrics>]| -> Vec<u64> {
+        metrics
+            .iter()
+            .map(|metrics| metrics.subdag_execution_latency_s().get_sample_count())
+            .collect()
+    };
     for seed in [7, 42] {
-        let (first, _, first_delivered) = run_once(seed);
-        let (second, _, second_delivered) = run_once(seed);
+        let (first, _, first_metrics) = run_once(seed, sequential);
+        let (second, _, second_metrics) = run_once(seed, sequential);
         assert_eq!(
-            first_delivered, second_delivered,
+            delivered(&first_metrics),
+            delivered(&second_metrics),
             "seed {seed} produced diverging delivery counts"
         );
-        for ((a, a_certifier), (b, b_certifier)) in first.iter().zip(&second) {
+        for ((a, a_certifier), (b, b_certifier)) in parts(first).iter().zip(&parts(second)) {
             assert_eq!(
                 a.store(),
                 b.store(),
@@ -293,4 +362,37 @@ fn simulation_is_deterministic_per_seed() {
             );
         }
     }
+}
+
+#[test]
+fn processing_time_delays_certification() {
+    let busy = |public_config: &PublicReplicaConfig| Busy(sequential(public_config));
+    let (_, _, idle) = run_once(7, sequential);
+    let (processors, _, slowed) = run_once(7, busy);
+    let delay = |idle: &Histogram, slowed: &Histogram| mean(slowed) - mean(idle);
+    for (idle, slowed) in idle.iter().zip(&slowed) {
+        // Every sub-dag's latency is exactly the busy time.
+        let execution = mean(slowed.subdag_execution_latency_s());
+        assert!(
+            (execution - BUSY.as_secs_f64()).abs() < 1e-9,
+            "{execution} s"
+        );
+        // Votes go out late, and every later sub-dag waits behind the slow ones.
+        let certification = delay(
+            idle.checkpoint_certification_latency_s(),
+            slowed.checkpoint_certification_latency_s(),
+        );
+        assert!(certification >= BUSY.as_secs_f64(), "{certification} s");
+        let end_to_end = delay(idle.end_to_end_latency_s(), slowed.end_to_end_latency_s());
+        assert!(end_to_end >= BUSY.as_secs_f64(), "{end_to_end} s");
+    }
+
+    // Validators with a backlog still settle on the same state.
+    let results = parts(processors.into_iter().map(|Busy(inner)| inner).collect());
+    let store = results[0].0.store();
+    assert!(
+        results
+            .iter()
+            .all(|(scheduler, _)| scheduler.store() == store)
+    );
 }

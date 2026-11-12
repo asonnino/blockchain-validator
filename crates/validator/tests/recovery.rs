@@ -21,7 +21,7 @@ use fake_engine::{FakeExecutor, FakeTransaction};
 use validator::{
     envelope::{NoMessage, Payload},
     metrics::ValidatorMetrics,
-    processor::{CommitProcessor, SequentialProcessor},
+    processor::{CommitProcessor, Processed, SequentialProcessor},
 };
 
 const STATE_UPDATES: usize = 3;
@@ -37,9 +37,11 @@ impl CommitProcessor for Mute {
         subdag: CommittedSubDag,
         now: Duration,
         metrics: &ValidatorMetrics,
-    ) -> Vec<Payload<NoMessage>> {
-        self.0.process(subdag, now, metrics);
-        Vec::new()
+    ) -> Processed<NoMessage> {
+        Processed {
+            payloads: Vec::new(),
+            ..self.0.process(subdag, now, metrics)
+        }
     }
 
     fn after_replay(&mut self) -> Vec<Payload<NoMessage>> {

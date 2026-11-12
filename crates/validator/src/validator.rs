@@ -28,7 +28,7 @@ use crate::generator::{LoadGeneratorConfig, TransactionGenerator};
 use crate::{
     envelope::{Envelope, Payload},
     metrics::ValidatorMetrics,
-    processor::{CommitProcessor, SequentialProcessor},
+    processor::{CommitProcessor, Processed, SequentialProcessor},
 };
 
 /// Capacity of the commit stream; a bounded channel is mandatory — a slow consumer must
@@ -174,12 +174,15 @@ impl<P: CommitProcessor> Validator<P> {
                 // The clock starts at delivery (idle waiting is not latency).
                 let start = C::now();
                 let now = C::timestamp_utc();
-                let payloads = processor.process(subdag, now, &driver_metrics);
+                let Processed { payloads, busy } = processor.process(subdag, now, &driver_metrics);
+                let transactions = to_consensus((now + busy).as_millis() as u64, payloads);
+                if !busy.is_zero() {
+                    C::sleep(busy).await;
+                }
                 driver_metrics.observe_subdag_execution_latency(C::elapsed(&start));
                 let _ = executed_sender.send(processor.executed());
                 let _ = certified_sender.send(processor.is_certified());
                 // Failure means the replica is shutting down.
-                let transactions = to_consensus(now.as_millis() as u64, payloads);
                 if !transactions.is_empty() && client.submit(transactions).await.is_err() {
                     tracing::debug!("payload submission failed; shutting down");
                 }
