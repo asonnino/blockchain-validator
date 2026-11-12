@@ -144,7 +144,7 @@ impl CommitProcessor for Busy {
         }
         Processed {
             busy: BUSY,
-            ..self.0.process(subdag, now, metrics)
+            ..self.0.process(subdag, now + BUSY, metrics)
         }
     }
 

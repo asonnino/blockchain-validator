@@ -59,7 +59,7 @@ pub struct Processed<M> {
     /// How long the processor was busy with the sub-dag. The driver sleeps it through `Ctx`
     /// before submitting and taking the next sub-dag, modelling processing cost under the
     /// simulator, where processing takes no time; under tokio the work already took real time,
-    /// so report zero.
+    /// so report zero. The work ends at `now + busy`, so stamp what it produces with that time.
     pub busy: Duration,
 }
 
