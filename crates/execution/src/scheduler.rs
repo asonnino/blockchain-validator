@@ -56,6 +56,7 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
                 let outcome = TransactionOutcome {
                     status: output.status().clone(),
                     events: output.take_events(),
+                    gas_used: output.gas_used(),
                 };
                 self.store.apply(output);
                 outcome
@@ -63,6 +64,7 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
                 TransactionOutcome {
                     status: ExecutionStatus::Aborted(AbortReason::InvalidTransaction),
                     events: Vec::new(),
+                    gas_used: 0,
                 }
             };
             self.outcomes.push(outcome);
@@ -91,7 +93,7 @@ mod tests {
     const DELETE: FunctionId = FunctionId::new(2);
 
     /// Aborts [`ABORT`] calls. Every other call touches its non-read-only inputs at the next
-    /// version: [`DELETE`] calls delete them and emit one event, the rest write them.
+    /// version: [`DELETE`] calls delete them, emit one event, and use 3 gas; the rest write them.
     struct Stub;
 
     impl ExecutionEngine for Stub {
@@ -111,7 +113,8 @@ mod tests {
             if transaction.function() == DELETE {
                 return ExecutionOutput::success(Vec::new())
                     .with_deletes(touched.map(|id| (id, version)).collect())
-                    .with_events(vec![Event::new(vec![2])]);
+                    .with_events(vec![Event::new(vec![2])])
+                    .with_gas_used(3);
             }
             let writes = touched
                 .map(|id| Object::new(id, version, Vec::new()))
@@ -179,7 +182,8 @@ mod tests {
             outcomes,
             [TransactionOutcome {
                 status,
-                events: Vec::new()
+                events: Vec::new(),
+                gas_used: 0,
             }]
         );
         assert!(scheduler.store().latest(&id).is_none());
@@ -264,6 +268,7 @@ mod tests {
         let deleted = TransactionOutcome {
             status: ExecutionStatus::Success,
             events: vec![Event::new(vec![2])],
+            gas_used: 3,
         };
         assert_eq!(outcomes[1], deleted);
         // The deleted object no longer resolves, so reading it aborts.

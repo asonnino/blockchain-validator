@@ -73,6 +73,9 @@ pub struct ExecutionOutput {
     writes: Vec<Object>,
     deletes: Vec<(ObjectId, Version)>,
     events: Vec<Event>,
+    /// The gas the engine metered for the call, in its own units; like events, outside the store
+    /// and the state commitment.
+    gas_used: u64,
 }
 
 impl ExecutionOutput {
@@ -83,6 +86,7 @@ impl ExecutionOutput {
             writes,
             deletes: Vec::new(),
             events: Vec::new(),
+            gas_used: 0,
         }
     }
 
@@ -93,6 +97,7 @@ impl ExecutionOutput {
             writes: Vec::new(),
             deletes: Vec::new(),
             events: Vec::new(),
+            gas_used: 0,
         }
     }
 
@@ -113,8 +118,17 @@ impl ExecutionOutput {
         self
     }
 
+    pub fn with_gas_used(mut self, gas_used: u64) -> Self {
+        self.gas_used = gas_used;
+        self
+    }
+
     pub fn status(&self) -> &ExecutionStatus {
         &self.status
+    }
+
+    pub(crate) fn gas_used(&self) -> u64 {
+        self.gas_used
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<Event> {
@@ -131,9 +145,10 @@ impl ExecutionOutput {
     }
 }
 
-/// A transaction's status and events, once its state changes are applied.
+/// A transaction's status, events, and gas used, once its state changes are applied.
 #[derive(PartialEq, Debug)]
 pub struct TransactionOutcome {
     pub status: ExecutionStatus,
     pub events: Vec<Event>,
+    pub gas_used: u64,
 }

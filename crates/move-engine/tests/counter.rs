@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{clock, failure, shared_counters, value};
+use common::{call, clock, failure, pure, shared_counters, value};
 use execution::{
     effects::{AbortReason, ExecutionStatus},
     engine::CommitInfo,
@@ -34,23 +34,8 @@ fn scheduler() -> (SequentialScheduler<MoveEngine>, ObjectID) {
     (SequentialScheduler::new(engine), package)
 }
 
-fn call(
-    package: ObjectID,
-    function: &str,
-    inputs: Vec<(ObjectId, AccessMode)>,
-    arguments: Vec<MoveArgument>,
-) -> Transaction {
-    let function = MoveEngine::function_id(package, "counter", function);
-    let call = MoveCall { arguments };
-    Transaction::new(function, inputs, bcs::to_bytes(&call).unwrap())
-}
-
 fn counter_module(package: ObjectID) -> ModuleId {
     ModuleId::new(package.into(), ident_str!("counter").to_owned())
-}
-
-fn pure(value: u64) -> MoveArgument {
-    MoveArgument::Pure(bcs::to_bytes(&value).unwrap())
 }
 
 fn status(
@@ -85,6 +70,7 @@ fn counters_are_created_incremented_and_destroyed() {
     let outcome = scheduler.execute([increment()]).next().unwrap();
     assert_eq!(outcome.status, ExecutionStatus::Success);
     assert_eq!(outcome.events.len(), 1);
+    assert!(outcome.gas_used > 0);
     assert_eq!(value(scheduler.store(), &id), 5);
     assert!(scheduler.store().latest(&id).unwrap().version() > created_at);
 
@@ -103,7 +89,9 @@ fn move_aborts_report_their_code_and_write_nothing() {
 
     let inputs = vec![(id, AccessMode::ReadWrite)];
     let check = call(package, "assert_incremented", inputs, vec![Object(0)]);
-    let failure = failure(status(&mut scheduler, check)).unwrap();
+    let outcome = scheduler.execute([check]).next().unwrap();
+    assert!(outcome.gas_used > 0);
+    let failure = failure(outcome.status).unwrap();
     let Kind::MoveAbort(location, 7) = failure.status else {
         panic!("not abort code 7: {failure:?}");
     };
@@ -193,7 +181,8 @@ fn malformed_calls_fail_without_writing() {
         ),
     ];
     for transaction in rejections {
-        assert_eq!(failure(status(&mut scheduler, transaction)), None);
+        let outcome = scheduler.execute([transaction]).next().unwrap();
+        assert_eq!((failure(outcome.status), outcome.gas_used), (None, 0));
     }
     // Sui decodes pure arguments itself.
     let malformed = increment(owned(), vec![Object(0), MoveArgument::Pure(vec![1, 2, 3])]);
@@ -271,9 +260,15 @@ fn stashed_counters_come_back_through_dynamic_fields() {
 fn replayed_creations_abort() {
     let (mut scheduler, package) = scheduler();
     let create = || call(package, "create", Vec::new(), Vec::new());
-    assert_eq!(status(&mut scheduler, create()), ExecutionStatus::Success);
+    let created = scheduler.execute([create()]).next().unwrap();
+    assert_eq!(created.status, ExecutionStatus::Success);
+    // The replay runs in full before aborting, so it uses the same gas.
+    let replayed = scheduler.execute([create()]).next().unwrap();
     let in_use = ExecutionStatus::Aborted(AbortReason::IdInUse);
-    assert_eq!(status(&mut scheduler, create()), in_use);
+    assert_eq!(
+        (replayed.status, replayed.gas_used),
+        (in_use, created.gas_used)
+    );
     // A fresh nonce makes the same call a new transaction.
     assert_eq!(
         status(&mut scheduler, create().with_nonce(1)),

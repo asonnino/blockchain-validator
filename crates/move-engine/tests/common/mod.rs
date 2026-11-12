@@ -11,9 +11,26 @@ use execution::{
     engine::ExecutionEngine,
     object::ObjectId,
     store::StateView,
+    transaction::{AccessMode, Transaction},
 };
-use move_engine::{MoveEngine, MoveFailure};
+use move_engine::{MoveArgument, MoveCall, MoveEngine, MoveFailure};
 use sui_types::{SUI_CLOCK_OBJECT_ID, base_types::ObjectID, object::Object};
+
+/// A call to the counter module's `function`.
+pub fn call(
+    package: ObjectID,
+    function: &str,
+    inputs: Vec<(ObjectId, AccessMode)>,
+    arguments: Vec<MoveArgument>,
+) -> Transaction {
+    let function = MoveEngine::function_id(package, "counter", function);
+    let call = MoveCall { arguments };
+    Transaction::new(function, inputs, bcs::to_bytes(&call).unwrap())
+}
+
+pub fn pure(value: u64) -> MoveArgument {
+    MoveArgument::Pure(bcs::to_bytes(&value).unwrap())
+}
 
 /// The counters the package's `init` shared at genesis.
 pub fn shared_counters(engine: &MoveEngine) -> Vec<ObjectId> {

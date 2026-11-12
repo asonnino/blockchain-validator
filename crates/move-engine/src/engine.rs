@@ -53,7 +53,7 @@ use sui_types::{
     error::ExecutionError,
     execution_params::ExecutionOrEarlyError,
     execution_status::ExecutionStatus as SuiStatus,
-    gas::SuiGasStatus,
+    gas::{SuiGasStatus, SuiGasStatusAPI},
     messages_consensus::ConsensusCommitPrologue,
     metrics::ExecutionMetrics,
     move_package::{MovePackage, normalize_deserialized_modules},
@@ -80,6 +80,8 @@ const SENDER: ObjectID = ObjectID::from_single_byte(0x5e);
 /// The validator runs a single epoch, so `TxContext`'s epoch and its start time are fixed.
 const EPOCH: EpochId = 0;
 const EPOCH_TIMESTAMP_MS: u64 = 0;
+/// The gas price and the reference gas price, so a gas budget's MIST are gas units.
+const GAS_PRICE: u64 = 1;
 
 /// The arguments of a call, BCS-encoded in its [`Transaction`]'s `args`.
 #[derive(Serialize, Deserialize)]
@@ -95,9 +97,12 @@ pub enum MoveArgument {
     Object(u16),
 }
 
-/// Executes one entry-function call per transaction through Sui's adapter, unmetered.
+/// Executes one entry-function call per transaction through Sui's adapter, metering each against a
+/// gas budget but charging nothing. It reports Sui's internal gas, finer than the gas units the
+/// budget is set in.
 pub struct MoveEngine {
     protocol_config: ProtocolConfig,
+    gas_budget: u64,
     runtime: Arc<MoveRuntime>,
     metrics: Arc<ExecutionMetrics>,
     /// Sui's framework and clock, then the configured packages and the objects their `init`
@@ -112,7 +117,10 @@ impl MoveEngine {
     /// Publishes `packages`, each a list of compiled modules depending only on Move's standard
     /// library and the Sui framework, at genesis on top of Sui's framework.
     pub fn new(packages: Vec<Vec<Vec<u8>>>) -> Self {
-        let protocol_config = ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown);
+        let mut protocol_config =
+            ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown);
+        // Metered storage stamps rebates on the written objects, which nothing pays for.
+        protocol_config.set_storage_gas_price_for_testing(0);
         assert_eq!(
             protocol_config.execution_version(),
             LATEST_EXECUTION_VERSION,
@@ -120,6 +128,7 @@ impl MoveEngine {
         );
         let mut engine = Self {
             runtime: runtime(&protocol_config),
+            gas_budget: protocol_config.max_gas_computation_bucket(),
             protocol_config,
             metrics: Arc::new(ExecutionMetrics::new(&Registry::new())),
             genesis: BuiltInFramework::genesis_objects().collect(),
@@ -171,6 +180,12 @@ impl MoveEngine {
         engine
     }
 
+    /// Bounds each call to `budget` gas units. Sui caps a call's computation at the default.
+    pub fn with_gas_budget(mut self, budget: u64) -> Self {
+        self.gas_budget = budget;
+        self
+    }
+
     /// Runs `transaction` from `sender` at genesis, applying its writes to `store` and adding
     /// them to the genesis objects, which it returns. `name` fixes the digest, so every
     /// validator derives the same ids.
@@ -193,6 +208,7 @@ impl MoveEngine {
             sender,
             Vec::new(),
             digest,
+            SuiGasStatus::new_unmetered(&self.protocol_config),
         );
         assert!(
             effects.status().is_ok(),
@@ -359,13 +375,14 @@ impl MoveEngine {
         sender: SuiAddress,
         inputs: Vec<ObjectReadResult>,
         digest: TransactionDigest,
+        gas_status: SuiGasStatus,
     ) -> SuiOutput<Mode> {
         // The sentinel payment Sui reads as unmetered: no gas coin is needed, and nothing is
         // charged against the price or budget.
         let gas_data = GasData {
             payment: vec![(ObjectID::ZERO, SequenceNumber::default(), ObjectDigest::MIN)],
             owner: sender,
-            price: 1,
+            price: GAS_PRICE,
             budget: self.protocol_config.max_tx_gas(),
         };
         // Sui pins the clock's version for every transaction, so `clock::borrow` reads it without
@@ -387,7 +404,7 @@ impl MoveEngine {
             system_objects,
             &EmptyUnsettledObjectFunds,
             gas_data,
-            SuiGasStatus::new_unmetered(&self.protocol_config),
+            gas_status,
             kind,
             None,
             sender,
@@ -434,7 +451,15 @@ impl ExecutionEngine for MoveEngine {
             object: ObjectReadResultKind::Object(clock),
         };
         let kind = TransactionKind::ConsensusCommitPrologue(prologue);
-        let output = self.run::<Normal, _>(&store, kind, SuiAddress::ZERO, vec![input], digest);
+        let unmetered = SuiGasStatus::new_unmetered(&self.protocol_config);
+        let output = self.run::<Normal, _>(
+            &store,
+            kind,
+            SuiAddress::ZERO,
+            vec![input],
+            digest,
+            unmetered,
+        );
         assert!(
             output.effects.status().is_ok(),
             "the commit prologue cannot fail"
@@ -536,12 +561,18 @@ impl ExecutionEngine for MoveEngine {
         let kind = TransactionKind::ProgrammableTransaction(builder.finish());
         let sender = SuiAddress::from(SENDER);
         let digest = sui_digest(transaction);
+        let metered =
+            SuiGasStatus::new(self.gas_budget, GAS_PRICE, GAS_PRICE, &self.protocol_config)
+                .expect("the gas price is valid");
+        let gas_left = metered.move_gas_status().gas_left;
         let SuiOutput {
             inner_store,
             effects,
             execution_result,
+            gas_status,
             ..
-        } = self.run::<Normal<ExecutionError>, _>(&store, kind, sender, inputs, digest);
+        } = self.run::<Normal<ExecutionError>, _>(&store, kind, sender, inputs, digest, metered);
+        let gas_used = u64::from(gas_left) - u64::from(gas_status.move_gas_status().gas_left);
         if let SuiStatus::Failure(failure) = effects.status() {
             // Sui keeps the VM's error as the source of its own.
             let vm_status = execution_result.err().and_then(|error| {
@@ -552,7 +583,8 @@ impl ExecutionEngine for MoveEngine {
                 status: failure.error.clone(),
                 vm_status,
             };
-            return ExecutionOutput::aborted(AbortReason::ExecutionFailure(failure.encode()));
+            let reason = AbortReason::ExecutionFailure(failure.encode());
+            return ExecutionOutput::aborted(reason).with_gas_used(gas_used);
         }
         let changes = effects.object_changes();
         // A replayed transaction derives the same fresh ids again, those it wraps at once
@@ -570,7 +602,7 @@ impl ExecutionEngine for MoveEngine {
                         .is_some()
             });
         if reused {
-            return ExecutionOutput::aborted(AbortReason::IdInUse);
+            return ExecutionOutput::aborted(AbortReason::IdInUse).with_gas_used(gas_used);
         }
         let writes = inner_store.written.values().map(to_object).collect();
         // Deleted and wrapped objects, fresh ones included, leave tombstones that keep their ids
@@ -590,6 +622,7 @@ impl ExecutionEngine for MoveEngine {
         ExecutionOutput::success(writes)
             .with_deletes(deletes)
             .with_events(events)
+            .with_gas_used(gas_used)
     }
 }
 
