@@ -7,8 +7,10 @@
 #![cfg(feature = "sui")]
 
 mod engine;
+mod failure;
 mod store;
 mod workload;
 
 pub use engine::{MoveArgument, MoveCall, MoveEngine};
+pub use failure::MoveFailure;
 pub use workload::{COUNTER, CounterWorkload};

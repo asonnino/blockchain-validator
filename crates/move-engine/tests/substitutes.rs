@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::value;
+use common::{failure, shared_counters, value};
 use execution::{
     crypto::Digest,
     effects::ExecutionStatus,
@@ -20,9 +20,12 @@ use move_binary_format::{
 };
 use move_core_types::identifier::Identifier;
 use move_engine::{COUNTER, MoveArgument, MoveCall, MoveEngine};
-use sui_types::{SUI_FRAMEWORK_PACKAGE_ID, base_types::ObjectID};
+use sui_types::{
+    SUI_FRAMEWORK_PACKAGE_ID, base_types::ObjectID, execution_status::ExecutionErrorKind as Kind,
+};
 
 const PLUS_ONE: &[u8] = include_bytes!("packages/plus_one/counter.mv");
+const ABORT_CODE: &[u8] = include_bytes!("packages/abort_code/counter.mv");
 const NEW_FIELD: &[u8] = include_bytes!("packages/new_field/counter.mv");
 const NEW_SIGNATURE: &[u8] = include_bytes!("packages/new_signature/counter.mv");
 const NEW_FUNCTION: &[u8] = include_bytes!("packages/new_function/counter.mv");
@@ -72,6 +75,31 @@ fn implementations_share_genesis_but_not_effects() {
 #[test]
 fn the_published_bytecode_substitutes_for_itself() {
     assert_eq!(run(engine(Some(COUNTER))), run(engine(None)));
+}
+
+/// Checks that a shared counter, still zero, was incremented.
+fn check(engine: MoveEngine) -> ExecutionStatus {
+    let (package, id) = (engine.packages()[0], shared_counters(&engine)[0]);
+    let function = MoveEngine::function_id(package, "counter", "assert_incremented");
+    let arguments = vec![MoveArgument::Object(0)];
+    let args = bcs::to_bytes(&MoveCall { arguments }).unwrap();
+    let check = Transaction::new(function, vec![(id, AccessMode::ReadOnly)], args);
+    let mut scheduler = SequentialScheduler::new(engine);
+    let mut outcomes = scheduler.execute([check]);
+    outcomes.next().unwrap().status
+}
+
+#[test]
+fn implementations_failing_differently_report_different_failures() {
+    let (status, other) = (check(engine(None)), check(engine(Some(ABORT_CODE))));
+    assert_ne!(status, other);
+    let abort = |status| match failure(status).unwrap().status {
+        Kind::MoveAbort(location, code) => (location.module, code),
+        status => panic!("not a Move abort: {status:?}"),
+    };
+    let ((module, code), (other_module, other_code)) = (abort(status), abort(other));
+    assert_eq!(module, other_module);
+    assert_eq!((code, other_code), (7, 8));
 }
 
 #[test]

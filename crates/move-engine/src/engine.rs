@@ -20,7 +20,8 @@ use execution::{
 };
 use eyre::{bail, eyre};
 use move_binary_format::{
-    CompiledModule, compatibility::Compatibility, file_format::Visibility, normalized::RcPool,
+    CompiledModule, compatibility::Compatibility, errors::VMError, file_format::Visibility,
+    normalized::RcPool,
 };
 use move_core_types::{ident_str, identifier::Identifier};
 use move_vm_runtime::{
@@ -32,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use sui_adapter_latest::{
     adapter::{new_move_runtime, substitute_package_id},
     data_store::transaction_package_store::TransactionPackageStore,
-    execution_engine::execute_transaction_to_effects,
+    execution_engine::{ExecutionOutput as SuiOutput, execute_transaction_to_effects},
     execution_mode::{ExecutionMode, Genesis, Normal},
 };
 use sui_framework::BuiltInFramework;
@@ -48,10 +49,11 @@ use sui_types::{
     clock::CLOCK_MODULE_NAME,
     committee::EpochId,
     digests::{ObjectDigest, TransactionDigest},
-    effects::{IDOperation, TransactionEffects, TransactionEffectsAPI},
+    effects::{IDOperation, TransactionEffectsAPI},
+    error::ExecutionError,
     execution_params::ExecutionOrEarlyError,
+    execution_status::ExecutionStatus as SuiStatus,
     gas::SuiGasStatus,
-    inner_temporary_store::InnerTemporaryStore,
     messages_consensus::ConsensusCommitPrologue,
     metrics::ExecutionMetrics,
     move_package::{MovePackage, normalize_deserialized_modules},
@@ -65,7 +67,10 @@ use sui_types::{
 };
 use sui_verifier_latest::verifier::sui_verify_module_unmetered;
 
-use crate::store::{GenesisPackages, SuiView};
+use crate::{
+    failure::MoveFailure,
+    store::{GenesisPackages, SuiView},
+};
 
 /// The execution cut this engine calls, which the pinned protocol version must select.
 const LATEST_EXECUTION_VERSION: u64 = 4;
@@ -178,7 +183,11 @@ impl MoveEngine {
     ) -> &[SuiObject] {
         let digest = TransactionDigest::new(Blake2b::<U32>::digest(name).into());
         let kind = TransactionKind::ProgrammableTransaction(transaction);
-        let (inner_store, effects) = self.run::<Mode, _>(
+        let SuiOutput {
+            inner_store,
+            effects,
+            ..
+        } = self.run::<Mode, _>(
             &SuiView(&*store, &self.substitutes),
             kind,
             sender,
@@ -350,7 +359,7 @@ impl MoveEngine {
         sender: SuiAddress,
         inputs: Vec<ObjectReadResult>,
         digest: TransactionDigest,
-    ) -> (InnerTemporaryStore, TransactionEffects) {
+    ) -> SuiOutput<Mode> {
         // The sentinel payment Sui reads as unmetered: no gas coin is needed, and nothing is
         // charged against the price or budget.
         let gas_data = GasData {
@@ -372,7 +381,7 @@ impl MoveEngine {
             )])),
             None => SystemObjectVersions::empty(),
         };
-        let output = execute_transaction_to_effects::<Mode>(
+        execute_transaction_to_effects::<Mode>(
             store,
             CheckedInputObjects::new_with_checked_transaction_inputs(InputObjects::new(inputs)),
             system_objects,
@@ -391,8 +400,7 @@ impl MoveEngine {
             false,
             ExecutionOrEarlyError::ok(None),
             &mut None,
-        );
-        (output.inner_store, output.effects)
+        )
     }
 }
 
@@ -426,10 +434,12 @@ impl ExecutionEngine for MoveEngine {
             object: ObjectReadResultKind::Object(clock),
         };
         let kind = TransactionKind::ConsensusCommitPrologue(prologue);
-        let (inner_store, effects) =
-            self.run::<Normal, _>(&store, kind, SuiAddress::ZERO, vec![input], digest);
-        assert!(effects.status().is_ok(), "the commit prologue cannot fail");
-        ExecutionOutput::success(inner_store.written.values().map(to_object).collect())
+        let output = self.run::<Normal, _>(&store, kind, SuiAddress::ZERO, vec![input], digest);
+        assert!(
+            output.effects.status().is_ok(),
+            "the commit prologue cannot fail"
+        );
+        ExecutionOutput::success(output.inner_store.written.values().map(to_object).collect())
     }
 
     fn execute<V: StateView>(&self, view: &V, transaction: &Transaction) -> ExecutionOutput {
@@ -437,9 +447,7 @@ impl ExecutionEngine for MoveEngine {
             return ExecutionOutput::aborted(AbortReason::UnknownFunction);
         };
         let Ok(call) = bcs::from_bytes::<MoveCall>(transaction.args()) else {
-            return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
-                FailureDetail::default(),
-            ));
+            return rejected();
         };
 
         let store = SuiView(view, &self.substitutes);
@@ -449,17 +457,13 @@ impl ExecutionEngine for MoveEngine {
         for (id, mode) in transaction.inputs() {
             // Move derives created ids from the transaction digest, so it declares no creations.
             if *mode == AccessMode::WriteOnly {
-                return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
-                    FailureDetail::default(),
-                ));
+                return rejected();
             }
             let id = ObjectID::new(*id.as_bytes());
             // Only commits advance the clock: Sui's input checks, which this engine replaces, let
             // transactions read it and nothing more.
             if id == SUI_CLOCK_OBJECT_ID && *mode != AccessMode::ReadOnly {
-                return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
-                    FailureDetail::default(),
-                ));
+                return rejected();
             }
             let Some(object) = store.object(&id) else {
                 return ExecutionOutput::aborted(AbortReason::MissingRead);
@@ -496,20 +500,14 @@ impl ExecutionEngine for MoveEngine {
                 }
                 // Sui rewrites every owned input, so the call must declare it writable.
                 Owner::AddressOwner(_) if *mode != AccessMode::ReadWrite => {
-                    return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
-                        FailureDetail::default(),
-                    ));
+                    return rejected();
                 }
                 Owner::AddressOwner(_) | Owner::Immutable if !object.is_package() => {
                     let reference = object.compute_object_reference();
                     let kind = InputObjectKind::ImmOrOwnedMoveObject(reference);
                     (ObjectArg::ImmOrOwnedObject(reference), kind)
                 }
-                _ => {
-                    return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
-                        FailureDetail::default(),
-                    ));
-                }
+                _ => return rejected(),
             };
             objects.push(builder.obj(argument).expect("inputs are unique"));
             inputs.push(ObjectReadResult {
@@ -523,11 +521,7 @@ impl ExecutionEngine for MoveEngine {
                 MoveArgument::Pure(bytes) => builder.pure_bytes(bytes, false),
                 MoveArgument::Object(index) => match objects.get(usize::from(index)) {
                     Some(object) => *object,
-                    None => {
-                        return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
-                            FailureDetail::default(),
-                        ));
-                    }
+                    None => return rejected(),
                 },
             });
         }
@@ -542,11 +536,23 @@ impl ExecutionEngine for MoveEngine {
         let kind = TransactionKind::ProgrammableTransaction(builder.finish());
         let sender = SuiAddress::from(SENDER);
         let digest = sui_digest(transaction);
-        let (inner_store, effects) = self.run::<Normal, _>(&store, kind, sender, inputs, digest);
-        if !effects.status().is_ok() {
-            return ExecutionOutput::aborted(AbortReason::ExecutionFailure(
-                FailureDetail::default(),
-            ));
+        let SuiOutput {
+            inner_store,
+            effects,
+            execution_result,
+            ..
+        } = self.run::<Normal<ExecutionError>, _>(&store, kind, sender, inputs, digest);
+        if let SuiStatus::Failure(failure) = effects.status() {
+            // Sui keeps the VM's error as the source of its own.
+            let vm_status = execution_result.err().and_then(|error| {
+                let source = error.source().as_ref()?;
+                source.downcast_ref::<VMError>().map(VMError::major_status)
+            });
+            let failure = MoveFailure {
+                status: failure.error.clone(),
+                vm_status,
+            };
+            return ExecutionOutput::aborted(AbortReason::ExecutionFailure(failure.encode()));
         }
         let changes = effects.object_changes();
         // A replayed transaction derives the same fresh ids again, those it wraps at once
@@ -591,6 +597,11 @@ fn runtime(protocol_config: &ProtocolConfig) -> Arc<MoveRuntime> {
     let natives = all_natives(true, protocol_config);
     let runtime = new_move_runtime(natives, protocol_config).expect("the Move runtime builds");
     Arc::new(runtime)
+}
+
+/// Fails a call the engine rejects before Sui runs it.
+fn rejected() -> ExecutionOutput {
+    ExecutionOutput::aborted(AbortReason::ExecutionFailure(FailureDetail::default()))
 }
 
 fn sui_digest(transaction: &Transaction) -> TransactionDigest {
