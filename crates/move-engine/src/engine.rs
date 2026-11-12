@@ -3,7 +3,10 @@
 
 //! Sui's latest execution cut behind [`ExecutionEngine`].
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use blake2::{Blake2b, Digest as _, digest::consts::U32};
 use execution::{
@@ -30,7 +33,9 @@ use sui_types::{
     MOVE_STDLIB_PACKAGE_ID, SUI_CLOCK_OBJECT_ID, SUI_CLOCK_OBJECT_SHARED_VERSION,
     SUI_FRAMEWORK_PACKAGE_ID,
     accumulator_root::EmptyUnsettledObjectFunds,
-    base_types::{ObjectID, SequenceNumber, SuiAddress, SystemObjectVersions},
+    base_types::{
+        ConsensusObjectVersion, ObjectID, SequenceNumber, SuiAddress, SystemObjectVersions,
+    },
     clock::CLOCK_MODULE_NAME,
     committee::EpochId,
     digests::{ObjectDigest, TransactionDigest},
@@ -245,10 +250,23 @@ impl MoveEngine {
             price: 1,
             budget: self.protocol_config.max_tx_gas(),
         };
+        // Sui pins the clock's version for every transaction, so `clock::borrow` reads it without
+        // the transaction taking it as an input.
+        let clock = ObjectId::from_bytes(SUI_CLOCK_OBJECT_ID.into_bytes());
+        let system_objects = match store.0.latest_version(&clock) {
+            Some(version) => SystemObjectVersions::from_map(BTreeMap::from([(
+                SUI_CLOCK_OBJECT_ID,
+                ConsensusObjectVersion {
+                    initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
+                    version: SequenceNumber::from_u64(version.as_u64()),
+                },
+            )])),
+            None => SystemObjectVersions::empty(),
+        };
         let output = execute_transaction_to_effects::<Mode>(
             store,
             CheckedInputObjects::new_with_checked_transaction_inputs(InputObjects::new(inputs)),
-            SystemObjectVersions::empty(),
+            system_objects,
             &EmptyUnsettledObjectFunds,
             gas_data,
             SuiGasStatus::new_unmetered(&self.protocol_config),

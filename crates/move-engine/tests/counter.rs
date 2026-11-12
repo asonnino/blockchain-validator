@@ -21,7 +21,7 @@ use move_engine::{
     MoveArgument::{self, Object},
     MoveCall, MoveEngine,
 };
-use sui_types::base_types::ObjectID;
+use sui_types::{SUI_FRAMEWORK_PACKAGE_ID, base_types::ObjectID};
 
 fn scheduler() -> (SequentialScheduler<MoveEngine>, ObjectID) {
     let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
@@ -243,6 +243,22 @@ fn the_clock_follows_commits() {
         timestamp_ms: 6_000,
     });
     assert_eq!(value(scheduler.store(), &clock()), 6_000);
+}
+
+#[test]
+fn transactions_read_the_clock_without_taking_it() {
+    let (mut scheduler, _) = scheduler();
+    scheduler.begin_commit(&CommitInfo {
+        timestamp_ms: 5_000,
+    });
+    // Sui's `clock::borrow` reads the clock implicitly; without its pinned version, Sui's adapter
+    // fails the transaction and panics in debug builds.
+    let function = MoveEngine::function_id(SUI_FRAMEWORK_PACKAGE_ID, "clock", "borrow");
+    let call = MoveCall {
+        arguments: Vec::new(),
+    };
+    let borrow = Transaction::new(function, Vec::new(), bcs::to_bytes(&call).unwrap());
+    assert_eq!(status(&mut scheduler, borrow), ExecutionStatus::Success);
 }
 
 #[test]
