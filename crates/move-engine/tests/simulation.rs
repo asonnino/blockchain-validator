@@ -8,10 +8,10 @@
 
 mod common;
 
-use std::{path::Path, time::Duration};
+use std::{ops::RangeInclusive, path::Path, time::Duration};
 
 use checkpoint::certifier::CheckpointCertifier;
-use common::{shared_counters, value};
+use common::{clock, shared_counters, value};
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::scheduler::SequentialScheduler;
 use move_engine::{COUNTER, CounterWorkload, MoveEngine};
@@ -35,9 +35,15 @@ fn engine() -> MoveEngine {
     MoveEngine::new(vec![vec![COUNTER.to_vec()]])
 }
 
-/// Runs the workload to a common fixed point and returns every validator's final state.
-fn run_once(seed: u64) -> Vec<(SequentialScheduler<MoveEngine>, CheckpointCertifier)> {
+/// Every validator's final state.
+type Results = Vec<(SequentialScheduler<MoveEngine>, CheckpointCertifier)>;
+
+/// Runs the workload to a common fixed point and returns the final states, with the run's span
+/// of simulated time in milliseconds since the Unix epoch.
+fn run_once(seed: u64) -> (Results, RangeInclusive<u64>) {
     SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
+        let now_ms = || SimulatorContext::timestamp_utc().as_millis() as u64;
+        let start_ms = now_ms();
         let public_config = PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE);
         let latency = LatencyModel::Uniform(UniformLatency { range_ms: 50..100 });
         let (network, node_networks) = SimulatedNetwork::new(&public_config.committee(), latency);
@@ -96,18 +102,19 @@ fn run_once(seed: u64) -> Vec<(SequentialScheduler<MoveEngine>, CheckpointCertif
         for validator in &mut validators {
             validator.wait_for_certified().await;
         }
+        let end_ms = now_ms();
 
         let mut results = Vec::with_capacity(COMMITTEE_SIZE);
         for validator in validators {
             results.push(validator.shutdown().await.into_parts());
         }
-        results
+        (results, start_ms..=end_ms)
     })
 }
 
 #[test]
 fn validators_converge_on_the_counter_workload() {
-    let results = run_once(7);
+    let (results, span_ms) = run_once(7);
     let (reference, certifier) = &results[0];
     let store = reference.store();
     let certified = certifier
@@ -125,11 +132,17 @@ fn validators_converge_on_the_counter_workload() {
     for id in &shared {
         assert!(value(store, id) > 0);
     }
+    // The clock advanced with the commits, to a time within the run.
+    let time_ms = value(store, &clock());
+    assert!(
+        span_ms.contains(&time_ms),
+        "{time_ms} ms outside {span_ms:?}"
+    );
 }
 
 #[test]
 fn simulation_is_deterministic_per_seed() {
-    let (first, second) = (run_once(42), run_once(42));
+    let ((first, _), (second, _)) = (run_once(42), run_once(42));
     for ((a, a_certifier), (b, b_certifier)) in first.iter().zip(&second) {
         assert_eq!(a.store(), b.store());
         assert_eq!(

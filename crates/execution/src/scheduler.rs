@@ -7,7 +7,7 @@ use std::vec::Drain;
 
 use crate::{
     effects::{AbortReason, ExecutionOutput, ExecutionStatus, TransactionOutcome},
-    engine::ExecutionEngine,
+    engine::{CommitInfo, ExecutionEngine},
     store::InMemoryStore,
     transaction::Transaction,
 };
@@ -30,6 +30,17 @@ impl<E: ExecutionEngine> SequentialScheduler<E> {
             engine,
             outcomes: Vec::new(),
         }
+    }
+
+    /// Applies the engine's [`begin_commit`](ExecutionEngine::begin_commit) output for `commit`.
+    pub fn begin_commit(&mut self, commit: &CommitInfo) {
+        let output = self.engine.begin_commit(&self.store, commit);
+        assert_eq!(
+            output.status(),
+            ExecutionStatus::Success,
+            "commits must begin"
+        );
+        self.store.apply(output);
     }
 
     /// Executes `transactions` in order, applying each transaction's output before executing the

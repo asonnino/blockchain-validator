@@ -3,38 +3,47 @@
 
 //! Sui's latest execution cut behind [`ExecutionEngine`].
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use blake2::{Blake2b, Digest as _, digest::consts::U32};
 use execution::{
     effects::{AbortReason, Event, ExecutionOutput},
-    engine::ExecutionEngine,
+    engine::{CommitInfo, ExecutionEngine},
     object::{Object, ObjectId, Version},
     store::{InMemoryStore, StateView},
     transaction::{AccessMode, FunctionId, Transaction},
 };
 use move_binary_format::{CompiledModule, file_format::Visibility};
-use move_core_types::identifier::Identifier;
+use move_core_types::{ident_str, identifier::Identifier};
 use move_vm_runtime::runtime::MoveRuntime;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use sui_adapter_latest::{
-    adapter::new_move_runtime, execution_engine::execute_transaction_to_effects,
-    execution_mode::Normal,
+    adapter::new_move_runtime,
+    execution_engine::execute_transaction_to_effects,
+    execution_mode::{ExecutionMode, Genesis, Normal},
 };
 use sui_framework::BuiltInFramework;
 use sui_move_natives_latest::all_natives;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::{
-    MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID,
+    MOVE_STDLIB_PACKAGE_ID, SUI_CLOCK_OBJECT_ID, SUI_CLOCK_OBJECT_SHARED_VERSION,
+    SUI_FRAMEWORK_PACKAGE_ID,
     accumulator_root::EmptyUnsettledObjectFunds,
-    base_types::{ObjectID, SequenceNumber, SuiAddress, SystemObjectVersions},
+    base_types::{
+        ConsensusObjectVersion, ObjectID, SequenceNumber, SuiAddress, SystemObjectVersions,
+    },
+    clock::CLOCK_MODULE_NAME,
     committee::EpochId,
     digests::{ObjectDigest, TransactionDigest},
     effects::{IDOperation, TransactionEffects, TransactionEffectsAPI},
     execution_params::ExecutionOrEarlyError,
     gas::SuiGasStatus,
     inner_temporary_store::InnerTemporaryStore,
+    messages_consensus::ConsensusCommitPrologue,
     metrics::ExecutionMetrics,
     object::{Object as SuiObject, Owner},
     programmable_transaction_builder::ProgrammableTransactionBuilder,
@@ -51,7 +60,7 @@ const LATEST_EXECUTION_VERSION: u64 = 4;
 /// Sends every transaction and owns every address-owned object. Not `0x0`, which Sui reserves for
 /// system transactions.
 const SENDER: ObjectID = ObjectID::from_single_byte(0x5e);
-/// Every validator must compute the same result, so the epoch and its clock are fixed.
+/// The validator runs a single epoch, so `TxContext`'s epoch and its start time are fixed.
 const EPOCH: EpochId = 0;
 const EPOCH_TIMESTAMP_MS: u64 = 0;
 
@@ -74,7 +83,8 @@ pub struct MoveEngine {
     protocol_config: ProtocolConfig,
     runtime: Arc<MoveRuntime>,
     metrics: Arc<ExecutionMetrics>,
-    /// Sui's framework, then the configured packages and the objects their `init` functions made.
+    /// Sui's framework and clock, then the configured packages and the objects their `init`
+    /// functions made.
     genesis: Vec<SuiObject>,
     packages: Vec<ObjectID>,
     functions: HashMap<FunctionId, (ObjectID, Identifier, Identifier)>,
@@ -105,33 +115,71 @@ impl MoveEngine {
         store.apply(ExecutionOutput::success(
             engine.genesis.iter().map(to_object).collect(),
         ));
+        // Sui's clock, which only the system address may create.
+        let mut builder = ProgrammableTransactionBuilder::new();
+        builder.programmable_move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            CLOCK_MODULE_NAME.to_owned(),
+            ident_str!("create").to_owned(),
+            Vec::new(),
+            Vec::new(),
+        );
+        engine.genesis_transaction::<Genesis>(
+            &mut store,
+            builder.finish(),
+            SuiAddress::ZERO,
+            "genesis clock",
+        );
         for (index, modules) in packages.into_iter().enumerate() {
             let mut builder = ProgrammableTransactionBuilder::new();
             builder.publish_immutable(
                 modules,
                 vec![MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID],
             );
-            // Fixed, so every validator derives the same package and object ids.
-            let digest = TransactionDigest::new(
-                Blake2b::<U32>::digest(format!("genesis package {index}")).into(),
-            );
-            let (inner_store, effects) =
-                engine.run(&SuiView(&store), builder.finish(), Vec::new(), digest);
-            assert!(
-                effects.status().is_ok(),
-                "genesis package {index} must publish: {:?}",
-                effects.status()
-            );
-            let written: Vec<_> = inner_store.written.into_values().collect();
-            store.apply(ExecutionOutput::success(
-                written.iter().map(to_object).collect(),
-            ));
-            let published = written.iter().filter(|object| object.is_package());
-            engine.packages.extend(published.map(|object| object.id()));
-            engine.genesis.extend(written);
+            let name = format!("genesis package {index}");
+            let published: Vec<_> = engine
+                .genesis_transaction::<Normal>(
+                    &mut store,
+                    builder.finish(),
+                    SuiAddress::from(SENDER),
+                    &name,
+                )
+                .iter()
+                .filter(|object| object.is_package())
+                .map(|object| object.id())
+                .collect();
+            engine.packages.extend(published);
         }
         engine.functions = engine.index_functions();
         engine
+    }
+
+    /// Runs `transaction` from `sender` at genesis, applying its writes to `store` and adding
+    /// them to the genesis objects, which it returns. `name` fixes the digest, so every
+    /// validator derives the same ids.
+    fn genesis_transaction<Mode: ExecutionMode>(
+        &mut self,
+        store: &mut InMemoryStore,
+        transaction: ProgrammableTransaction,
+        sender: SuiAddress,
+        name: &str,
+    ) -> &[SuiObject] {
+        let digest = TransactionDigest::new(Blake2b::<U32>::digest(name).into());
+        let kind = TransactionKind::ProgrammableTransaction(transaction);
+        let (inner_store, effects) =
+            self.run::<Mode, _>(&SuiView(&*store), kind, sender, Vec::new(), digest);
+        assert!(
+            effects.status().is_ok(),
+            "{name} must succeed: {:?}",
+            effects.status()
+        );
+        let start = self.genesis.len();
+        self.genesis.extend(inner_store.written.into_values());
+        let written = &self.genesis[start..];
+        store.apply(ExecutionOutput::success(
+            written.iter().map(to_object).collect(),
+        ));
+        written
     }
 
     /// The configured packages' ids, in publication order.
@@ -185,15 +233,15 @@ impl MoveEngine {
         functions
     }
 
-    /// Runs a programmable transaction from [`SENDER`] through Sui's adapter.
-    fn run<V: StateView>(
+    /// Runs `kind` through Sui's adapter.
+    fn run<Mode: ExecutionMode, V: StateView>(
         &self,
         store: &SuiView<'_, V>,
-        transaction: ProgrammableTransaction,
+        kind: TransactionKind,
+        sender: SuiAddress,
         inputs: Vec<ObjectReadResult>,
         digest: TransactionDigest,
     ) -> (InnerTemporaryStore, TransactionEffects) {
-        let sender = SuiAddress::from(SENDER);
         // The sentinel payment Sui reads as unmetered: no gas coin is needed, and nothing is
         // charged against the price or budget.
         let gas_data = GasData {
@@ -202,14 +250,27 @@ impl MoveEngine {
             price: 1,
             budget: self.protocol_config.max_tx_gas(),
         };
-        let output = execute_transaction_to_effects::<Normal>(
+        // Sui pins the clock's version for every transaction, so `clock::borrow` reads it without
+        // the transaction taking it as an input.
+        let clock = ObjectId::from_bytes(SUI_CLOCK_OBJECT_ID.into_bytes());
+        let system_objects = match store.0.latest_version(&clock) {
+            Some(version) => SystemObjectVersions::from_map(BTreeMap::from([(
+                SUI_CLOCK_OBJECT_ID,
+                ConsensusObjectVersion {
+                    initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
+                    version: SequenceNumber::from_u64(version.as_u64()),
+                },
+            )])),
+            None => SystemObjectVersions::empty(),
+        };
+        let output = execute_transaction_to_effects::<Mode>(
             store,
             CheckedInputObjects::new_with_checked_transaction_inputs(InputObjects::new(inputs)),
-            SystemObjectVersions::empty(),
+            system_objects,
             &EmptyUnsettledObjectFunds,
             gas_data,
             SuiGasStatus::new_unmetered(&self.protocol_config),
-            TransactionKind::ProgrammableTransaction(transaction),
+            kind,
             None,
             sender,
             digest,
@@ -231,6 +292,37 @@ impl ExecutionEngine for MoveEngine {
         self.genesis.iter().map(to_object).collect()
     }
 
+    /// Runs Sui's consensus commit prologue, which sets the clock to the commit's timestamp.
+    fn begin_commit<V: StateView>(&self, view: &V, commit: &CommitInfo) -> ExecutionOutput {
+        let store = SuiView(view);
+        let clock = store
+            .object(&SUI_CLOCK_OBJECT_ID)
+            .expect("genesis creates the clock");
+        // Sui's adapter reads only the timestamp.
+        let prologue = ConsensusCommitPrologue {
+            epoch: EPOCH,
+            round: 0,
+            commit_timestamp_ms: commit.timestamp_ms,
+        };
+        // Each prologue moves the clock to a new version, so each gets its own digest; anchor
+        // rounds may repeat.
+        let name = format!("consensus commit prologue {}", clock.version().value());
+        let digest = TransactionDigest::new(Blake2b::<U32>::digest(name).into());
+        let input = ObjectReadResult {
+            input_object_kind: InputObjectKind::SharedMoveObject {
+                id: SUI_CLOCK_OBJECT_ID,
+                initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
+                mutability: SharedObjectMutability::Mutable,
+            },
+            object: ObjectReadResultKind::Object(clock),
+        };
+        let kind = TransactionKind::ConsensusCommitPrologue(prologue);
+        let (inner_store, effects) =
+            self.run::<Normal, _>(&store, kind, SuiAddress::ZERO, vec![input], digest);
+        assert!(effects.status().is_ok(), "the commit prologue cannot fail");
+        ExecutionOutput::success(inner_store.written.values().map(to_object).collect())
+    }
+
     fn execute<V: StateView>(&self, view: &V, transaction: &Transaction) -> ExecutionOutput {
         let Some((package, module, function)) = self.functions.get(&transaction.function()) else {
             return ExecutionOutput::aborted(AbortReason::UnknownFunction);
@@ -249,6 +341,11 @@ impl ExecutionEngine for MoveEngine {
                 return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
             }
             let id = ObjectID::new(*id.as_bytes());
+            // Only commits advance the clock: Sui's input checks, which this engine replaces, let
+            // transactions read it and nothing more.
+            if id == SUI_CLOCK_OBJECT_ID && *mode != AccessMode::ReadOnly {
+                return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
+            }
             let Some(object) = store.object(&id) else {
                 return ExecutionOutput::aborted(AbortReason::MissingRead);
             };
@@ -317,8 +414,10 @@ impl ExecutionEngine for MoveEngine {
             arguments,
         );
 
+        let kind = TransactionKind::ProgrammableTransaction(builder.finish());
+        let sender = SuiAddress::from(SENDER);
         let digest = sui_digest(transaction);
-        let (inner_store, effects) = self.run(&store, builder.finish(), inputs, digest);
+        let (inner_store, effects) = self.run::<Normal, _>(&store, kind, sender, inputs, digest);
         if !effects.status().is_ok() {
             return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
         }

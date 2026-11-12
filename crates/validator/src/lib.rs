@@ -11,4 +11,5 @@ pub mod envelope;
 pub mod generator;
 pub mod metrics;
 pub mod processor;
+pub mod time;
 pub mod validator;

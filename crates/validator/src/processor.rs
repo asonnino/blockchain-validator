@@ -10,13 +10,17 @@ use checkpoint::{
     checkpoint::Checkpoint,
 };
 use dag::{consensus::CommittedSubDag, crypto::AsBytes};
-use execution::{engine::ExecutionEngine, scheduler::SequentialScheduler};
+use execution::{
+    engine::{CommitInfo, ExecutionEngine},
+    scheduler::SequentialScheduler,
+};
 use replica::config::PublicReplicaConfig;
 use serde::Serialize;
 
 use crate::{
     envelope::{Envelope, NoMessage, Payload},
     metrics::ValidatorMetrics,
+    time::CommitClock,
 };
 
 /// Consumes committed sub-dags in commit order, starting with those replayed from the WAL.
@@ -54,6 +58,7 @@ pub trait CommitProcessor: Send + 'static {
 pub struct SequentialProcessor<E> {
     scheduler: SequentialScheduler<E>,
     certifier: CheckpointCertifier,
+    commit_clock: CommitClock,
     executed: u64,
 }
 
@@ -63,6 +68,7 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
         let protocol = public_config.parameters.consensus.to_protocol(&committee)?;
         Ok(Self {
             scheduler: SequentialScheduler::new(engine),
+            commit_clock: CommitClock::new(committee.clone()),
             certifier: CheckpointCertifier::new(committee, protocol.quorum_threshold),
             executed: 0,
         })
@@ -87,13 +93,16 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
         mut subdag: CommittedSubDag,
     ) -> (usize, Option<Checkpoint>) {
         let anchor = subdag.anchor;
+        let commit = CommitInfo {
+            timestamp_ms: self.commit_clock.commit(&subdag),
+        };
         subdag.sort();
         // Votes are recorded as they decode, before this sub-dag mints: none can reference its
         // own delivering sub-dag's checkpoint, which only exists once that sub-dag committed.
         let certifier = &mut self.certifier;
         // Submission stamps reduce to their sum here, while the payloads are in hand.
         let mut stamp_sum_ms = 0u64;
-        let transactions = subdag
+        let mut transactions = subdag
             .blocks
             .iter()
             .flat_map(|block| {
@@ -127,7 +136,11 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
                     }
                     Payload::Message(message) => match message {},
                 }
-            });
+            })
+            .peekable();
+        if transactions.peek().is_some() {
+            self.scheduler.begin_commit(&commit);
+        }
         let executed = self.scheduler.execute(transactions).len();
         let minted = (executed > 0).then(|| {
             let timings = CheckpointTimings {
@@ -189,10 +202,18 @@ mod tests {
     use dag::{
         authority::Authority,
         block::{Block, data::Data, transaction::Transaction as ConsensusTransaction},
+        committee::Committee,
         consensus::CommittedSubDag,
         crypto::CryptoEngine,
     };
-    use execution::{object::ObjectId, scheduler::SequentialScheduler};
+    use execution::{
+        effects::ExecutionOutput,
+        engine::{CommitInfo, ExecutionEngine},
+        object::{Object, ObjectId, Version},
+        scheduler::SequentialScheduler,
+        store::StateView,
+        transaction::Transaction,
+    };
     use fake_engine::{FakeExecutor, FakeTransaction};
     use prometheus::Registry;
 
@@ -200,16 +221,22 @@ mod tests {
         envelope::{NoMessage, Payload},
         metrics::ValidatorMetrics,
         processor::{CommitProcessor, SequentialProcessor},
+        time::CommitClock,
     };
 
     type Envelope = crate::envelope::Envelope<NoMessage>;
 
-    fn state() -> SequentialProcessor<FakeExecutor> {
+    fn processor<E: ExecutionEngine>(engine: E) -> SequentialProcessor<E> {
         SequentialProcessor {
-            scheduler: SequentialScheduler::new(FakeExecutor),
+            scheduler: SequentialScheduler::new(engine),
             certifier: CheckpointCertifier::new_for_test(vec![1; 4], 3, 0),
+            commit_clock: CommitClock::new(Committee::new_test(vec![1; 4])),
             executed: 0,
         }
+    }
+
+    fn state() -> SequentialProcessor<FakeExecutor> {
+        processor(FakeExecutor)
     }
 
     fn metrics() -> Arc<ValidatorMetrics> {
@@ -217,7 +244,7 @@ mod tests {
     }
 
     /// A sub-dag at `round` with one block per `(author, payloads)` entry, anchored at the
-    /// first block.
+    /// first block. Each block is stamped `round` seconds plus `author` milliseconds.
     fn subdag_at(round: u64, blocks: Vec<(usize, Vec<Vec<u8>>)>) -> CommittedSubDag {
         let blocks: Vec<_> = blocks
             .into_iter()
@@ -231,7 +258,7 @@ mod tests {
                     round,
                     vec![],
                     transactions,
-                    0,
+                    round * 1_000_000_000 + author as u64 * 1_000_000,
                     &CryptoEngine::disabled(),
                 );
                 Data::new(block)
@@ -348,6 +375,59 @@ mod tests {
         let end_to_end = metrics.end_to_end_latency_s();
         assert_eq!(end_to_end.get_sample_count(), 1);
         assert_eq!(end_to_end.get_sample_sum(), 2.0);
+    }
+
+    #[test]
+    fn executing_subdags_begin_a_commit_at_their_commit_time() {
+        /// The fake engine, plus an object that each begun commit sets to its timestamp.
+        struct Clocked;
+
+        fn clock() -> ObjectId {
+            ObjectId::new(u64::MAX)
+        }
+
+        impl ExecutionEngine for Clocked {
+            fn begin_commit<V: StateView>(&self, view: &V, commit: &CommitInfo) -> ExecutionOutput {
+                let version = view
+                    .latest_version(&clock())
+                    .map_or(Version::new(1), |v| v.next());
+                let time = commit.timestamp_ms.to_le_bytes().to_vec();
+                ExecutionOutput::success(vec![Object::new(clock(), version, time)])
+            }
+
+            fn execute<V: StateView>(
+                &self,
+                view: &V,
+                transaction: &Transaction,
+            ) -> ExecutionOutput {
+                FakeExecutor.execute(view, transaction)
+            }
+        }
+
+        let mut state = processor(Clocked);
+        let parents = subdag_at(2, (0..4).map(|author| (author, vec![])).collect()).blocks;
+        // Reading the clock aborts unless the commit began before the transaction ran.
+        let create = FakeTransaction::success(vec![clock()], vec![ObjectId::new(1)], vec![]);
+        let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
+        let anchor = Data::new(Block::new(
+            Authority::from(1usize),
+            3,
+            parents.iter().map(|parent| *parent.reference()).collect(),
+            vec![ConsensusTransaction::new(execute.into())],
+            9_999_000_000,
+            &CryptoEngine::disabled(),
+        ));
+        let subdag = CommittedSubDag::new(*anchor.reference(), [parents, vec![anchor]].concat());
+        state.execute_subdag(&metrics(), Duration::ZERO, subdag);
+        assert!(state.scheduler.store().latest(&ObjectId::new(1)).is_some());
+        // The parents' median stamp, from round 2 at authors 0 to 3; not the anchor's own.
+        let time = state.scheduler.store().latest(&clock()).unwrap().contents();
+        assert_eq!(time, 2002u64.to_le_bytes());
+
+        let commitment = state.scheduler.store().commitment();
+        let nothing = subdag_at(4, vec![(0, vec![vec![0xFF; 16]])]);
+        state.execute_subdag(&metrics(), Duration::ZERO, nothing);
+        assert_eq!(state.scheduler.store().commitment(), commitment);
     }
 
     #[test]

@@ -5,6 +5,13 @@
 
 use crate::{effects::ExecutionOutput, object::Object, store::StateView, transaction::Transaction};
 
+/// What consensus tells engines about a committed sub-dag before its transactions run;
+/// identical on every validator.
+pub struct CommitInfo {
+    /// The commit's timestamp, in milliseconds since the Unix epoch; it never decreases.
+    pub timestamp_ms: u64,
+}
+
 /// Executes a transaction against a read-only view of the store.
 ///
 /// Engines are stateless: `execute` is a pure, synchronous function of the view and the
@@ -15,6 +22,12 @@ pub trait ExecutionEngine {
     /// every validator; the state commitment covers them.
     fn genesis(&self) -> Vec<Object> {
         Vec::new()
+    }
+
+    /// Runs before the transactions of each committed sub-dag that has any, and its output is
+    /// applied first. It must succeed.
+    fn begin_commit<V: StateView>(&self, _view: &V, _commit: &CommitInfo) -> ExecutionOutput {
+        ExecutionOutput::success(Vec::new())
     }
 
     fn execute<V: StateView>(&self, view: &V, transaction: &Transaction) -> ExecutionOutput;

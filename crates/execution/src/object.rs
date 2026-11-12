@@ -45,7 +45,7 @@ impl Version {
         Self(self.0.checked_add(1).expect("Version overflow"))
     }
 
-    pub(crate) fn as_u64(&self) -> u64 {
+    pub fn as_u64(&self) -> u64 {
         self.0
     }
 }

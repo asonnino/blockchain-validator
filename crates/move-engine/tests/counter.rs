@@ -7,9 +7,10 @@
 
 mod common;
 
-use common::{shared_counters, value};
+use common::{clock, shared_counters, value};
 use execution::{
     effects::{AbortReason, ExecutionStatus},
+    engine::CommitInfo,
     object::ObjectId,
     scheduler::SequentialScheduler,
     store::StateView,
@@ -20,7 +21,7 @@ use move_engine::{
     MoveArgument::{self, Object},
     MoveCall, MoveEngine,
 };
-use sui_types::base_types::ObjectID;
+use sui_types::{SUI_FRAMEWORK_PACKAGE_ID, base_types::ObjectID};
 
 fn scheduler() -> (SequentialScheduler<MoveEngine>, ObjectID) {
     let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
@@ -124,6 +125,16 @@ fn malformed_calls_fail_without_writing() {
             vec![(package_id, AccessMode::ReadWrite)],
             vec![Object(0), pure(1)],
         ),
+        // Only commits advance the clock.
+        call(
+            package,
+            "stamp",
+            vec![
+                (id, AccessMode::ReadWrite),
+                (clock(), AccessMode::ReadWrite),
+            ],
+            vec![Object(0), Object(1)],
+        ),
     ];
     let failure = ExecutionStatus::Aborted(AbortReason::ExecutionFailure);
     for transaction in calls {
@@ -211,6 +222,43 @@ fn replayed_creations_abort_when_wrapped_at_birth() {
     assert!(scheduler.store().latest(&fresh).is_some());
     let in_use = ExecutionStatus::Aborted(AbortReason::IdInUse);
     assert_eq!(status(&mut scheduler, stash()), in_use);
+}
+
+#[test]
+fn the_clock_follows_commits() {
+    let (mut scheduler, package) = scheduler();
+    let id = create(&mut scheduler, package, 0);
+    // The clock, like a counter, keeps its value right after its `UID`.
+    assert_eq!(value(scheduler.store(), &clock()), 0);
+    let inputs = vec![(id, AccessMode::ReadWrite), (clock(), AccessMode::ReadOnly)];
+    let stamp = call(package, "stamp", inputs, vec![Object(0), Object(1)]);
+
+    scheduler.begin_commit(&CommitInfo {
+        timestamp_ms: 5_000,
+    });
+    assert_eq!(status(&mut scheduler, stamp), ExecutionStatus::Success);
+    assert_eq!(value(scheduler.store(), &id), 5_000);
+
+    scheduler.begin_commit(&CommitInfo {
+        timestamp_ms: 6_000,
+    });
+    assert_eq!(value(scheduler.store(), &clock()), 6_000);
+}
+
+#[test]
+fn transactions_read_the_clock_without_taking_it() {
+    let (mut scheduler, _) = scheduler();
+    scheduler.begin_commit(&CommitInfo {
+        timestamp_ms: 5_000,
+    });
+    // Sui's `clock::borrow` reads the clock implicitly; without its pinned version, Sui's adapter
+    // fails the transaction and panics in debug builds.
+    let function = MoveEngine::function_id(SUI_FRAMEWORK_PACKAGE_ID, "clock", "borrow");
+    let call = MoveCall {
+        arguments: Vec::new(),
+    };
+    let borrow = Transaction::new(function, Vec::new(), bcs::to_bytes(&call).unwrap());
+    assert_eq!(status(&mut scheduler, borrow), ExecutionStatus::Success);
 }
 
 #[test]
