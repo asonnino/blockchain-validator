@@ -3,6 +3,9 @@
 
 //! Reads of the counter package's objects, shared by the test binaries.
 
+// Each test binary compiles its own copy of this module and uses a subset of it.
+#![allow(dead_code)]
+
 use execution::{engine::ExecutionEngine, object::ObjectId, store::StateView};
 use move_engine::MoveEngine;
 use sui_types::{SUI_CLOCK_OBJECT_ID, base_types::ObjectID, object::Object};

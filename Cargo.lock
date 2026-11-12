@@ -4597,6 +4597,7 @@ dependencies = [
  "checkpoint",
  "dag",
  "execution",
+ "eyre",
  "move-binary-format",
  "move-core-types",
  "move-vm-runtime",
@@ -4610,6 +4611,7 @@ dependencies = [
  "sui-move-natives-latest",
  "sui-protocol-config",
  "sui-types",
+ "sui-verifier-latest",
  "validator",
 ]
 

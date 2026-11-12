@@ -60,6 +60,7 @@ sui-framework = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.8
 sui-move-natives-latest = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 sui-protocol-config = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 sui-types = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+sui-verifier-latest = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 
 [profile.release]
 panic = "abort"

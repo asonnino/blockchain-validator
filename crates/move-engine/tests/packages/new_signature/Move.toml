@@ -1,0 +1,6 @@
+[package]
+name = "new_signature"
+edition = "2024"
+
+[addresses]
+counter = "0x0"
