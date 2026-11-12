@@ -160,31 +160,37 @@ mod tests {
     use crate::{COUNTER, CounterWorkload, MoveEngine};
 
     /// Two authorities' streams, interleaved: every write succeeds, so streams neither repeat
-    /// each other's transactions nor miss their own counters.
+    /// each other's transactions nor miss their own counters. Every validator meters them alike.
     #[test]
     fn interleaved_streams_succeed() {
-        let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
-        let mut streams: Vec<_> = (0..2)
-            .map(|namespace| {
-                let rng = StdRng::seed_from_u64(namespace);
-                (namespace, CounterWorkload::new(&engine), rng)
-            })
-            .collect();
-        let mut scheduler = SequentialScheduler::new(engine);
-        let mut reads = 0;
-        for counter in 0..50 {
-            for (namespace, workload, rng) in &mut streams {
-                let transaction = workload.transaction(*namespace, counter, 0, rng);
-                let read = matches!(transaction.inputs(), [(_, AccessMode::ReadOnly)]);
-                let status = scheduler.execute([transaction]).next().unwrap().status;
-                // A read aborts while its shared counter is still zero.
-                if read {
-                    reads += usize::from(status == ExecutionStatus::Success);
-                } else {
-                    assert_eq!(status, ExecutionStatus::Success);
+        let run = || {
+            let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
+            let mut streams: Vec<_> = (0..2)
+                .map(|namespace| {
+                    let rng = StdRng::seed_from_u64(namespace);
+                    (namespace, CounterWorkload::new(&engine), rng)
+                })
+                .collect();
+            let mut scheduler = SequentialScheduler::new(engine);
+            let mut reads = 0;
+            let mut gas = Vec::new();
+            for counter in 0..50 {
+                for (namespace, workload, rng) in &mut streams {
+                    let transaction = workload.transaction(*namespace, counter, 0, rng);
+                    let read = matches!(transaction.inputs(), [(_, AccessMode::ReadOnly)]);
+                    let outcome = scheduler.execute([transaction]).next().unwrap();
+                    gas.push(outcome.gas_used);
+                    // A read aborts while its shared counter is still zero.
+                    if read {
+                        reads += usize::from(outcome.status == ExecutionStatus::Success);
+                    } else {
+                        assert_eq!(outcome.status, ExecutionStatus::Success);
+                    }
                 }
             }
-        }
-        assert!(reads > 0);
+            assert!(reads > 0);
+            gas
+        };
+        assert_eq!(run(), run());
     }
 }

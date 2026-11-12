@@ -7,10 +7,11 @@
 
 mod common;
 
-use common::{failure, shared_counters, value};
+use common::{call, failure, pure, shared_counters, value};
 use execution::{
     crypto::Digest,
     effects::ExecutionStatus,
+    object::ObjectId,
     scheduler::SequentialScheduler,
     transaction::{AccessMode, Transaction},
 };
@@ -18,14 +19,15 @@ use move_binary_format::{
     CompiledModule,
     file_format::{Bytecode, FunctionDefinition, Visibility},
 };
-use move_core_types::identifier::Identifier;
-use move_engine::{COUNTER, MoveArgument, MoveCall, MoveEngine};
+use move_core_types::{identifier::Identifier, vm_status::StatusCode};
+use move_engine::{COUNTER, MoveArgument, MoveEngine, MoveFailure};
 use sui_types::{
     SUI_FRAMEWORK_PACKAGE_ID, base_types::ObjectID, execution_status::ExecutionErrorKind as Kind,
 };
 
 const PLUS_ONE: &[u8] = include_bytes!("packages/plus_one/counter.mv");
 const ABORT_CODE: &[u8] = include_bytes!("packages/abort_code/counter.mv");
+const ENDLESS: &[u8] = include_bytes!("packages/endless/counter.mv");
 const NEW_FIELD: &[u8] = include_bytes!("packages/new_field/counter.mv");
 const NEW_SIGNATURE: &[u8] = include_bytes!("packages/new_signature/counter.mv");
 const NEW_FUNCTION: &[u8] = include_bytes!("packages/new_function/counter.mv");
@@ -40,36 +42,49 @@ fn engine(substitute: Option<&[u8]>) -> MoveEngine {
     engine
 }
 
-/// Creates a counter and increments it by 5, returning the genesis commitment, the counter's
-/// value, and the final commitment.
-fn run(engine: MoveEngine) -> (Digest, u64, Digest) {
+fn create(package: ObjectID) -> Transaction {
+    call(package, "create", Vec::new(), Vec::new())
+}
+
+/// Increments counter `id` by 5.
+fn increment(package: ObjectID, id: ObjectId) -> Transaction {
+    let inputs = vec![(id, AccessMode::ReadWrite)];
+    call(
+        package,
+        "increment",
+        inputs,
+        vec![MoveArgument::Object(0), pure(5)],
+    )
+}
+
+/// Creates a counter and increments it, returning the genesis commitment, the counter's value,
+/// the final commitment, and the increment's gas.
+fn run(engine: MoveEngine) -> (Digest, u64, Digest, u64) {
     let package = engine.packages()[0];
-    let call = |function, inputs, arguments| {
-        let function = MoveEngine::function_id(package, "counter", function);
-        let args = bcs::to_bytes(&MoveCall { arguments }).unwrap();
-        Transaction::new(function, inputs, args)
-    };
     let mut scheduler = SequentialScheduler::new(engine);
     let genesis = scheduler.store().commitment();
-    let create = call("create", Vec::new(), Vec::new());
+    let create = create(package);
     let id = MoveEngine::fresh_id(&create);
-    let step = MoveArgument::Pure(bcs::to_bytes(&5u64).unwrap());
-    let inputs = vec![(id, AccessMode::ReadWrite)];
-    let increment = call("increment", inputs, vec![MoveArgument::Object(0), step]);
-    for outcome in scheduler.execute([create, increment]) {
+    let outcomes: Vec<_> = scheduler
+        .execute([create, increment(package, id)])
+        .collect();
+    for outcome in &outcomes {
         assert_eq!(outcome.status, ExecutionStatus::Success);
     }
     let store = scheduler.store();
-    (genesis, value(store, &id), store.commitment())
+    let gas = outcomes[1].gas_used;
+    (genesis, value(store, &id), store.commitment(), gas)
 }
 
 #[test]
 fn implementations_share_genesis_but_not_effects() {
-    let (genesis, value, commitment) = run(engine(None));
-    let (other_genesis, other_value, other_commitment) = run(engine(Some(PLUS_ONE)));
+    let (genesis, value, commitment, gas) = run(engine(None));
+    let (other_genesis, other_value, other_commitment, other_gas) = run(engine(Some(PLUS_ONE)));
     assert_eq!(genesis, other_genesis);
     assert_eq!((value, other_value), (5, 6));
     assert_ne!(commitment, other_commitment);
+    // `plus_one` adds through a helper, which gas tells apart even for calls this cheap.
+    assert!(gas < other_gas, "{gas} against {other_gas}");
 }
 
 #[test]
@@ -80,10 +95,13 @@ fn the_published_bytecode_substitutes_for_itself() {
 /// Checks that a shared counter, still zero, was incremented.
 fn check(engine: MoveEngine) -> ExecutionStatus {
     let (package, id) = (engine.packages()[0], shared_counters(&engine)[0]);
-    let function = MoveEngine::function_id(package, "counter", "assert_incremented");
-    let arguments = vec![MoveArgument::Object(0)];
-    let args = bcs::to_bytes(&MoveCall { arguments }).unwrap();
-    let check = Transaction::new(function, vec![(id, AccessMode::ReadOnly)], args);
+    let inputs = vec![(id, AccessMode::ReadOnly)];
+    let check = call(
+        package,
+        "assert_incremented",
+        inputs,
+        vec![MoveArgument::Object(0)],
+    );
     let mut scheduler = SequentialScheduler::new(engine);
     let mut outcomes = scheduler.execute([check]);
     outcomes.next().unwrap().status
@@ -100,6 +118,30 @@ fn implementations_failing_differently_report_different_failures() {
     let ((module, code), (other_module, other_code)) = (abort(status), abort(other));
     assert_eq!(module, other_module);
     assert_eq!((code, other_code), (7, 8));
+}
+
+#[test]
+fn endless_calls_run_out_of_gas_without_writing() {
+    // The default budget takes seconds to exhaust in debug builds.
+    let run_out = |budget| {
+        let engine = engine(Some(ENDLESS)).with_gas_budget(budget);
+        let package = engine.packages()[0];
+        let mut scheduler = SequentialScheduler::new(engine);
+        let create = create(package);
+        let id = MoveEngine::fresh_id(&create);
+        let created = scheduler.execute([create]).next().unwrap();
+        assert_eq!(created.status, ExecutionStatus::Success);
+        let commitment = scheduler.store().commitment();
+        let outcome = scheduler.execute([increment(package, id)]).next().unwrap();
+        assert_eq!(scheduler.store().commitment(), commitment);
+        let out_of_gas = MoveFailure {
+            status: Kind::InsufficientGas,
+            vm_status: Some(StatusCode::OUT_OF_GAS),
+        };
+        assert_eq!(failure(outcome.status), Some(out_of_gas));
+        outcome.gas_used
+    };
+    assert!(run_out(10_000) < run_out(100_000));
 }
 
 #[test]
