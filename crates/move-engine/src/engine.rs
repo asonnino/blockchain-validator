@@ -31,7 +31,7 @@ use sui_types::{
     SUI_FRAMEWORK_PACKAGE_ID,
     accumulator_root::EmptyUnsettledObjectFunds,
     base_types::{ObjectID, SequenceNumber, SuiAddress, SystemObjectVersions},
-    clock::{CLOCK_MODULE_NAME, Clock},
+    clock::CLOCK_MODULE_NAME,
     committee::EpochId,
     digests::{ObjectDigest, TransactionDigest},
     effects::{IDOperation, TransactionEffects, TransactionEffectsAPI},
@@ -274,22 +274,17 @@ impl ExecutionEngine for MoveEngine {
         self.genesis.iter().map(to_object).collect()
     }
 
-    /// Runs Sui's consensus commit prologue, which sets the clock to the commit's timestamp, or
-    /// leaves it if that is earlier: the clock never runs backwards.
+    /// Runs Sui's consensus commit prologue, which sets the clock to the commit's timestamp.
     fn begin_commit<V: StateView>(&self, view: &V, commit: &CommitInfo) -> ExecutionOutput {
         let store = SuiView(view);
         let clock = store
             .object(&SUI_CLOCK_OBJECT_ID)
             .expect("genesis creates the clock");
-        let contents = clock
-            .data
-            .try_as_move()
-            .expect("the clock is a Move object");
-        let now = bcs::from_bytes::<Clock>(contents.contents()).expect("clocks decode");
+        // Sui's adapter reads only the timestamp.
         let prologue = ConsensusCommitPrologue {
             epoch: EPOCH,
-            round: commit.round,
-            commit_timestamp_ms: commit.timestamp_ms.max(now.timestamp_ms()),
+            round: 0,
+            commit_timestamp_ms: commit.timestamp_ms,
         };
         // Each prologue moves the clock to a new version, so each gets its own digest; anchor
         // rounds may repeat.

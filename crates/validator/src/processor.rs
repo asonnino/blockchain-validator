@@ -20,6 +20,7 @@ use serde::Serialize;
 use crate::{
     envelope::{Envelope, NoMessage, Payload},
     metrics::ValidatorMetrics,
+    time::CommitClock,
 };
 
 /// Consumes committed sub-dags in commit order, starting with those replayed from the WAL.
@@ -57,6 +58,7 @@ pub trait CommitProcessor: Send + 'static {
 pub struct SequentialProcessor<E> {
     scheduler: SequentialScheduler<E>,
     certifier: CheckpointCertifier,
+    commit_clock: CommitClock,
     executed: u64,
 }
 
@@ -66,6 +68,7 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
         let protocol = public_config.parameters.consensus.to_protocol(&committee)?;
         Ok(Self {
             scheduler: SequentialScheduler::new(engine),
+            commit_clock: CommitClock::new(committee.clone()),
             certifier: CheckpointCertifier::new(committee, protocol.quorum_threshold),
             executed: 0,
         })
@@ -90,16 +93,8 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
         mut subdag: CommittedSubDag,
     ) -> (usize, Option<Checkpoint>) {
         let anchor = subdag.anchor;
-        let anchor_block = subdag
-            .blocks
-            .iter()
-            .find(|block| *block.reference() == anchor);
         let commit = CommitInfo {
-            round: anchor.round,
-            timestamp_ms: anchor_block
-                .expect("sub-dags contain their anchor")
-                .timestamp()
-                .as_millis() as u64,
+            timestamp_ms: self.commit_clock.commit(&subdag),
         };
         subdag.sort();
         // Votes are recorded as they decode, before this sub-dag mints: none can reference its
@@ -207,6 +202,7 @@ mod tests {
     use dag::{
         authority::Authority,
         block::{Block, data::Data, transaction::Transaction as ConsensusTransaction},
+        committee::Committee,
         consensus::CommittedSubDag,
         crypto::CryptoEngine,
     };
@@ -225,6 +221,7 @@ mod tests {
         envelope::{NoMessage, Payload},
         metrics::ValidatorMetrics,
         processor::{CommitProcessor, SequentialProcessor},
+        time::CommitClock,
     };
 
     type Envelope = crate::envelope::Envelope<NoMessage>;
@@ -233,6 +230,7 @@ mod tests {
         SequentialProcessor {
             scheduler: SequentialScheduler::new(engine),
             certifier: CheckpointCertifier::new_for_test(vec![1; 4], 3, 0),
+            commit_clock: CommitClock::new(Committee::new_test(vec![1; 4])),
             executed: 0,
         }
     }
@@ -380,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn executing_subdags_begin_a_commit_at_their_anchor_time() {
+    fn executing_subdags_begin_a_commit_at_their_commit_time() {
         /// The fake engine, plus an object that each begun commit sets to its timestamp.
         struct Clocked;
 
@@ -407,17 +405,24 @@ mod tests {
         }
 
         let mut state = processor(Clocked);
+        let parents = subdag_at(2, (0..4).map(|author| (author, vec![])).collect()).blocks;
         // Reading the clock aborts unless the commit began before the transaction ran.
         let create = FakeTransaction::success(vec![clock()], vec![ObjectId::new(1)], vec![]);
         let execute = Envelope::new(0, Payload::Execute(create.into())).to_bytes();
-        // Anchored at author 1's block, stamped 3 s plus 1 ms. Neither author 2's later stamp
-        // nor the earlier-round block, which sorts first, may count.
-        let mut subdag = subdag_at(3, vec![(1, vec![execute]), (2, vec![])]);
-        subdag.blocks.extend(subdag_at(2, vec![(0, vec![])]).blocks);
+        let anchor = Data::new(Block::new(
+            Authority::from(1usize),
+            3,
+            parents.iter().map(|parent| *parent.reference()).collect(),
+            vec![ConsensusTransaction::new(execute.into())],
+            9_999_000_000,
+            &CryptoEngine::disabled(),
+        ));
+        let subdag = CommittedSubDag::new(*anchor.reference(), [parents, vec![anchor]].concat());
         state.execute_subdag(&metrics(), Duration::ZERO, subdag);
         assert!(state.scheduler.store().latest(&ObjectId::new(1)).is_some());
+        // The parents' median stamp, from round 2 at authors 0 to 3; not the anchor's own.
         let time = state.scheduler.store().latest(&clock()).unwrap().contents();
-        assert_eq!(time, 3001u64.to_le_bytes());
+        assert_eq!(time, 2002u64.to_le_bytes());
 
         let commitment = state.scheduler.store().commitment();
         let nothing = subdag_at(4, vec![(0, vec![vec![0xFF; 16]])]);

@@ -8,9 +8,7 @@ use crate::{effects::ExecutionOutput, object::Object, store::StateView, transact
 /// What consensus tells engines about a committed sub-dag before its transactions run;
 /// identical on every validator.
 pub struct CommitInfo {
-    /// The round of the sub-dag's anchor.
-    pub round: u64,
-    /// The anchor's timestamp, in milliseconds since the Unix epoch.
+    /// The commit's timestamp, in milliseconds since the Unix epoch; it never decreases.
     pub timestamp_ms: u64,
 }
 

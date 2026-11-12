@@ -225,7 +225,7 @@ fn replayed_creations_abort_when_wrapped_at_birth() {
 }
 
 #[test]
-fn the_clock_follows_commits_without_running_backwards() {
+fn the_clock_follows_commits() {
     let (mut scheduler, package) = scheduler();
     let id = create(&mut scheduler, package, 0);
     // The clock, like a counter, keeps its value right after its `UID`.
@@ -234,17 +234,15 @@ fn the_clock_follows_commits_without_running_backwards() {
     let stamp = call(package, "stamp", inputs, vec![Object(0), Object(1)]);
 
     scheduler.begin_commit(&CommitInfo {
-        round: 1,
         timestamp_ms: 5_000,
     });
     assert_eq!(status(&mut scheduler, stamp), ExecutionStatus::Success);
     assert_eq!(value(scheduler.store(), &id), 5_000);
 
     scheduler.begin_commit(&CommitInfo {
-        round: 2,
-        timestamp_ms: 4_000,
+        timestamp_ms: 6_000,
     });
-    assert_eq!(value(scheduler.store(), &clock()), 5_000);
+    assert_eq!(value(scheduler.store(), &clock()), 6_000);
 }
 
 #[test]
