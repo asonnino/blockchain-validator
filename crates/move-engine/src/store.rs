@@ -3,6 +3,8 @@
 
 //! Sui's storage traits over a [`StateView`], whose objects hold BCS-encoded Sui objects.
 
+use std::collections::HashMap;
+
 use execution::{object::ObjectId, store::StateView};
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress, VersionNumber},
@@ -13,7 +15,11 @@ use sui_types::{
 };
 
 /// Executions are sequential, so the view's latest version is the only one Sui can ask for.
-pub(crate) struct SuiView<'v, V>(pub(crate) &'v V);
+pub(crate) struct SuiView<'v, V>(
+    pub(crate) &'v V,
+    /// Packages the engine runs in place of the stored ones.
+    pub(crate) &'v HashMap<ObjectID, PackageObject>,
+);
 
 impl<V: StateView> SuiView<'_, V> {
     pub(crate) fn object(&self, id: &ObjectID) -> Option<Object> {
@@ -34,6 +40,9 @@ impl<V: StateView> ObjectStore for SuiView<'_, V> {
 
 impl<V: StateView> BackingPackageStore for SuiView<'_, V> {
     fn get_package_object(&self, id: &ObjectID) -> SuiResult<Option<PackageObject>> {
+        if let Some(package) = self.1.get(id) {
+            return Ok(Some(package.clone()));
+        }
         Ok(self
             .object(id)
             .filter(|object| object.is_package())

@@ -53,6 +53,7 @@ simulator = { git = "https://github.com/asonnino/mysticeti", rev = "ce841202c7a6
 # floor mysticeti requires.
 bcs = "0.1.4"
 move-binary-format = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+move-bytecode-verifier = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 move-core-types = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 move-vm-runtime = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 sui-adapter-latest = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
@@ -60,6 +61,7 @@ sui-framework = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.8
 sui-move-natives-latest = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 sui-protocol-config = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 sui-types = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
+sui-verifier-latest = { git = "https://github.com/MystenLabs/sui", tag = "testnet-v1.84.0" }
 
 [profile.release]
 panic = "abort"

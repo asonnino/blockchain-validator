@@ -16,13 +16,17 @@ use execution::{
     store::{InMemoryStore, StateView},
     transaction::{AccessMode, FunctionId, Transaction},
 };
-use move_binary_format::{CompiledModule, file_format::Visibility};
+use eyre::{bail, eyre};
+use move_binary_format::{
+    CompiledModule, compatibility::Compatibility, file_format::Visibility, normalized::RcPool,
+};
+use move_bytecode_verifier::verify_module_with_config_unmetered;
 use move_core_types::{ident_str, identifier::Identifier};
 use move_vm_runtime::runtime::MoveRuntime;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use sui_adapter_latest::{
-    adapter::new_move_runtime,
+    adapter::{new_move_runtime, substitute_package_id},
     execution_engine::execute_transaction_to_effects,
     execution_mode::{ExecutionMode, Genesis, Normal},
 };
@@ -45,13 +49,16 @@ use sui_types::{
     inner_temporary_store::InnerTemporaryStore,
     messages_consensus::ConsensusCommitPrologue,
     metrics::ExecutionMetrics,
+    move_package::{MovePackage, normalize_deserialized_modules},
     object::{Object as SuiObject, Owner},
     programmable_transaction_builder::ProgrammableTransactionBuilder,
+    storage::PackageObject,
     transaction::{
         CheckedInputObjects, GasData, InputObjectKind, InputObjects, ObjectArg, ObjectReadResult,
         ObjectReadResultKind, ProgrammableTransaction, SharedObjectMutability, TransactionKind,
     },
 };
+use sui_verifier_latest::verifier::sui_verify_module_unmetered;
 
 use crate::store::SuiView;
 
@@ -88,6 +95,7 @@ pub struct MoveEngine {
     genesis: Vec<SuiObject>,
     packages: Vec<ObjectID>,
     functions: HashMap<FunctionId, (ObjectID, Identifier, Identifier)>,
+    substitutes: HashMap<ObjectID, PackageObject>,
 }
 
 impl MoveEngine {
@@ -100,15 +108,14 @@ impl MoveEngine {
             LATEST_EXECUTION_VERSION,
             "the pinned protocol version must select the latest execution cut"
         );
-        let natives = all_natives(true, &protocol_config);
-        let runtime = new_move_runtime(natives, &protocol_config).expect("the Move runtime builds");
         let mut engine = Self {
+            runtime: runtime(&protocol_config),
             protocol_config,
-            runtime: Arc::new(runtime),
             metrics: Arc::new(ExecutionMetrics::new(&Registry::new())),
             genesis: BuiltInFramework::genesis_objects().collect(),
             packages: Vec::new(),
             functions: HashMap::new(),
+            substitutes: HashMap::new(),
         };
 
         let mut store = InMemoryStore::default();
@@ -166,8 +173,13 @@ impl MoveEngine {
     ) -> &[SuiObject] {
         let digest = TransactionDigest::new(Blake2b::<U32>::digest(name).into());
         let kind = TransactionKind::ProgrammableTransaction(transaction);
-        let (inner_store, effects) =
-            self.run::<Mode, _>(&SuiView(&*store), kind, sender, Vec::new(), digest);
+        let (inner_store, effects) = self.run::<Mode, _>(
+            &SuiView(&*store, &self.substitutes),
+            kind,
+            sender,
+            Vec::new(),
+            digest,
+        );
         assert!(
             effects.status().is_ok(),
             "{name} must succeed: {:?}",
@@ -185,6 +197,82 @@ impl MoveEngine {
     /// The configured packages' ids, in publication order.
     pub fn packages(&self) -> &[ObjectID] {
         &self.packages
+    }
+
+    /// Runs `modules` in place of the configured `package`, so engines can run different
+    /// implementations over the same state. The substitute is verified as at publication and
+    /// must keep the published modules, datatype layouts, and public and entry function
+    /// signatures, so objects stay readable across implementations; bodies and private functions
+    /// may differ.
+    pub fn substitute(&mut self, package: ObjectID, modules: Vec<Vec<u8>>) -> eyre::Result<()> {
+        if !self.packages.contains(&package) {
+            bail!("{package} is not a configured package");
+        }
+        let published = self
+            .genesis
+            .iter()
+            .find(|object| object.id() == package)
+            .expect("genesis holds the configured packages");
+        let published_package = published
+            .data
+            .try_as_package()
+            .expect("configured packages are packages");
+        let binary_config = self.protocol_config.binary_config(None);
+        let mut compiled = modules
+            .iter()
+            .map(|bytes| CompiledModule::deserialize_with_config(bytes, &binary_config))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| eyre!("substitute modules do not deserialize: {error:?}"))?;
+        substitute_package_id(&mut compiled, package).map_err(|error| eyre!("{error:?}"))?;
+        let verifier_config = self.protocol_config.verifier_config(None);
+        for module in &compiled {
+            verify_module_with_config_unmetered(&verifier_config, module)
+                .map_err(|error| eyre!("substitute module fails verification: {error:?}"))?;
+            sui_verify_module_unmetered(module, &BTreeMap::new(), &verifier_config)
+                .map_err(|error| eyre!("substitute module fails Sui's checks: {error:?}"))?;
+        }
+
+        let pool = &mut RcPool::new();
+        let before = published_package
+            .normalize(pool, &binary_config, false)
+            .map_err(|error| eyre!("{error:?}"))?;
+        let after = normalize_deserialized_modules(pool, compiled.iter(), false);
+        if compiled.len() != before.len() || !before.keys().eq(after.keys()) {
+            bail!("substitute modules differ from the published ones");
+        }
+        for (name, module) in &before {
+            let substitute = &after[name];
+            let compatibility = Compatibility::full_check();
+            compatibility
+                .check(module, substitute)
+                .and_then(|()| compatibility.check(substitute, module))
+                .map_err(|error| {
+                    eyre!("substitute module {name} changes its interface: {error:?}")
+                })?;
+        }
+
+        let mut module_map = BTreeMap::new();
+        for module in &compiled {
+            let mut bytes = Vec::new();
+            module
+                .serialize_with_version(module.version, &mut bytes)
+                .expect("verified modules serialize");
+            module_map.insert(module.name().to_string(), bytes);
+        }
+        let substitute = MovePackage::new(
+            package,
+            published_package.version(),
+            module_map,
+            self.protocol_config.max_move_package_size(),
+            published_package.type_origin_table().clone(),
+            published_package.linkage_table().clone(),
+        )
+        .map_err(|error| eyre!("{error:?}"))?;
+        let object = SuiObject::new_from_package(substitute, published.previous_transaction);
+        self.substitutes.insert(package, PackageObject::new(object));
+        // The runtime caches the packages it loaded, the published one included.
+        self.runtime = runtime(&self.protocol_config);
+        Ok(())
     }
 
     /// The id a [`Transaction`] uses to call `package::module::function`.
@@ -294,7 +382,7 @@ impl ExecutionEngine for MoveEngine {
 
     /// Runs Sui's consensus commit prologue, which sets the clock to the commit's timestamp.
     fn begin_commit<V: StateView>(&self, view: &V, commit: &CommitInfo) -> ExecutionOutput {
-        let store = SuiView(view);
+        let store = SuiView(view, &self.substitutes);
         let clock = store
             .object(&SUI_CLOCK_OBJECT_ID)
             .expect("genesis creates the clock");
@@ -331,7 +419,7 @@ impl ExecutionEngine for MoveEngine {
             return ExecutionOutput::aborted(AbortReason::ExecutionFailure);
         };
 
-        let store = SuiView(view);
+        let store = SuiView(view, &self.substitutes);
         let mut builder = ProgrammableTransactionBuilder::new();
         let mut inputs = Vec::with_capacity(transaction.inputs().len());
         let mut objects = Vec::with_capacity(transaction.inputs().len());
@@ -458,6 +546,12 @@ impl ExecutionEngine for MoveEngine {
             .with_deletes(deletes)
             .with_events(events)
     }
+}
+
+fn runtime(protocol_config: &ProtocolConfig) -> Arc<MoveRuntime> {
+    let natives = all_natives(true, protocol_config);
+    let runtime = new_move_runtime(natives, protocol_config).expect("the Move runtime builds");
+    Arc::new(runtime)
 }
 
 fn sui_digest(transaction: &Transaction) -> TransactionDigest {

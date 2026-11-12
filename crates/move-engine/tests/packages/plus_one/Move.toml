@@ -1,0 +1,6 @@
+[package]
+name = "plus_one"
+edition = "2024"
+
+[addresses]
+counter = "0x0"

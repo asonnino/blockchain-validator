@@ -8,8 +8,10 @@ publish.workspace = true
 [dependencies]
 bcs = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
+eyre = { workspace = true, optional = true }
 execution.workspace = true
 move-binary-format = { workspace = true, optional = true }
+move-bytecode-verifier = { workspace = true, optional = true }
 move-core-types = { workspace = true, optional = true }
 move-vm-runtime = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
@@ -20,13 +22,16 @@ sui-framework = { workspace = true, optional = true }
 sui-move-natives-latest = { workspace = true, optional = true }
 sui-protocol-config = { workspace = true, optional = true }
 sui-types = { workspace = true, optional = true }
+sui-verifier-latest = { workspace = true, optional = true }
 
 [features]
 # Sui's execution layer, kept out of default builds for the weight of its dependency tree.
 sui = [
   "dep:bcs",
   "dep:blake2",
+  "dep:eyre",
   "dep:move-binary-format",
+  "dep:move-bytecode-verifier",
   "dep:move-core-types",
   "dep:move-vm-runtime",
   "dep:prometheus",
@@ -37,6 +42,7 @@ sui = [
   "dep:sui-move-natives-latest",
   "dep:sui-protocol-config",
   "dep:sui-types",
+  "dep:sui-verifier-latest",
 ]
 
 [dev-dependencies]
