@@ -18,7 +18,7 @@ use orchestrator::{
 };
 
 use crate::{
-    args::Engine,
+    engines::Engine,
     remote::protocol::{ClientParameters, NodeParameters, ValidatorProtocol},
 };
 
@@ -26,14 +26,22 @@ pub(crate) struct RemoteBenchmarkDriver {
     settings: Settings,
     username: String,
     engine: Engine,
+    /// The engine's parameters, as YAML.
+    engine_config: Option<String>,
 }
 
 impl RemoteBenchmarkDriver {
-    pub(crate) fn new(settings: Settings, username: String, engine: Engine) -> Self {
+    pub(crate) fn new(
+        settings: Settings,
+        username: String,
+        engine: Engine,
+        engine_config: Option<String>,
+    ) -> Self {
         Self {
             settings,
             username,
             engine,
+            engine_config,
         }
     }
 
@@ -53,7 +61,8 @@ impl RemoteBenchmarkDriver {
         if matches!(self.engine, Engine::Move) {
             bail!("testbed builds lack the Move engine until asonnino/mysticeti#340");
         }
-        let protocol_commands = ValidatorProtocol::new(&self.settings, self.engine);
+        let protocol_commands =
+            ValidatorProtocol::new(&self.settings, self.engine, self.engine_config.clone());
         let node_parameters = match &self.settings.node_parameters_path {
             Some(path) => {
                 NodeParameters::load(path).wrap_err("Failed to load node's parameters")?

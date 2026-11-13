@@ -52,6 +52,13 @@ impl Call {
     }
 }
 
+impl MoveEngine {
+    /// An engine whose one package is the counter, as [`CounterWorkload`] expects.
+    pub fn counter() -> Self {
+        Self::new(vec![vec![COUNTER.to_vec()]])
+    }
+}
+
 impl CounterWorkload {
     const OWNED: u64 = 4;
     const MAX_STEP: u64 = 10;
@@ -157,14 +164,14 @@ mod tests {
     };
     use rand::{SeedableRng, rngs::StdRng};
 
-    use crate::{COUNTER, CounterWorkload, MoveEngine};
+    use crate::{CounterWorkload, MoveEngine};
 
     /// Two authorities' streams, interleaved: every write succeeds, so streams neither repeat
     /// each other's transactions nor miss their own counters. Every validator meters them alike.
     #[test]
     fn interleaved_streams_succeed() {
         let run = || {
-            let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
+            let engine = MoveEngine::counter();
             let mut streams: Vec<_> = (0..2)
                 .map(|namespace| {
                     let rng = StdRng::seed_from_u64(namespace);

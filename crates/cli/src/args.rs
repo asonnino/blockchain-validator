@@ -3,9 +3,11 @@
 
 use std::{net::IpAddr, path::PathBuf};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use dag::authority::Authority;
 use tracing_subscriber::filter::LevelFilter;
+
+use crate::engines::Engine;
 
 /// Blockchain validator: a mysticeti consensus replica composed with execution and
 /// self-certifying checkpoints.
@@ -73,14 +75,9 @@ pub struct RunArgs {
     /// Execution engine; the load generator submits the engine's own workload.
     #[arg(long, value_enum, default_value_t = Engine::Fake)]
     pub engine: Engine,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-pub enum Engine {
-    /// Creates and updates opaque objects, ignoring the call arguments.
-    Fake,
-    /// Runs the bundled counter Move package through Sui's execution layer.
-    Move,
+    /// Path to the engine's parameters (YAML); the engine's defaults if omitted.
+    #[arg(long, value_name = "FILE")]
+    pub engine_config_path: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -145,5 +142,9 @@ pub enum RemoteTestbedCommand {
         /// Execution engine the validators run.
         #[arg(long, value_enum, default_value_t = Engine::Fake)]
         engine: Engine,
+
+        /// Path to the engine's parameters (YAML); the engine's defaults if omitted.
+        #[arg(long, value_name = "FILE")]
+        engine_config_path: Option<PathBuf>,
     },
 }

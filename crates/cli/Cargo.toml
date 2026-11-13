@@ -26,6 +26,10 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 validator = { workspace = true, features = ["benchmark"] }
 
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true
+
 [features]
 # `--engine move`, which builds Sui's execution layer.
 move = ["dep:move-engine", "move-engine/sui"]

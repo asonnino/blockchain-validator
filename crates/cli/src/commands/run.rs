@@ -4,18 +4,19 @@
 use std::{fs, path::PathBuf};
 
 use dag::{authority::Authority, config::ImportExport, context::TokioCtx};
-use execution::{engine::ExecutionEngine, workload::Workload};
 use eyre::{Result, WrapErr, eyre};
-use fake_engine::{FakeExecutor, FakeWorkload};
 use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
     prometheus::{MetricsRegistry, PrometheusServer},
 };
 use tracing_subscriber::filter::LevelFilter;
-use validator::{generator::LoadGeneratorConfig, validator::ValidatorBuilder};
+use validator::{
+    engine::Engine as ValidatorEngine, generator::LoadGeneratorConfig, validator::ValidatorBuilder,
+};
 
 use crate::{
-    args::{Engine, RunArgs},
+    args::RunArgs,
+    engines::{Engine, EngineConfig, FakeConfig},
     tracing::ValidatorTracing,
 };
 
@@ -37,6 +38,7 @@ pub async fn run(
         private_config_path,
         load_generator_config_path,
         engine,
+        engine_config_path,
     } = args;
     tracing::info!("Starting validator {authority}");
 
@@ -46,11 +48,11 @@ pub async fn run(
         .map(|path| LoadGeneratorConfig::load(&path))
         .transpose()?;
 
+    let config_path = engine_config_path.as_deref();
     match engine {
         Engine::Fake => {
             run_with(
-                FakeExecutor,
-                FakeWorkload::default(),
+                FakeConfig::load_or_default(config_path)?,
                 authority,
                 public_config,
                 private_config,
@@ -60,11 +62,8 @@ pub async fn run(
         }
         #[cfg(feature = "move")]
         Engine::Move => {
-            let engine = move_engine::MoveEngine::new(vec![vec![move_engine::COUNTER.to_vec()]]);
-            let workload = move_engine::CounterWorkload::new(&engine);
             run_with(
-                engine,
-                workload,
+                crate::engines::MoveConfig::load_or_default(config_path)?,
                 authority,
                 public_config,
                 private_config,
@@ -77,9 +76,8 @@ pub async fn run(
     }
 }
 
-async fn run_with<E: ExecutionEngine + Send + 'static, W: Workload>(
-    engine: E,
-    workload: W,
+async fn run_with<En: ValidatorEngine>(
+    engine: En,
     authority: Authority,
     public_config: PublicReplicaConfig,
     private_config: PrivateReplicaConfig,
@@ -106,14 +104,16 @@ async fn run_with<E: ExecutionEngine + Send + 'static, W: Workload>(
     // TCP, real crypto, WAL storage. The registry is shared between the replica's and the
     // validator's metrics and served over HTTP below.
     let registry = MetricsRegistry::new();
-    let handle = ValidatorBuilder::new(engine, authority, public_config, private_config)?
-        .with_registry(registry.clone())
-        .build()
-        .start::<TokioCtx>()
-        .await?;
+    let processor = engine.processor(authority, &public_config)?;
+    let handle =
+        ValidatorBuilder::with_processor(processor, authority, public_config, private_config)
+            .with_registry(registry.clone())
+            .build()
+            .start::<TokioCtx>()
+            .await?;
     // Keep the generator task bound to the command's scope so it isn't dropped mid-run.
     let load_generator =
-        load_generator_config.map(|config| handle.start_load_generator(config, workload));
+        load_generator_config.map(|config| handle.start_load_generator(config, engine.workload()));
 
     // Expose metrics over HTTP on all interfaces for external scraping.
     let metrics_server = PrometheusServer::new(metrics_address, &registry)
