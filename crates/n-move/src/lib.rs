@@ -16,6 +16,8 @@ mod vote;
 pub use assignment::{VersionId, assign};
 pub use decision::{Decider, Decision, Rejection};
 pub use digest::{InputDigest, ResultDigest};
-pub use processor::NVersionProcessor;
+pub use processor::{
+    BlockRecord, CostModel, NVersionProcessor, Outcome, Records, TransactionRecord,
+};
 pub use synthetic::{Cluster, SyntheticConfig, SyntheticEngine};
 pub use vote::{Position, Vote};
