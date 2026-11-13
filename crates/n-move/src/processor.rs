@@ -349,7 +349,8 @@ mod tests {
         crypto::CryptoEngine,
     };
     use execution::{
-        engine::ExecutionEngine,
+        effects::ExecutionOutput,
+        engine::{CommitInfo, ExecutionEngine},
         object::{Object, ObjectId, Version},
         store::{InMemoryStore, StateView},
         transaction::Transaction,
@@ -374,18 +375,15 @@ mod tests {
 
     /// Authority 0 of four correct versions, deciding at 3 of 4 with a cutoff of 2 rounds.
     fn processor() -> NVersionProcessor<FakeExecutor> {
+        processor_with(|| FakeExecutor)
+    }
+
+    fn processor_with<E: ExecutionEngine>(engine: impl Fn() -> E) -> NVersionProcessor<E> {
         let public_config = PublicReplicaConfig::new_for_tests(4);
         let assignment = (0..4).map(VersionId).collect();
-        let engines = (0..4).map(|_| FakeExecutor).collect();
-        NVersionProcessor::new(
-            Authority::from(0usize),
-            engines,
-            assignment,
-            3,
-            2,
-            &public_config,
-        )
-        .unwrap()
+        let engines = (0..4).map(|_| engine()).collect();
+        let authority = Authority::from(0usize);
+        NVersionProcessor::new(authority, engines, assignment, 3, 2, &public_config).unwrap()
     }
 
     fn execute(transaction: FakeTransaction) -> Vec<u8> {
@@ -394,6 +392,11 @@ mod tests {
 
     /// `vote` cast by authorities 1 to 3 in a sub-dag at `round`.
     fn votes_at(round: u64, vote: &Vote) -> CommittedSubDag {
+        votes_after(round, None, vote)
+    }
+
+    /// [`votes_at`], with the anchor's parent stamped `parent_ms` if any.
+    fn votes_after(round: u64, parent_ms: Option<u64>, vote: &Vote) -> CommittedSubDag {
         let blocks = (1..4)
             .map(|author| {
                 let copy = Vote { ..*vote };
@@ -401,34 +404,50 @@ mod tests {
                 (author, vec![payload])
             })
             .collect();
-        subdag_at(round, blocks)
+        subdag_after(round, parent_ms, blocks)
     }
 
     /// A sub-dag at `round` with one block per `(author, payloads)` entry, anchored at the first.
     fn subdag_at(round: u64, blocks: Vec<(usize, Vec<Vec<u8>>)>) -> CommittedSubDag {
-        let blocks: Vec<_> = blocks
-            .into_iter()
-            .map(|(author, payloads)| {
-                let transactions = payloads
-                    .into_iter()
-                    .map(|bytes| ConsensusTransaction::new(bytes.into()))
-                    .collect();
-                let block = Block::new(
-                    Authority::from(author),
-                    round,
-                    vec![],
-                    transactions,
-                    round * 1_000_000_000,
-                    &CryptoEngine::disabled(),
-                );
-                Data::new(block)
-            })
-            .collect();
-        CommittedSubDag::new(*blocks[0].reference(), blocks)
+        subdag_after(round, None, blocks)
     }
 
-    fn process(
-        processor: &mut NVersionProcessor<FakeExecutor>,
+    /// [`subdag_at`], whose anchor includes a parent from the round below stamped `parent_ms`, if
+    /// any: the commit clock times a commit by its anchor's parents.
+    fn subdag_after(
+        round: u64,
+        parent_ms: Option<u64>,
+        blocks: Vec<(usize, Vec<Vec<u8>>)>,
+    ) -> CommittedSubDag {
+        let block = |author: usize, round, includes, payloads: Vec<Vec<u8>>, ms: u64| {
+            let transactions = payloads
+                .into_iter()
+                .map(|bytes| ConsensusTransaction::new(bytes.into()))
+                .collect();
+            let (author, crypto) = (Authority::from(author), CryptoEngine::disabled());
+            Data::new(Block::new(
+                author,
+                round,
+                includes,
+                transactions,
+                ms * 1_000_000,
+                &crypto,
+            ))
+        };
+        let parent = parent_ms.map(|ms| block(3, round - 1, vec![], vec![], ms));
+        let includes = parent.iter().map(|parent| *parent.reference()).collect();
+        let mut entries = blocks.into_iter();
+        let (author, payloads) = entries.next().expect("an anchor");
+        let anchor = block(author, round, includes, payloads, round * 1000);
+        let reference = *anchor.reference();
+        let others =
+            entries.map(|(author, payloads)| block(author, round, vec![], payloads, round * 1000));
+        let blocks = parent.into_iter().chain([anchor]).chain(others).collect();
+        CommittedSubDag::new(reference, blocks)
+    }
+
+    fn process<E: ExecutionEngine + Send + 'static>(
+        processor: &mut NVersionProcessor<E>,
         subdag: CommittedSubDag,
     ) -> Vec<Payload<Vote>> {
         let metrics = ValidatorMetrics::new(&Registry::new());
@@ -485,6 +504,66 @@ mod tests {
         );
         assert_eq!(decisions.len(), 2);
         assert_eq!(store.latest_version(&x), Some(Version::new(2)));
+    }
+
+    /// Starts each commit by stamping [`clock`] with the commit's timestamp, as Move's prologue
+    /// sets its clock.
+    struct Clocked;
+
+    fn clock() -> ObjectId {
+        ObjectId::new(0xc1)
+    }
+
+    impl ExecutionEngine for Clocked {
+        fn begin_commit<V: StateView>(&self, view: &V, commit: &CommitInfo) -> ExecutionOutput {
+            let version = view
+                .latest_version(&clock())
+                .map_or(Version::new(1), |v| v.next());
+            let stamp = commit.timestamp_ms.to_be_bytes().to_vec();
+            ExecutionOutput::success(vec![Object::new(clock(), version, stamp)])
+        }
+
+        fn execute<V: StateView>(&self, view: &V, transaction: &Transaction) -> ExecutionOutput {
+            FakeExecutor.execute(view, transaction)
+        }
+    }
+
+    #[test]
+    fn released_commits_begin_with_their_own_prologue() {
+        let mut processor = processor_with(|| Clocked);
+        let x = ObjectId::new(1);
+        let create = execute(FakeTransaction::success(vec![], vec![x], vec![]));
+        let first = process(
+            &mut processor,
+            subdag_after(2, Some(1000), vec![(0, vec![create])]),
+        );
+        let [Payload::Message(create_vote)] = &first[..] else {
+            panic!("one own vote: {first:?}");
+        };
+        // Committed at 3 s and queued; it reads the clock as it updates x.
+        let update = execute(FakeTransaction::success(vec![clock()], vec![], vec![x]));
+        process(
+            &mut processor,
+            subdag_after(3, Some(3000), vec![(0, vec![update])]),
+        );
+        // Released at 5 s.
+        let released = process(&mut processor, votes_after(4, Some(5000), create_vote));
+        let [Payload::Attest(_), Payload::Message(update_vote)] = &released[..] else {
+            panic!("a checkpoint and the update's vote: {released:?}");
+        };
+        let minted = process(&mut processor, votes_at(6, update_vote));
+        let [Payload::Attest(checkpoint)] = &minted[..] else {
+            panic!("a checkpoint: {minted:?}");
+        };
+
+        let (store, _, _) = processor.into_parts();
+        let clock = store.latest(&clock()).unwrap();
+        // One prologue per released commit, stamped with the queued commit's own time.
+        assert_eq!(clock.version(), Version::new(2));
+        assert_eq!(clock.contents(), 3000u64.to_be_bytes());
+        // The update read the clock its prologue wrote: one past its version 2.
+        assert_eq!(store.latest_version(&x), Some(Version::new(3)));
+        assert_eq!(checkpoint.commitment(), store.commitment());
     }
 
     #[test]
@@ -548,7 +627,7 @@ mod tests {
         let id = ObjectId::new(1);
         let mut store = InMemoryStore::default();
         let object = Object::new(id, Version::new(1), b"x".to_vec());
-        store.apply(execution::effects::ExecutionOutput::success(vec![object]));
+        store.apply(ExecutionOutput::success(vec![object]));
         let transaction: Transaction = FakeTransaction::success(vec![], vec![], vec![id]).into();
         let result = ResultDigest::new(&FakeExecutor.execute(&store, &transaction));
         let config = Arc::new(SyntheticConfig {
