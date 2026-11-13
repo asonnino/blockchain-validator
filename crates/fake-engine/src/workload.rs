@@ -79,8 +79,9 @@ impl Workload for FakeWorkload {
         // At a zero share the RNG draws nothing more, keeping the creations-only stream.
         if self.update_share > 0.0 && !self.recent.is_empty() && rng.gen_bool(self.update_share) {
             let updated = self.recent[rng.gen_range(0..self.recent.len())];
-            return FakeTransaction::success_with_args(vec![], vec![], vec![updated], padding)
-                .into();
+            let update = FakeTransaction::success_with_args(vec![], vec![], vec![updated], padding);
+            // Repeated updates of one object differ only by their nonce.
+            return Transaction::from(update).with_nonce(counter);
         }
         if self.recent.len() == Self::RECENT {
             self.recent.pop_front();
@@ -130,6 +131,16 @@ mod tests {
             .collect();
         let mut created = Vec::new();
         let mut updates = 0;
+        let digests: Vec<_> = transactions
+            .iter()
+            .map(|tx| *tx.digest().as_bytes())
+            .collect();
+        for (index, digest) in digests.iter().enumerate() {
+            assert!(
+                !digests[..index].contains(digest),
+                "transaction {index} repeats"
+            );
+        }
         for transaction in &transactions {
             assert_eq!(bincode::serialized_size(transaction).unwrap(), 128);
             match transaction.inputs() {
