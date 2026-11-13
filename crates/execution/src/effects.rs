@@ -127,7 +127,7 @@ impl ExecutionOutput {
         &self.status
     }
 
-    pub(crate) fn gas_used(&self) -> u64 {
+    pub fn gas_used(&self) -> u64 {
         self.gas_used
     }
 
