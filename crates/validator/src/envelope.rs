@@ -54,7 +54,7 @@ impl<M> Envelope<M> {
     }
 
     /// The submission time stamped at [`new`](Envelope::new), in milliseconds since epoch.
-    pub(crate) fn timestamp_ms(&self) -> u64 {
+    pub fn timestamp_ms(&self) -> u64 {
         self.timestamp_ms
     }
 }
