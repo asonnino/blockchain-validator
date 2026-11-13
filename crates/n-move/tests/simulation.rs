@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The n-version processor on a committee under the mysticeti simulator, each validator running a
-//! synthetic version of the fake engine. A correct result keeps every object's contents
-//! [`FakeExecutor::NEW_OBJECT_CONTENT`]; a wrong one appends a tag.
+//! synthetic version of the fake engine and classifying outcomes against a version never wrong.
 
 use std::{path::Path, pin::pin, sync::Arc, time::Duration};
 
@@ -17,8 +16,8 @@ use execution::{
 use fake_engine::{FakeExecutor, FakeTransaction};
 use futures::future::{Either, select};
 use n_move::{
-    Cluster, Decision, NVersionProcessor, Position, Rejection, SyntheticConfig, SyntheticEngine,
-    VersionId, assign,
+    Cluster, CostModel, NVersionProcessor, Outcome, Position, Records, Rejection, SyntheticConfig,
+    SyntheticEngine, VersionId, assign,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use replica::{
@@ -38,13 +37,10 @@ const CUTOFF: u64 = 50;
 const OBJECTS: u64 = 10;
 /// Simulated time any wait may take: validators that disagree would otherwise wait forever.
 const LIMIT: Duration = Duration::from_secs(60);
+const EXECUTION: Duration = Duration::from_millis(1);
 
-/// Every validator's final state, certifier, and decisions.
-type Results = Vec<(
-    InMemoryStore,
-    CheckpointCertifier,
-    Vec<(Position, Decision)>,
-)>;
+/// Every validator's final state, certifier, and records.
+type Results = Vec<(InMemoryStore, CheckpointCertifier, Records)>;
 
 /// Runs one synthetic version per authority under `config`, submitting each batch once every
 /// validator decided the previous ones, from a different validator each time.
@@ -57,6 +53,7 @@ fn run(seed: u64, config: SyntheticConfig, batches: Vec<Vec<Transaction>>) -> Re
         let private_configs =
             PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), COMMITTEE_SIZE);
         let config = Arc::new(config);
+        let correct = Arc::new(crate::config(Vec::new()));
         let assignment = assign(&committee, COMMITTEE_SIZE, seed);
 
         let mut validators = Vec::with_capacity(COMMITTEE_SIZE);
@@ -67,15 +64,21 @@ fn run(seed: u64, config: SyntheticConfig, batches: Vec<Vec<Transaction>>) -> Re
             let engines = (0..COMMITTEE_SIZE)
                 .map(|version| SyntheticEngine::new(VersionId(version), config.clone()))
                 .collect();
+            let reference = SyntheticEngine::new(VersionId(0), correct.clone());
             let processor = NVersionProcessor::new(
                 authority,
                 engines,
+                reference,
                 assignment.clone(),
                 THRESHOLD,
                 CUTOFF,
                 &public_config,
             )
-            .expect("processor must build");
+            .expect("processor must build")
+            .with_cost(CostModel {
+                per_execution: EXECUTION,
+                per_gas: Duration::ZERO,
+            });
             let validator = ValidatorBuilder::with_processor(
                 processor,
                 authority,
@@ -155,63 +158,83 @@ fn workload() -> Vec<Vec<Transaction>> {
     vec![creations, updates]
 }
 
-/// The contents of every workload object in `store`.
-fn contents(store: &InMemoryStore) -> Vec<Vec<u8>> {
-    (1..=OBJECTS)
-        .map(|id| {
-            store
-                .latest(&ObjectId::new(id))
-                .unwrap()
-                .contents()
-                .to_vec()
-        })
+/// Each decided transaction's position and outcome, in decision order.
+fn outcomes(records: &Records) -> Vec<(Position, &Outcome)> {
+    let transactions = records.transactions.iter();
+    transactions
+        .map(|record| (record.position, &record.outcome))
         .collect()
 }
 
-/// Asserts every validator ended with the same store and certificate, every decision final.
-fn assert_agreement(results: &Results) {
-    let (store, certifier, decisions) = &results[0];
-    assert_eq!(decisions.len() as u64, 2 * OBJECTS);
+/// Asserts every validator ended with the same store, certificate, and outcomes, every one
+/// `expected`, and saw each transaction's stages in order.
+fn assert_agreement(results: &Results, expected: Outcome) {
+    let (store, certifier, records) = &results[0];
+    assert_eq!(records.transactions.len() as u64, 2 * OBJECTS);
     assert!(
-        decisions
+        outcomes(records)
             .iter()
-            .all(|(_, decision)| matches!(decision, Decision::Final { .. }))
+            .all(|(_, outcome)| **outcome == expected)
     );
     let certified = certifier.highest_certified().expect("certified");
     assert_eq!(certified.checkpoint().commitment(), store.commitment());
-    for (other_store, other_certifier, other_decisions) in results {
+    for (other_store, other_certifier, other_records) in results {
         assert_eq!(other_store, store);
         assert_eq!(other_certifier.highest_certified(), Some(certified));
-        assert_eq!(other_decisions, decisions);
+        assert_eq!(outcomes(other_records), outcomes(records));
+        let mut executions = other_records.transactions.len() as u32;
+        for record in &other_records.transactions {
+            let stages = [record.submitted_ms, record.committed_ms, record.executed_ms];
+            let voted = record.voted_ms.unwrap_or(record.executed_ms);
+            assert!(
+                stages.is_sorted() && (record.executed_ms..=record.decided_ms).contains(&voted)
+            );
+            // Every repair succeeds with the first winning voter's version.
+            assert_eq!(record.repairs, u32::from(record.lost));
+            assert!(!record.lost_to_earlier);
+            executions += record.repairs;
+        }
+        assert_eq!(other_records.busy, EXECUTION * executions);
     }
+}
+
+/// How many validators lost every result, repairing each.
+fn losers(results: &Results) -> usize {
+    let lost_all = |records: &Records| {
+        let mut transactions = records.transactions.iter();
+        transactions.all(|record| record.lost && record.repairs > 0)
+    };
+    results
+        .iter()
+        .filter(|(_, _, records)| lost_all(records))
+        .count()
 }
 
 #[test]
 fn correct_versions_finalize_everything_deterministically() {
     let results = run(1, config(Vec::new()), workload());
-    assert_agreement(&results);
-    let correct = FakeExecutor::NEW_OBJECT_CONTENT;
-    assert!(contents(&results[0].0).iter().all(|c| c == correct));
+    assert_agreement(&results, Outcome::FinalCorrect);
+    assert_eq!(losers(&results), 0);
 
     let again = run(1, config(Vec::new()), workload());
-    assert_eq!(again[0].0, results[0].0);
-    assert_eq!(again[0].2, results[0].2);
+    for ((store, _, records), (other_store, _, other_records)) in results.iter().zip(&again) {
+        assert_eq!((store, records), (other_store, other_records));
+    }
 }
 
 #[test]
 fn a_wrong_version_loses_and_repairs() {
     let results = run(2, config(vec![cluster(&[0], None)]), workload());
-    assert_agreement(&results);
-    let correct = FakeExecutor::NEW_OBJECT_CONTENT;
-    assert!(contents(&results[0].0).iter().all(|c| c == correct));
+    assert_agreement(&results, Outcome::FinalCorrect);
+    assert_eq!(losers(&results), 1);
 }
 
 #[test]
 fn a_threshold_of_versions_agreeing_on_a_wrong_result_finalizes_it() {
     let results = run(3, config(vec![cluster(&[0, 1, 2], None)]), workload());
-    assert_agreement(&results);
-    let correct = FakeExecutor::NEW_OBJECT_CONTENT;
-    assert!(contents(&results[0].0).iter().all(|c| c != correct));
+    assert_agreement(&results, Outcome::FinalWrong);
+    // The correct version loses to the wrong majority.
+    assert_eq!(losers(&results), 1);
 }
 
 #[test]
@@ -232,28 +255,36 @@ fn dependents_of_a_rejected_transaction_are_rejected_for_it() {
         vec![vec![create], vec![update, dependent]],
     );
 
-    let (store, _, decisions) = &results[0];
+    let (store, _, records) = &results[0];
     let [
         (_, created),
         (update, rejected),
         (dependent, dependent_rejected),
-    ] = &decisions[..]
+    ] = &outcomes(records)[..]
     else {
-        panic!("three decisions: {decisions:?}");
+        panic!("three decisions: {:?}", records.transactions);
     };
-    assert!(matches!(created, Decision::Final { .. }));
+    assert_eq!(**created, Outcome::FinalCorrect);
     assert_eq!(update.commit, dependent.commit, "one commit");
-    assert_eq!(*rejected, Decision::Rejected(Rejection::Impossible));
+    assert_eq!(**rejected, Outcome::Rejected(Rejection::Impossible));
     assert_eq!(
-        *dependent_rejected,
-        Decision::Rejected(Rejection::EarlierTransaction)
+        **dependent_rejected,
+        Outcome::Rejected(Rejection::EarlierTransaction)
     );
     assert_eq!(
         store.latest(&x).unwrap().contents(),
         FakeExecutor::NEW_OBJECT_CONTENT
     );
     assert_eq!(store.latest_version(&y), None);
-    for (other_store, _, other_decisions) in &results {
-        assert_eq!((other_store, other_decisions), (store, decisions));
+    for (other_store, _, other_records) in &results {
+        assert_eq!(other_store, store);
+        assert_eq!(outcomes(other_records), outcomes(records));
+        // Every validator executed the dependent on its own, stale, result for the update.
+        let stale: Vec<_> = other_records
+            .transactions
+            .iter()
+            .map(|record| record.lost_to_earlier)
+            .collect();
+        assert_eq!(stale, [false, false, true]);
     }
 }

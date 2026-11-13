@@ -10,6 +10,7 @@ use std::{collections::VecDeque, time::Duration};
 use checkpoint::certifier::{CheckpointCertifier, CheckpointTimings};
 use dag::{authority::Authority, committee::Stake, consensus::CommittedSubDag, crypto::AsBytes};
 use execution::{
+    crypto::Digest,
     effects::{AbortReason, ExecutionOutput, ExecutionStatus},
     engine::{CommitInfo, ExecutionEngine},
     store::{InMemoryStore, Overlay, StateView},
@@ -25,35 +26,111 @@ use validator::{
 
 use crate::{
     assignment::VersionId,
-    decision::{Decider, Decision},
+    decision::{Decider, Decision, Rejection},
     digest::{InputDigest, ResultDigest},
     vote::{Position, Vote},
 };
+
+/// The simulated time the processor's executions take, reported as [`Processed::busy`]: a
+/// constant per execution plus a cost per unit of gas. Repairs count as executions; ground-truth
+/// runs of the reference engine do not.
+#[derive(Default)]
+pub struct CostModel {
+    pub per_execution: Duration,
+    pub per_gas: Duration,
+}
+
+impl CostModel {
+    fn cost(&self, output: &ExecutionOutput) -> Duration {
+        let gas_nanos = (self.per_gas.as_nanos() as u64).saturating_mul(output.gas_used());
+        self.per_execution + Duration::from_nanos(gas_nanos)
+    }
+}
+
+/// How a transaction ended, against the reference engine's result on the decided state.
+#[derive(PartialEq, Debug)]
+pub enum Outcome {
+    FinalCorrect,
+    FinalWrong,
+    Rejected(Rejection),
+}
+
+/// One transaction as this validator saw it. Times are milliseconds since the epoch on the
+/// validator's clock; processing time counts from the sub-dag that triggered it.
+#[derive(PartialEq, Debug)]
+pub struct TransactionRecord {
+    pub position: Position,
+    pub digest: Digest,
+    pub submitted_ms: u64,
+    pub committed_ms: u64,
+    pub executed_ms: u64,
+    /// When the own vote committed, unless the transaction was decided before.
+    pub voted_ms: Option<u64>,
+    pub decided_ms: u64,
+    pub outcome: Outcome,
+    /// The own result lost.
+    pub lost: bool,
+    /// The own execution ran on inputs an earlier decision changed.
+    pub lost_to_earlier: bool,
+    pub repairs: u32,
+    /// The own execution's gas.
+    pub gas_used: u64,
+}
+
+/// The bytes of n-move votes a committed block carries.
+#[derive(PartialEq, Debug)]
+pub struct BlockRecord {
+    pub round: u64,
+    pub author: Authority,
+    pub vote_bytes: usize,
+}
+
+/// What a processor measured over its run.
+#[derive(Default, PartialEq, Debug)]
+pub struct Records {
+    /// In decision order.
+    pub transactions: Vec<TransactionRecord>,
+    /// In commit order.
+    pub blocks: Vec<BlockRecord>,
+    pub busy: Duration,
+}
 
 /// A committed sub-dag's transactions, waiting for the barrier.
 struct Queued {
     commit: u64,
     info: CommitInfo,
-    transactions: Vec<Transaction>,
+    committed_ms: u64,
+    /// With their submission stamps.
+    transactions: Vec<(Transaction, u64)>,
 }
 
 /// A transaction of the commit being decided, with this validator's own execution of it.
 struct Executed {
+    position: Position,
     transaction: Transaction,
     input: InputDigest,
     result: ResultDigest,
     /// Taken once the transaction is final.
     output: Option<ExecutionOutput>,
+    gas_used: u64,
+    submitted_ms: u64,
+    committed_ms: u64,
+    executed_ms: u64,
+    voted_ms: Option<u64>,
 }
 
 /// A validator's [`CommitProcessor`] for n-version execution.
 pub struct NVersionProcessor<E> {
+    authority: Authority,
     /// One engine per version, the own one and the others for repair.
     engines: Vec<E>,
     /// The own version.
     version: VersionId,
     /// Each authority's version.
     assignment: Vec<VersionId>,
+    /// Never wrong.
+    reference: E,
+    cost: CostModel,
     /// The final state: decided results only.
     store: InMemoryStore,
     decider: Decider,
@@ -64,7 +141,7 @@ pub struct NVersionProcessor<E> {
     queue: VecDeque<Queued>,
     /// The commit being decided.
     executing: Option<Vec<Executed>>,
-    decisions: Vec<(Position, Decision)>,
+    records: Records,
 }
 
 impl<E: ExecutionEngine> NVersionProcessor<E> {
@@ -73,6 +150,7 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
     pub fn new(
         authority: Authority,
         engines: Vec<E>,
+        reference: E,
         assignment: Vec<VersionId>,
         threshold: Stake,
         cutoff: u64,
@@ -93,9 +171,12 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
         let mut store = InMemoryStore::default();
         store.apply(ExecutionOutput::success(engines[version.0].genesis()));
         Ok(Self {
+            authority,
             engines,
             version,
             assignment,
+            reference,
+            cost: CostModel::default(),
             store,
             decider: Decider::new(committee.clone(), threshold, cutoff),
             certifier: CheckpointCertifier::new(committee.clone(), protocol.quorum_threshold),
@@ -103,24 +184,24 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             commits: 0,
             queue: VecDeque::new(),
             executing: None,
-            decisions: Vec::new(),
+            records: Records::default(),
         })
     }
 
-    /// The final state, the checkpoint certifier, and every decision in commit order.
-    pub fn into_parts(
-        self,
-    ) -> (
-        InMemoryStore,
-        CheckpointCertifier,
-        Vec<(Position, Decision)>,
-    ) {
-        (self.store, self.certifier, self.decisions)
+    pub fn with_cost(mut self, cost: CostModel) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// The final state, the checkpoint certifier, and the records.
+    pub fn into_parts(self) -> (InMemoryStore, CheckpointCertifier, Records) {
+        (self.store, self.certifier, self.records)
     }
 
     /// Decides the executing commit's transactions while their votes allow, applying each
-    /// decision to the final state. Returns whether the commit is fully decided.
-    fn decide(&mut self) -> bool {
+    /// decision to the final state, at `now` plus the `busy` time spent so far. Returns whether
+    /// the commit is fully decided.
+    fn decide(&mut self, now: Duration, busy: &mut Duration) -> bool {
         let Some(executing) = &mut self.executing else {
             return true;
         };
@@ -130,26 +211,53 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             let Some((_, decision)) = self.decider.decide(input) else {
                 return false;
             };
-            if let Decision::Final { result, voters } = &decision {
-                let own = executed.input == input && executed.result == *result;
-                let output = match executed.output.take() {
-                    Some(output) if own => output,
-                    _ => {
-                        let transaction = &executed.transaction;
-                        let (engines, assignment) = (&self.engines, &self.assignment);
-                        repair(
-                            engines,
-                            assignment,
-                            &self.store,
-                            transaction,
-                            *result,
-                            voters,
-                        )
+            let (mut lost, mut repairs) = (false, 0);
+            let outcome = match decision {
+                Decision::Final { result, voters } => {
+                    let truth = execute(&self.reference, &self.store, &executed.transaction);
+                    let correct = ResultDigest::new(&truth) == result;
+                    lost = executed.result != result;
+                    let own = executed.input == input && !lost;
+                    let output = match executed.output.take() {
+                        Some(output) if own => output,
+                        _ => {
+                            let transaction = &executed.transaction;
+                            let (output, tries, spent) = repair(
+                                &self.engines,
+                                &self.assignment,
+                                &self.store,
+                                transaction,
+                                result,
+                                &voters,
+                                &self.cost,
+                            );
+                            (repairs, *busy) = (tries, *busy + spent);
+                            output
+                        }
+                    };
+                    self.store.apply(output);
+                    if correct {
+                        Outcome::FinalCorrect
+                    } else {
+                        Outcome::FinalWrong
                     }
-                };
-                self.store.apply(output);
-            }
-            self.decisions.push((position, decision));
+                }
+                Decision::Rejected(rejection) => Outcome::Rejected(rejection),
+            };
+            self.records.transactions.push(TransactionRecord {
+                position,
+                digest: executed.transaction.digest(),
+                submitted_ms: executed.submitted_ms,
+                committed_ms: executed.committed_ms,
+                executed_ms: executed.executed_ms,
+                voted_ms: executed.voted_ms,
+                decided_ms: millis(now + *busy),
+                outcome,
+                lost,
+                lost_to_earlier: executed.input != input,
+                repairs,
+                gas_used: executed.gas_used,
+            });
         }
         true
     }
@@ -157,7 +265,13 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
     /// Executes the next queued commit with the own version over the final state, and returns
     /// this validator's votes on its transactions. It registers the commit at `round`, so its
     /// cutoff runs from its execution rather than its commit.
-    fn release(&mut self, queued: Queued, round: u64) -> Vec<Payload<Vote>> {
+    fn release(
+        &mut self,
+        queued: Queued,
+        round: u64,
+        now: Duration,
+        busy: &mut Duration,
+    ) -> Vec<Payload<Vote>> {
         let engine = &self.engines[self.version.0];
         let prologue = engine.begin_commit(&self.store, &queued.info);
         assert_eq!(
@@ -172,9 +286,10 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
         let mut overlay = Overlay::new(&self.store);
         let mut votes = Vec::with_capacity(queued.transactions.len());
         let mut transactions = Vec::with_capacity(queued.transactions.len());
-        for (index, transaction) in queued.transactions.into_iter().enumerate() {
+        for (index, (transaction, submitted_ms)) in queued.transactions.into_iter().enumerate() {
             let input = InputDigest::new(&overlay, &transaction);
             let output = execute(engine, &overlay, &transaction);
+            *busy += self.cost.cost(&output);
             let result = ResultDigest::new(&output);
             overlay.apply(&output);
             let position = Position {
@@ -189,10 +304,16 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
                 result,
             }));
             transactions.push(Executed {
+                position,
                 transaction,
                 input,
                 result,
+                gas_used: output.gas_used(),
                 output: Some(output),
+                submitted_ms,
+                committed_ms: queued.committed_ms,
+                executed_ms: millis(now + *busy),
+                voted_ms: None,
             });
         }
         self.executing = Some(transactions);
@@ -217,37 +338,51 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
         let (mut transactions, mut votes) = (Vec::new(), Vec::new());
         for block in &subdag.blocks {
             let author = block.author();
+            let mut vote_bytes = 0;
             for payload in block.transactions() {
-                let Ok(envelope) = Envelope::<Vote>::from_bytes(payload.as_bytes())
+                let bytes = payload.as_bytes();
+                let Ok(envelope) = Envelope::<Vote>::from_bytes(bytes)
                     .inspect_err(|error| tracing::warn!(?error, "skipping undecodable payload"))
                 else {
                     continue;
                 };
+                let submitted_ms = envelope.timestamp_ms();
                 match envelope.into_payload() {
-                    Payload::Execute(transaction) => transactions.push(transaction),
+                    Payload::Execute(transaction) => transactions.push((transaction, submitted_ms)),
                     Payload::Attest(checkpoint) => {
                         self.certifier.record(anchor, author, checkpoint);
                     }
-                    Payload::Message(vote) => votes.push((author, vote)),
+                    Payload::Message(vote) => {
+                        vote_bytes += bytes.len();
+                        if author == self.authority {
+                            self.voted(vote.position, millis(now));
+                        }
+                        votes.push((author, vote));
+                    }
                 }
             }
+            self.records.blocks.push(BlockRecord {
+                round: block.round(),
+                author,
+                vote_bytes,
+            });
         }
         self.decider.record(anchor.round, votes);
         self.queue.push_back(Queued {
             commit: self.commits,
             info,
+            committed_ms: millis(now),
             transactions,
         });
         self.commits += 1;
 
-        let mut payloads = Vec::new();
-        while self.decide() {
-            if self.executing.take().is_some() {
-                // Todo: the submission stamps behind end-to-end latency, with the metrics of
-                // MystenLabs/n-version-move#17.
+        let (mut payloads, mut busy) = (Vec::new(), Duration::ZERO);
+        while self.decide(now, &mut busy) {
+            if let Some(decided) = self.executing.take() {
+                let stamps = decided.iter().map(|executed| executed.submitted_ms);
                 let timings = CheckpointTimings {
-                    minted_at: now,
-                    mean_timestamp_ms: 0,
+                    minted_at: now + busy,
+                    mean_timestamp_ms: stamps.sum::<u64>() / decided.len() as u64,
                 };
                 let commitment = self.store.commitment();
                 let checkpoint = self.certifier.push(anchor, commitment, timings).clone();
@@ -257,13 +392,11 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
                 break;
             };
             if !queued.transactions.is_empty() {
-                payloads.extend(self.release(queued, anchor.round));
+                payloads.extend(self.release(queued, anchor.round, now, &mut busy));
             }
         }
-        Processed {
-            payloads,
-            busy: Duration::ZERO,
-        }
+        self.records.busy += busy;
+        Processed { payloads, busy }
     }
 
     /// Resubmits the own votes on undecided transactions and the uncertified checkpoints: both
@@ -273,21 +406,18 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
         let Some((executing, head)) = self.executing.as_ref().zip(self.decider.head()) else {
             return pending.collect();
         };
-        let votes = executing[head.index as usize..]
-            .iter()
-            .zip(head.index..)
-            .map(|(executed, index)| {
-                Payload::Message(Vote {
-                    position: Position { index, ..head },
-                    input: executed.input,
-                    result: executed.result,
-                })
-            });
+        let votes = executing[head.index as usize..].iter().map(|executed| {
+            Payload::Message(Vote {
+                position: executed.position,
+                input: executed.input,
+                result: executed.result,
+            })
+        });
         pending.chain(votes).collect()
     }
 
     fn executed(&self) -> u64 {
-        self.decisions.len() as u64
+        self.records.transactions.len() as u64
     }
 
     /// The highest certified commitment equals the final state's.
@@ -298,6 +428,24 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
             .map(|certificate| certificate.checkpoint().commitment());
         certified == Some(self.store.commitment())
     }
+}
+
+impl<E> NVersionProcessor<E> {
+    /// Notes that the own vote on `position` committed at `now_ms`.
+    fn voted(&mut self, position: Position, now_ms: u64) {
+        let executed = self
+            .executing
+            .as_mut()
+            .and_then(|executing| executing.get_mut(position.index as usize))
+            .filter(|executed| executed.position == position);
+        if let Some(executed) = executed {
+            executed.voted_ms.get_or_insert(now_ms);
+        }
+    }
+}
+
+fn millis(time: Duration) -> u64 {
+    time.as_millis() as u64
 }
 
 /// `transaction`'s output under `engine`, failing static verification as the scheduler does.
@@ -315,6 +463,7 @@ fn execute<E: ExecutionEngine, V: StateView>(
 
 /// Re-executes `transaction` on the final state with each winning voter's version in turn, until
 /// one reproduces `result`; a Byzantine voter's version may not, but an honest voter's does.
+/// Returns the output, the executions tried, and their cost.
 fn repair<E: ExecutionEngine>(
     engines: &[E],
     assignment: &[VersionId],
@@ -322,8 +471,9 @@ fn repair<E: ExecutionEngine>(
     transaction: &Transaction,
     result: ResultDigest,
     voters: &[Authority],
-) -> ExecutionOutput {
-    let mut tried = Vec::new();
+    cost: &CostModel,
+) -> (ExecutionOutput, u32, Duration) {
+    let (mut tried, mut spent) = (Vec::new(), Duration::ZERO);
     for voter in voters {
         let version = assignment[voter.index()];
         if tried.contains(&version) {
@@ -331,8 +481,9 @@ fn repair<E: ExecutionEngine>(
         }
         tried.push(version);
         let output = execute(&engines[version.0], store, transaction);
+        spent += cost.cost(&output);
         if ResultDigest::new(&output) == result {
-            return output;
+            return (output, tried.len() as u32, spent);
         }
     }
     panic!("no voter's version reproduces the final result");
@@ -364,10 +515,9 @@ mod tests {
         processor::CommitProcessor,
     };
 
-    use super::{NVersionProcessor, repair};
+    use super::{CostModel, NVersionProcessor, Outcome, repair};
     use crate::{
         assignment::VersionId,
-        decision::Decision,
         digest::ResultDigest,
         synthetic::{SyntheticConfig, SyntheticEngine},
         vote::{Position, Vote},
@@ -383,7 +533,16 @@ mod tests {
         let assignment = (0..4).map(VersionId).collect();
         let engines = (0..4).map(|_| engine()).collect();
         let authority = Authority::from(0usize);
-        NVersionProcessor::new(authority, engines, assignment, 3, 2, &public_config).unwrap()
+        NVersionProcessor::new(
+            authority,
+            engines,
+            engine(),
+            assignment,
+            3,
+            2,
+            &public_config,
+        )
+        .unwrap()
     }
 
     fn execute(transaction: FakeTransaction) -> Vec<u8> {
@@ -451,7 +610,8 @@ mod tests {
         subdag: CommittedSubDag,
     ) -> Vec<Payload<Vote>> {
         let metrics = ValidatorMetrics::new(&Registry::new());
-        processor.process(subdag, Duration::ZERO, &metrics).payloads
+        let now = Duration::from_secs(subdag.anchor.round);
+        processor.process(subdag, now, &metrics).payloads
     }
 
     fn own_votes(payloads: &[Payload<Vote>]) -> Vec<&Vote> {
@@ -493,17 +653,33 @@ mod tests {
                 index: 0
             }
         );
+        // A late own vote on the decided creation leaves the update's record alone.
+        let late = Envelope::new(0, Payload::Message(Vote { ..*create_vote })).to_bytes();
+        process(&mut processor, subdag_at(4, vec![(0, vec![late])]));
         // Round 5 is the update's deadline, counted from its release rather than its commit.
         process(&mut processor, votes_at(5, update_vote));
 
-        let (store, _, decisions) = processor.into_parts();
-        assert!(
-            decisions
-                .iter()
-                .all(|(_, decision)| matches!(decision, Decision::Final { .. }))
-        );
-        assert_eq!(decisions.len(), 2);
+        let (store, _, records) = processor.into_parts();
+        let outcomes: Vec<_> = records
+            .transactions
+            .iter()
+            .map(|record| &record.outcome)
+            .collect();
+        assert_eq!(outcomes, [&Outcome::FinalCorrect, &Outcome::FinalCorrect]);
         assert_eq!(store.latest_version(&x), Some(Version::new(2)));
+        // The update waited from its commit at 2 s to its release at 3 s; no own vote committed.
+        let times: Vec<_> = records
+            .transactions
+            .iter()
+            .map(|record| {
+                let stages = (record.committed_ms, record.executed_ms);
+                (stages, record.voted_ms, record.decided_ms)
+            })
+            .collect();
+        assert_eq!(
+            times,
+            [((1000, 1000), None, 3000), ((2000, 3000), None, 5000)]
+        );
     }
 
     /// Starts each commit by stamping [`clock`] with the commit's timestamp, as Move's prologue
@@ -567,6 +743,70 @@ mod tests {
     }
 
     #[test]
+    fn executions_cost_busy_time_and_records_follow_it() {
+        let cost = CostModel {
+            per_execution: Duration::from_millis(1),
+            per_gas: Duration::ZERO,
+        };
+        let mut processor = processor().with_cost(cost);
+        let metrics = ValidatorMetrics::new(&Registry::new());
+        let creations = [1, 2].map(|id| {
+            let creation = FakeTransaction::success(vec![], vec![ObjectId::new(id)], vec![]);
+            Envelope::new(7, Payload::<Vote>::Execute(creation.into())).to_bytes()
+        });
+        let subdag = subdag_at(1, vec![(0, creations.into())]);
+        let executed = processor.process(subdag, Duration::from_secs(10), &metrics);
+        assert_eq!(executed.busy, Duration::from_millis(2));
+
+        // Every authority's votes on both, the own ones included, commit at 20 s.
+        let votes: Vec<_> = own_votes(&executed.payloads)
+            .into_iter()
+            .map(|vote| Envelope::new(0, Payload::Message(Vote { ..*vote })).to_bytes())
+            .collect();
+        let blocks = (0..4).map(|author| (author, votes.clone())).collect();
+        processor.process(subdag_at(2, blocks), Duration::from_secs(20), &metrics);
+
+        let (_, _, records) = processor.into_parts();
+        let times: Vec<_> = records
+            .transactions
+            .iter()
+            .map(|record| {
+                let stages = (record.submitted_ms, record.committed_ms, record.executed_ms);
+                (stages, record.voted_ms, record.decided_ms)
+            })
+            .collect();
+        let decided = (Some(20_000), 20_000);
+        let expected = [
+            ((7, 10_000, 10_001), decided),
+            ((7, 10_000, 10_002), decided),
+        ];
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|(stages, (voted, decided))| (*stages, *voted, *decided))
+            .collect();
+        assert_eq!(times, expected);
+        assert_eq!(records.busy, Duration::from_millis(2));
+        let blocks: Vec<_> = records
+            .blocks
+            .iter()
+            .map(|block| (block.round, block.author.index(), block.vote_bytes))
+            .collect();
+        let bytes = votes.iter().map(Vec::len).sum();
+        let voting = (0..4).map(|author| (2, author, bytes));
+        assert_eq!(
+            blocks,
+            [(1, 0, 0)].into_iter().chain(voting).collect::<Vec<_>>()
+        );
+
+        let gas = ExecutionOutput::success(Vec::new()).with_gas_used(500);
+        let cost = CostModel {
+            per_execution: Duration::from_millis(1),
+            per_gas: Duration::from_micros(1),
+        };
+        assert_eq!(cost.cost(&gas), Duration::from_micros(1500));
+    }
+
+    #[test]
     fn replay_resubmits_votes_on_undecided_transactions_and_pending_checkpoints() {
         let mut processor = processor();
         let creations = [1, 2].map(|id| {
@@ -598,8 +838,21 @@ mod tests {
         let (store, transaction, result, engines) = repair_setup();
         let voters = [Authority::from(0usize), Authority::from(1usize)];
         let assignment = [VersionId(0), VersionId(1)];
-        let output = repair(&engines, &assignment, &store, &transaction, result, &voters);
+        let cost = CostModel {
+            per_execution: Duration::from_millis(1),
+            per_gas: Duration::ZERO,
+        };
+        let (output, tries, spent) = repair(
+            &engines,
+            &assignment,
+            &store,
+            &transaction,
+            result,
+            &voters,
+            &cost,
+        );
         assert_eq!(ResultDigest::new(&output), result);
+        assert_eq!((tries, spent), (2, Duration::from_millis(2)));
     }
 
     #[test]
@@ -607,13 +860,16 @@ mod tests {
     fn repair_never_applies_another_result() {
         let (store, transaction, result, engines) = repair_setup();
         let assignment = [VersionId(0), VersionId(1)];
+        let voters = [Authority::from(0usize)];
+        let cost = CostModel::default();
         repair(
             &engines,
             &assignment,
             &store,
             &transaction,
             result,
-            &[Authority::from(0usize)],
+            &voters,
+            &cost,
         );
     }
 
