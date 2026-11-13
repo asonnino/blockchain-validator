@@ -4,8 +4,10 @@
 //! The remote benchmark driver: composes the orchestrator's phases per load and reports
 //! progress through plain tracing lines.
 
-use std::fs;
+use std::{fmt::Debug, fs};
 
+use blake2::{Blake2s256, Digest};
+use clap::ValueEnum;
 use eyre::{Context, Result, bail};
 use orchestrator::{
     benchmark::{BenchmarkParameters, Parameters},
@@ -18,7 +20,7 @@ use orchestrator::{
 };
 
 use crate::{
-    args::Engine,
+    engines::Engine,
     remote::protocol::{ClientParameters, NodeParameters, ValidatorProtocol},
 };
 
@@ -26,14 +28,22 @@ pub(crate) struct RemoteBenchmarkDriver {
     settings: Settings,
     username: String,
     engine: Engine,
+    /// The engine's parameters, as YAML.
+    engine_config: Option<String>,
 }
 
 impl RemoteBenchmarkDriver {
-    pub(crate) fn new(settings: Settings, username: String, engine: Engine) -> Self {
+    pub(crate) fn new(
+        settings: Settings,
+        username: String,
+        engine: Engine,
+        engine_config: Option<String>,
+    ) -> Self {
         Self {
             settings,
             username,
             engine,
+            engine_config,
         }
     }
 
@@ -48,12 +58,12 @@ impl RemoteBenchmarkDriver {
     ) -> Result<()> {
         // Todo: build the testbed with the `move` feature (and the C flags Sui's crypto needs)
         // once the orchestrator lets protocols choose their build command
-        // (asonnino/mysticeti#340), and name the measurement files by engine so runs of
-        // different engines don't overwrite each other.
+        // (asonnino/mysticeti#340).
         if matches!(self.engine, Engine::Move) {
             bail!("testbed builds lack the Move engine until asonnino/mysticeti#340");
         }
-        let protocol_commands = ValidatorProtocol::new(&self.settings, self.engine);
+        let protocol_commands =
+            ValidatorProtocol::new(&self.settings, self.engine, self.engine_config.clone());
         let node_parameters = match &self.settings.node_parameters_path {
             Some(path) => {
                 NodeParameters::load(path).wrap_err("Failed to load node's parameters")?
@@ -233,7 +243,14 @@ impl RemoteBenchmarkDriver {
             .results_dir
             .join(format!("results-{}", self.settings.repository.commit));
         fs::create_dir_all(&results_dir).wrap_err("Failed to create results directory")?;
-        let measurements_path = results_dir.join(format!("measurements-{parameters:?}.yaml"));
+        let engine_config = self.engine_config.as_deref();
+        if let Some(engine_config) = engine_config {
+            let path = format!("engine-config-{}.yaml", fingerprint(engine_config));
+            fs::write(results_dir.join(path), engine_config)
+                .wrap_err("Failed to save the engine config")?;
+        }
+        let measurements_path =
+            results_dir.join(measurements_name(parameters, self.engine, engine_config));
 
         loop {
             let tick = tokio::select! {
@@ -279,5 +296,56 @@ impl RemoteBenchmarkDriver {
                 }
             }
         }
+    }
+}
+
+/// The measurements file of a benchmark. Default fake runs keep their historical names; other
+/// engines and engine configs add suffixes, so their results don't overwrite each other.
+fn measurements_name(
+    parameters: &impl Debug,
+    engine: Engine,
+    engine_config: Option<&str>,
+) -> String {
+    let mut name = format!("measurements-{parameters:?}");
+    if !matches!(engine, Engine::Fake) {
+        let engine = engine.to_possible_value().expect("engines are named");
+        name = format!("{name}-{}", engine.get_name());
+    }
+    if let Some(engine_config) = engine_config {
+        name = format!("{name}-{}", fingerprint(engine_config));
+    }
+    name + ".yaml"
+}
+
+/// A short, stable hash of an engine config.
+fn fingerprint(engine_config: &str) -> String {
+    let hash = Blake2s256::digest(engine_config.as_bytes());
+    hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt;
+
+    use super::measurements_name;
+    use crate::engines::Engine;
+
+    struct Parameters;
+
+    impl fmt::Debug for Parameters {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("p")
+        }
+    }
+
+    #[test]
+    fn measurements_names_tell_engines_and_configs_apart() {
+        let name = |engine, config| measurements_name(&Parameters, engine, config);
+        assert_eq!(name(Engine::Fake, None), "measurements-p.yaml");
+        assert_eq!(name(Engine::Move, None), "measurements-p-move.yaml");
+        let half = name(Engine::Fake, Some("update_share: 0.5\n"));
+        let full = name(Engine::Fake, Some("update_share: 1.0\n"));
+        assert!(half.starts_with("measurements-p-") && half.ends_with(".yaml"));
+        assert_ne!(half, full);
     }
 }

@@ -69,17 +69,17 @@ impl ValidatorMetrics {
         self.submitted_transactions.inc_by(count);
     }
 
-    pub(crate) fn observe_subdag_execution_latency(&self, latency: Duration) {
+    pub fn observe_subdag_execution_latency(&self, latency: Duration) {
         self.subdag_execution_latency_s
             .observe(latency.as_secs_f64());
     }
 
-    pub(crate) fn observe_checkpoint_certification_latency(&self, latency: Duration) {
+    pub fn observe_checkpoint_certification_latency(&self, latency: Duration) {
         self.checkpoint_certification_latency_s
             .observe(latency.as_secs_f64());
     }
 
-    pub(crate) fn observe_end_to_end_latency(&self, latency: Duration) {
+    pub fn observe_end_to_end_latency(&self, latency: Duration) {
         self.end_to_end_latency_s.observe(latency.as_secs_f64());
     }
 

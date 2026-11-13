@@ -34,7 +34,7 @@ const NEW_FUNCTION: &[u8] = include_bytes!("packages/new_function/counter.mv");
 
 /// The counter package's engine, running `substitute` in its place if any.
 fn engine(substitute: Option<&[u8]>) -> MoveEngine {
-    let mut engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
+    let mut engine = MoveEngine::counter();
     if let Some(modules) = substitute {
         let package = engine.packages()[0];
         engine.substitute(package, vec![modules.to_vec()]).unwrap();

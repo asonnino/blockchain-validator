@@ -14,7 +14,7 @@ use checkpoint::certifier::CheckpointCertifier;
 use common::{clock, shared_counters, value};
 use dag::{authority::Authority, context::Ctx, metrics::Metrics};
 use execution::scheduler::SequentialScheduler;
-use move_engine::{COUNTER, CounterWorkload, MoveEngine};
+use move_engine::{CounterWorkload, MoveEngine};
 use rand::{SeedableRng, rngs::StdRng};
 use replica::{
     builder::StorageKind,
@@ -30,10 +30,6 @@ const COMMITTEE_SIZE: usize = 4;
 const TARGET_TRANSACTIONS: u64 = 400;
 /// One quiescence window: long enough for any in-flight block to commit everywhere.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
-
-fn engine() -> MoveEngine {
-    MoveEngine::new(vec![vec![COUNTER.to_vec()]])
-}
 
 /// Every validator's final state.
 type Results = Vec<(SequentialScheduler<MoveEngine>, CheckpointCertifier)>;
@@ -55,7 +51,7 @@ fn run_once(seed: u64) -> (Results, RangeInclusive<u64>) {
         for (index, (node_network, private_config)) in
             node_networks.into_iter().zip(private_configs).enumerate()
         {
-            let engine = engine();
+            let engine = MoveEngine::counter();
             workloads.push(CounterWorkload::new(&engine));
             let authority = Authority::from(index);
             let validator =
@@ -127,7 +123,7 @@ fn validators_converge_on_the_counter_workload() {
     }
 
     // Every validator's stream contends on the shared counters.
-    let shared = shared_counters(&engine());
+    let shared = shared_counters(&MoveEngine::counter());
     assert!(!shared.is_empty());
     for id in &shared {
         assert!(value(store, id) > 0);
