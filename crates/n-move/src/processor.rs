@@ -871,25 +871,26 @@ mod tests {
         let replay = |processor: &mut NVersionProcessor<_>, subdag| {
             processor.process(subdag, Duration::ZERO, &metrics).payloads
         };
-        // Replay decides the creation and releases the update.
+        // Replay decides the creation; the update, the last replayed commit (2), executes.
         let (x, y) = (ObjectId::new(1), ObjectId::new(2));
         let create = execute(FakeTransaction::success(vec![], vec![x], vec![]));
         let first = replay(&mut processor, subdag_at(1, vec![(0, vec![create])]));
         let [Payload::Message(create_vote)] = &first[..] else {
             panic!("one own vote: {first:?}");
         };
+        replay(&mut processor, votes_at(2, create_vote));
         let update = execute(FakeTransaction::success(vec![], vec![], vec![x]));
-        replay(&mut processor, subdag_at(2, vec![(0, vec![update])]));
-        let released = replay(&mut processor, votes_at(3, create_vote));
-        let [Payload::Attest(_), Payload::Message(update_vote)] = &released[..] else {
-            panic!("a checkpoint and the update's vote: {released:?}");
+        let released = replay(&mut processor, subdag_at(3, vec![(0, vec![update])]));
+        let [Payload::Message(update_vote)] = &released[..] else {
+            panic!("the update's vote: {released:?}");
         };
 
-        // The update, from a replayed commit, decides live; only live commits leave records.
+        // The first live commit (3) waits for the update, which decides live: only the live
+        // commit leaves records.
         processor.after_replay();
-        process(&mut processor, votes_at(4, update_vote));
         let create = execute(FakeTransaction::success(vec![], vec![y], vec![]));
-        let live = process(&mut processor, subdag_at(5, vec![(0, vec![create])]));
+        process(&mut processor, subdag_at(4, vec![(0, vec![create])]));
+        let live = process(&mut processor, votes_at(5, update_vote));
         process(&mut processor, votes_at(6, own_votes(&live)[0]));
 
         assert_eq!(processor.executed(), 3);
@@ -902,13 +903,13 @@ mod tests {
         assert_eq!(
             positions,
             [Position {
-                commit: 4,
+                commit: 3,
                 index: 0
             }]
         );
         assert_eq!(records.busy, Duration::from_millis(1));
         let rounds: Vec<_> = records.blocks.iter().map(|block| block.round).collect();
-        assert_eq!(rounds, [4, 4, 4, 5, 6, 6, 6]);
+        assert_eq!(rounds, [4, 5, 5, 5, 6, 6, 6]);
     }
 
     #[test]
