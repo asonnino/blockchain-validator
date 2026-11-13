@@ -111,8 +111,9 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
         // Votes are recorded as they decode, before this sub-dag mints: none can reference its
         // own delivering sub-dag's checkpoint, which only exists once that sub-dag committed.
         let certifier = &mut self.certifier;
-        // Submission stamps reduce to their sum here, while the payloads are in hand.
-        let mut stamp_sum_ms = 0u64;
+        // Submission stamps reduce to their sum here, while the payloads are in hand. Clients
+        // choose them, so the sum holds any number of `u64::MAX` stamps.
+        let mut stamp_sum_ms = 0u128;
         let mut transactions = subdag
             .blocks
             .iter()
@@ -130,7 +131,7 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
                 let stamp_ms = envelope.timestamp_ms();
                 match envelope.into_payload() {
                     Payload::Execute(transaction) => {
-                        stamp_sum_ms += stamp_ms;
+                        stamp_sum_ms += u128::from(stamp_ms);
                         Some(transaction)
                     }
                     // Votes are attributed to the block author: they ride their author's own
@@ -156,7 +157,7 @@ impl<E: ExecutionEngine> SequentialProcessor<E> {
         let minted = (executed > 0).then(|| {
             let timings = CheckpointTimings {
                 minted_at: now,
-                mean_timestamp_ms: stamp_sum_ms / executed as u64,
+                mean_timestamp_ms: (stamp_sum_ms / executed as u128) as u64,
             };
             self.certifier
                 .push(anchor, self.scheduler.store().commitment(), timings)
@@ -495,5 +496,29 @@ mod tests {
         let end_to_end = metrics.end_to_end_latency_s();
         assert_eq!(end_to_end.get_sample_count(), 2);
         assert_eq!(end_to_end.get_sample_sum(), 2.0 + 5.5);
+    }
+
+    #[test]
+    fn checkpoints_take_the_mean_of_any_stamps() {
+        let mut state = state();
+        let metrics = metrics();
+        let execute = |id, stamp_ms| {
+            let create = FakeTransaction::success(vec![], vec![ObjectId::new(id)], vec![]);
+            Envelope::new(stamp_ms, Payload::Execute(create.into())).to_bytes()
+        };
+        let stamped = subdag(vec![execute(1, u64::MAX), execute(2, 1)]);
+        let (_, minted) = state.execute_subdag(&metrics, Duration::ZERO, stamped);
+        let checkpoint = minted.expect("executing sub-dag must mint a checkpoint");
+
+        // Certified 2s after the mean stamp, 2^63 ms.
+        let votes = (0..3)
+            .map(|author| {
+                let vote = Envelope::new(0, Payload::Attest(checkpoint.clone())).to_bytes();
+                (author, vec![vote])
+            })
+            .collect();
+        let now = Duration::from_millis(1 << 63) + Duration::from_secs(2);
+        state.execute_subdag(&metrics, now, subdag_at(2, votes));
+        assert_eq!(metrics.end_to_end_latency_s().get_sample_sum(), 2.0);
     }
 }
