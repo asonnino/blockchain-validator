@@ -135,9 +135,16 @@ impl ExecutionOutput {
         mem::take(&mut self.events)
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn writes(&self) -> &[Object] {
         &self.writes
+    }
+
+    pub fn deletes(&self) -> &[(ObjectId, Version)] {
+        &self.deletes
+    }
+
+    pub fn events(&self) -> &[Event] {
+        &self.events
     }
 
     pub(crate) fn into_changes(self) -> (Vec<Object>, Vec<(ObjectId, Version)>) {

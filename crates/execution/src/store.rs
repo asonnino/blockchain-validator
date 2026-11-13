@@ -107,7 +107,7 @@ impl StateView for InMemoryStore {
 mod tests {
     use crate::{
         crypto::Digest,
-        effects::{AbortReason, ExecutionOutput},
+        effects::{AbortReason, Event, ExecutionOutput},
         object::{Object, ObjectId, Version},
         store::{InMemoryStore, StateView},
     };
@@ -168,6 +168,13 @@ mod tests {
     fn aborted_outputs_cannot_delete() {
         let delete = vec![(ObjectId::new(1), Version::new(1))];
         let _ = ExecutionOutput::aborted(AbortReason::ExplicitAbort).with_deletes(delete);
+    }
+
+    #[test]
+    #[should_panic(expected = "aborts emit nothing")]
+    fn aborted_outputs_cannot_emit() {
+        let events = vec![Event::new(vec![1])];
+        let _ = ExecutionOutput::aborted(AbortReason::ExplicitAbort).with_events(events);
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub(crate) type Hasher = blake2::Blake2b<digest::consts::U32>;
 pub struct Digest([u8; 32]);
 
 impl Digest {
-    pub(crate) fn new(bytes: [u8; 32]) -> Self {
+    pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
