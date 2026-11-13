@@ -33,7 +33,8 @@ use crate::{
 
 /// The simulated time the processor's executions take, reported as [`Processed::busy`]: a
 /// constant per execution plus a cost per unit of gas. Repairs count as executions; ground-truth
-/// runs of the reference engine do not.
+/// runs of the reference engine do not. Costs, like the simulated time they add up to, must fit a
+/// [`Duration`]: processing panics otherwise.
 #[derive(Default)]
 pub struct CostModel {
     pub per_execution: Duration,
@@ -47,10 +48,8 @@ impl CostModel {
             .per_gas
             .as_nanos()
             .saturating_mul(u128::from(output.gas_used()));
-        let gas = u64::try_from(nanos / NANOS_PER_SEC).map_or(Duration::MAX, |secs| {
-            Duration::new(secs, (nanos % NANOS_PER_SEC) as u32)
-        });
-        self.per_execution.saturating_add(gas)
+        let secs = u64::try_from(nanos / NANOS_PER_SEC).expect("costs fit a Duration");
+        self.per_execution + Duration::new(secs, (nanos % NANOS_PER_SEC) as u32)
     }
 }
 
@@ -838,18 +837,13 @@ mod tests {
             per_gas: Duration::from_micros(1),
         };
         assert_eq!(cost.cost(&gas), Duration::from_micros(1500));
-        // Costs beyond 2^64 ns stay exact, up to `Duration::MAX`.
+        // Costs beyond 2^64 ns stay exact.
         let heavy = ExecutionOutput::success(Vec::new()).with_gas_used(20_000_000_000);
         let per_second = CostModel {
             per_execution: Duration::ZERO,
             per_gas: Duration::from_secs(1),
         };
         assert_eq!(per_second.cost(&heavy), Duration::from_secs(20_000_000_000));
-        let unbounded = CostModel {
-            per_execution: Duration::from_secs(1),
-            per_gas: Duration::MAX,
-        };
-        assert_eq!(unbounded.cost(&heavy), Duration::MAX);
     }
 
     #[test]
