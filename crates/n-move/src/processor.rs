@@ -85,7 +85,7 @@ pub struct BlockRecord {
     pub vote_bytes: usize,
 }
 
-/// What a processor measured over its run.
+/// What a processor measured over the commits delivered after replay.
 #[derive(Default, PartialEq, Debug)]
 pub struct Records {
     /// In decision order.
@@ -141,6 +141,10 @@ pub struct NVersionProcessor<E> {
     queue: VecDeque<Queued>,
     /// The commit being decided.
     executing: Option<Vec<Executed>>,
+    /// The first commit delivered after replay, once replay ends.
+    live_from: Option<u64>,
+    /// The decided transactions of replayed commits, which leave no records.
+    replayed: u64,
     records: Records,
 }
 
@@ -184,6 +188,8 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             commits: 0,
             queue: VecDeque::new(),
             executing: None,
+            live_from: None,
+            replayed: 0,
             records: Records::default(),
         })
     }
@@ -244,6 +250,10 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
                 }
                 Decision::Rejected(rejection) => Outcome::Rejected(rejection),
             };
+            if !self.live_from.is_some_and(|first| position.commit >= first) {
+                self.replayed += 1;
+                continue;
+            }
             self.records.transactions.push(TransactionRecord {
                 position,
                 digest: executed.transaction.digest(),
@@ -361,11 +371,13 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
                     }
                 }
             }
-            self.records.blocks.push(BlockRecord {
-                round: block.round(),
-                author,
-                vote_bytes,
-            });
+            if self.live_from.is_some() {
+                self.records.blocks.push(BlockRecord {
+                    round: block.round(),
+                    author,
+                    vote_bytes,
+                });
+            }
         }
         self.decider.record(anchor.round, votes);
         self.queue.push_back(Queued {
@@ -379,10 +391,13 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
         let (mut payloads, mut busy) = (Vec::new(), Duration::ZERO);
         while self.decide(now, &mut busy) {
             if let Some(decided) = self.executing.take() {
-                let stamps = decided.iter().map(|executed| executed.submitted_ms);
+                // Clients choose the stamps, so they sum wide.
+                let stamps = decided
+                    .iter()
+                    .map(|executed| u128::from(executed.submitted_ms));
                 let timings = CheckpointTimings {
                     minted_at: now + busy,
-                    mean_timestamp_ms: stamps.sum::<u64>() / decided.len() as u64,
+                    mean_timestamp_ms: (stamps.sum::<u128>() / decided.len() as u128) as u64,
                 };
                 let commitment = self.store.commitment();
                 let checkpoint = self.certifier.push(anchor, commitment, timings).clone();
@@ -395,13 +410,16 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
                 payloads.extend(self.release(queued, anchor.round, now, &mut busy));
             }
         }
-        self.records.busy += busy;
+        if self.live_from.is_some() {
+            self.records.busy += busy;
+        }
         Processed { payloads, busy }
     }
 
     /// Resubmits the own votes on undecided transactions and the uncertified checkpoints: both
     /// dedupe per author, so the ones that did commit are ignored.
     fn after_replay(&mut self) -> Vec<Payload<Vote>> {
+        self.live_from.get_or_insert(self.commits);
         let pending = self.certifier.pending().cloned().map(Payload::Attest);
         let Some((executing, head)) = self.executing.as_ref().zip(self.decider.head()) else {
             return pending.collect();
@@ -417,7 +435,7 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
     }
 
     fn executed(&self) -> u64 {
-        self.records.transactions.len() as u64
+        self.replayed + self.records.transactions.len() as u64
     }
 
     /// The highest certified commitment equals the final state's.
@@ -528,7 +546,16 @@ mod tests {
         processor_with(|| FakeExecutor)
     }
 
-    fn processor_with<E: ExecutionEngine>(engine: impl Fn() -> E) -> NVersionProcessor<E> {
+    fn processor_with<E: ExecutionEngine + Send + 'static>(
+        engine: impl Fn() -> E,
+    ) -> NVersionProcessor<E> {
+        let mut processor = replaying_with(engine);
+        processor.after_replay();
+        processor
+    }
+
+    /// [`processor_with`], still replaying.
+    fn replaying_with<E: ExecutionEngine>(engine: impl Fn() -> E) -> NVersionProcessor<E> {
         let public_config = PublicReplicaConfig::new_for_tests(4);
         let assignment = (0..4).map(VersionId).collect();
         let engines = (0..4).map(|_| engine()).collect();
@@ -831,6 +858,82 @@ mod tests {
             panic!("a checkpoint: {minted:?}");
         };
         assert_eq!(processor.after_replay(), minted);
+    }
+
+    #[test]
+    fn replayed_commits_count_but_leave_no_records() {
+        let cost = CostModel {
+            per_execution: Duration::from_millis(1),
+            per_gas: Duration::ZERO,
+        };
+        let mut processor = replaying_with(|| FakeExecutor).with_cost(cost);
+        let metrics = ValidatorMetrics::new(&Registry::new());
+        let replay = |processor: &mut NVersionProcessor<_>, subdag| {
+            processor.process(subdag, Duration::ZERO, &metrics).payloads
+        };
+        // Replay decides the creation and releases the update.
+        let (x, y) = (ObjectId::new(1), ObjectId::new(2));
+        let create = execute(FakeTransaction::success(vec![], vec![x], vec![]));
+        let first = replay(&mut processor, subdag_at(1, vec![(0, vec![create])]));
+        let [Payload::Message(create_vote)] = &first[..] else {
+            panic!("one own vote: {first:?}");
+        };
+        let update = execute(FakeTransaction::success(vec![], vec![], vec![x]));
+        replay(&mut processor, subdag_at(2, vec![(0, vec![update])]));
+        let released = replay(&mut processor, votes_at(3, create_vote));
+        let [Payload::Attest(_), Payload::Message(update_vote)] = &released[..] else {
+            panic!("a checkpoint and the update's vote: {released:?}");
+        };
+
+        // The update, from a replayed commit, decides live; only live commits leave records.
+        processor.after_replay();
+        process(&mut processor, votes_at(4, update_vote));
+        let create = execute(FakeTransaction::success(vec![], vec![y], vec![]));
+        let live = process(&mut processor, subdag_at(5, vec![(0, vec![create])]));
+        process(&mut processor, votes_at(6, own_votes(&live)[0]));
+
+        assert_eq!(processor.executed(), 3);
+        let (_, _, records) = processor.into_parts();
+        let positions: Vec<_> = records
+            .transactions
+            .iter()
+            .map(|record| record.position)
+            .collect();
+        assert_eq!(
+            positions,
+            [Position {
+                commit: 4,
+                index: 0
+            }]
+        );
+        assert_eq!(records.busy, Duration::from_millis(1));
+        let rounds: Vec<_> = records.blocks.iter().map(|block| block.round).collect();
+        assert_eq!(rounds, [4, 4, 4, 5, 6, 6, 6]);
+    }
+
+    #[test]
+    fn checkpoints_take_the_mean_of_any_stamps() {
+        let mut processor = processor();
+        let creations = [(1, u64::MAX), (2, 1)].map(|(id, stamp_ms)| {
+            let creation = FakeTransaction::success(vec![], vec![ObjectId::new(id)], vec![]);
+            Envelope::new(stamp_ms, Payload::<Vote>::Execute(creation.into())).to_bytes()
+        });
+        let votes = process(&mut processor, subdag_at(1, vec![(0, creations.into())]));
+        let [first, second] = &own_votes(&votes)[..] else {
+            panic!("two own votes: {votes:?}");
+        };
+        process(&mut processor, votes_at(2, first));
+        let minted = process(&mut processor, votes_at(3, second));
+        let [Payload::Attest(checkpoint)] = &minted[..] else {
+            panic!("a checkpoint: {minted:?}");
+        };
+
+        let (_, mut certifier, _) = processor.into_parts();
+        let anchor = votes_at(4, first).anchor;
+        let timings = (0..3usize).find_map(|author| {
+            certifier.record(anchor, Authority::from(author), checkpoint.clone())
+        });
+        assert_eq!(timings.unwrap().mean_timestamp_ms, 1 << 63);
     }
 
     #[test]
