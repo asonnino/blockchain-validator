@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use execution::{
+    crypto::Digest,
     effects::{AbortReason, Event, ExecutionOutput, FailureDetail},
     engine::ExecutionEngine,
     object::Object,
@@ -21,6 +22,9 @@ use crate::{assignment::VersionId, digest::seeded};
 pub struct Cluster {
     pub versions: Vec<VersionId>,
     pub probability: f64,
+    /// The digests of the only transactions the cluster can be wrong on, or `None` for every
+    /// transaction.
+    pub transactions: Option<Vec<Digest>>,
 }
 
 /// Which versions are wrong on which transactions. Wrongness hashes the seed with the transaction's
@@ -102,6 +106,10 @@ impl SyntheticEngine {
         let clusters = self.config.clusters.iter().enumerate();
         clusters
             .filter(|(_, cluster)| cluster.versions.contains(&self.version))
+            .filter(|(_, cluster)| {
+                let targets = cluster.transactions.as_ref();
+                targets.is_none_or(|targets| targets.contains(&digest))
+            })
             .map(|(index, cluster)| (Tag::cluster(index), cluster.probability))
             .chain([(
                 Tag::version(self.version),
@@ -217,6 +225,7 @@ mod tests {
         config.clusters.push(Cluster {
             versions: vec![VersionId(1), VersionId(2)],
             probability: 1.0,
+            transactions: None,
         });
         let engines = engines(config);
         let (store, transactions) = setup();
@@ -227,6 +236,20 @@ mod tests {
             .collect();
         assert_eq!(digests[1], digests[2]);
         assert!(digests[0] != truth && digests[1] != truth && digests[0] != digests[1]);
+    }
+
+    #[test]
+    fn targeted_clusters_are_wrong_on_their_transactions_only() {
+        let (_, transactions) = setup();
+        let mut config = config(0, vec![0.0]);
+        config.clusters.push(Cluster {
+            versions: vec![VersionId(0)],
+            probability: 1.0,
+            transactions: Some(vec![transactions[1].digest()]),
+        });
+        let outcomes = correct(&engines(config));
+        let wrong: Vec<_> = (0..outcomes.len()).filter(|&i| !outcomes[i][0]).collect();
+        assert_eq!(wrong, [1]);
     }
 
     #[test]

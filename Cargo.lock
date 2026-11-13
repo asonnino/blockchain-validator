@@ -4887,11 +4887,20 @@ name = "n-move"
 version = "0.1.0"
 dependencies = [
  "blake2 0.11.0",
+ "checkpoint",
  "dag",
  "digest 0.11.3",
  "execution",
+ "eyre",
  "fake-engine",
+ "futures",
+ "prometheus",
+ "rand 0.8.7",
+ "replica",
  "serde",
+ "simulator",
+ "tracing",
+ "validator",
 ]
 
 [[package]]

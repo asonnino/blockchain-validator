@@ -18,6 +18,7 @@ pub struct Position {
 /// A validator's vote on a transaction: the digest of the inputs it found and of the result its
 /// version produced.
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct Vote {
     pub position: Position,
     pub input: InputDigest,
