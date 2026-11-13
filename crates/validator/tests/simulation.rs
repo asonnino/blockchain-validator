@@ -335,19 +335,25 @@ fn validators_converge_under_simulation() {
 
 #[test]
 fn simulation_is_deterministic_per_seed() {
-    let delivered = |metrics: &[Arc<ValidatorMetrics>]| -> Vec<u64> {
-        metrics
-            .iter()
-            .map(|metrics| metrics.subdag_execution_latency_s().get_sample_count())
-            .collect()
+    // Latencies come from the simulated clock, so a seed reproduces them exactly.
+    let latencies = |metrics: &[Arc<ValidatorMetrics>]| -> Vec<[(u64, f64); 3]> {
+        let histograms = |metrics: &ValidatorMetrics| {
+            [
+                metrics.subdag_execution_latency_s(),
+                metrics.checkpoint_certification_latency_s(),
+                metrics.end_to_end_latency_s(),
+            ]
+            .map(|histogram| (histogram.get_sample_count(), histogram.get_sample_sum()))
+        };
+        metrics.iter().map(|metrics| histograms(metrics)).collect()
     };
     for seed in [7, 42] {
         let (first, _, first_metrics) = run_once(seed, sequential);
         let (second, _, second_metrics) = run_once(seed, sequential);
         assert_eq!(
-            delivered(&first_metrics),
-            delivered(&second_metrics),
-            "seed {seed} produced diverging delivery counts"
+            latencies(&first_metrics),
+            latencies(&second_metrics),
+            "seed {seed} produced diverging latencies"
         );
         for ((a, a_certifier), (b, b_certifier)) in parts(first).iter().zip(&parts(second)) {
             assert_eq!(
