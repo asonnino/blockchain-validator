@@ -469,7 +469,7 @@ impl<E> NVersionProcessor<E> {
 }
 
 fn millis(time: Duration) -> u64 {
-    time.as_millis() as u64
+    u64::try_from(time.as_millis()).expect("times fit u64 milliseconds")
 }
 
 /// `transaction`'s output under `engine`, failing static verification as the scheduler does.
