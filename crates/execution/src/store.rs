@@ -103,13 +103,59 @@ impl StateView for InMemoryStore {
     }
 }
 
+/// Changes pending over a base view, which reads see first: a commit's effects before they are
+/// final, for instance.
+pub struct Overlay<'v, V> {
+    base: &'v V,
+    /// The latest pending version of each id, with `None` marking a deletion.
+    pending: BTreeMap<ObjectId, (Version, Option<Object>)>,
+}
+
+impl<'v, V: StateView> Overlay<'v, V> {
+    pub fn new(base: &'v V) -> Self {
+        Self {
+            base,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    /// Layers `output`'s writes and deletions over the pending changes; aborted outputs carry
+    /// none.
+    pub fn apply(&mut self, output: &ExecutionOutput) {
+        for object in output.writes() {
+            let copy = Object::new(object.id(), object.version(), object.contents().to_vec());
+            self.pending
+                .insert(object.id(), (object.version(), Some(copy)));
+        }
+        for (id, version) in output.deletes() {
+            self.pending.insert(*id, (*version, None));
+        }
+    }
+}
+
+impl<V: StateView> StateView for Overlay<'_, V> {
+    fn latest(&self, id: &ObjectId) -> Option<&Object> {
+        match self.pending.get(id) {
+            Some((_, object)) => object.as_ref(),
+            None => self.base.latest(id),
+        }
+    }
+
+    fn latest_version(&self, id: &ObjectId) -> Option<Version> {
+        match self.pending.get(id) {
+            Some((version, _)) => Some(*version),
+            None => self.base.latest_version(id),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         crypto::Digest,
         effects::{AbortReason, Event, ExecutionOutput},
         object::{Object, ObjectId, Version},
-        store::{InMemoryStore, StateView},
+        store::{InMemoryStore, Overlay, StateView},
     };
 
     #[test]
@@ -280,6 +326,41 @@ mod tests {
         split.apply(ExecutionOutput::success(vec![second()]));
 
         assert_eq!(batched.commitment(), split.commitment());
+    }
+
+    #[test]
+    fn overlays_read_like_the_store_their_changes_would_make() {
+        let ids = [1, 2, 3, 4].map(ObjectId::new);
+        let genesis = || {
+            let objects = ids[..3]
+                .iter()
+                .map(|id| Object::new(*id, Version::new(1), vec![1]));
+            ExecutionOutput::success(objects.collect())
+        };
+        // Later changes to an id override earlier ones; aborts change nothing.
+        let changes = || {
+            let write = |id, version| Object::new(id, Version::new(version), vec![version as u8]);
+            [
+                ExecutionOutput::success(vec![write(ids[1], 2)])
+                    .with_deletes(vec![(ids[2], Version::new(2))]),
+                ExecutionOutput::aborted(AbortReason::ExplicitAbort),
+                ExecutionOutput::success(vec![write(ids[2], 3)])
+                    .with_deletes(vec![(ids[1], Version::new(3))]),
+            ]
+        };
+        let (mut base, mut expected) = (InMemoryStore::default(), InMemoryStore::default());
+        base.apply(genesis());
+        expected.apply(genesis());
+        changes()
+            .into_iter()
+            .for_each(|change| expected.apply(change));
+
+        let mut overlay = Overlay::new(&base);
+        changes().iter().for_each(|change| overlay.apply(change));
+        for id in &ids {
+            assert_eq!(overlay.latest(id), expected.latest(id));
+            assert_eq!(overlay.latest_version(id), expected.latest_version(id));
+        }
     }
 
     // Commitments are persisted and compared across nodes, so the exact bytes matter: pin them so
