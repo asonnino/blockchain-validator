@@ -42,8 +42,15 @@ pub struct CostModel {
 
 impl CostModel {
     fn cost(&self, output: &ExecutionOutput) -> Duration {
-        let gas_nanos = (self.per_gas.as_nanos() as u64).saturating_mul(output.gas_used());
-        self.per_execution + Duration::from_nanos(gas_nanos)
+        const NANOS_PER_SEC: u128 = 1_000_000_000;
+        let nanos = self
+            .per_gas
+            .as_nanos()
+            .saturating_mul(u128::from(output.gas_used()));
+        let gas = u64::try_from(nanos / NANOS_PER_SEC).map_or(Duration::MAX, |secs| {
+            Duration::new(secs, (nanos % NANOS_PER_SEC) as u32)
+        });
+        self.per_execution.saturating_add(gas)
     }
 }
 
@@ -831,6 +838,18 @@ mod tests {
             per_gas: Duration::from_micros(1),
         };
         assert_eq!(cost.cost(&gas), Duration::from_micros(1500));
+        // Costs beyond 2^64 ns stay exact, up to `Duration::MAX`.
+        let heavy = ExecutionOutput::success(Vec::new()).with_gas_used(20_000_000_000);
+        let per_second = CostModel {
+            per_execution: Duration::ZERO,
+            per_gas: Duration::from_secs(1),
+        };
+        assert_eq!(per_second.cost(&heavy), Duration::from_secs(20_000_000_000));
+        let unbounded = CostModel {
+            per_execution: Duration::from_secs(1),
+            per_gas: Duration::MAX,
+        };
+        assert_eq!(unbounded.cost(&heavy), Duration::MAX);
     }
 
     #[test]
