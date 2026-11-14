@@ -123,4 +123,15 @@ fn outputs_never_overwrite_inputs_or_earlier_runs() {
     let earlier = fs::read(&summary).unwrap();
     assert!(!run(&path, dir.path()).success());
     assert_eq!(fs::read(&summary).unwrap(), earlier);
+
+    // So would another suite, whose copy would no longer describe the earlier runs.
+    let other = dir.path().join("other.yaml");
+    fs::write(
+        &other,
+        "- {name: other, duration_secs: 1, load: {load: 10}}\n",
+    )
+    .unwrap();
+    assert!(!run(&other, dir.path()).success());
+    assert_eq!(fs::read_to_string(&path).unwrap(), suite);
+    assert!(!dir.path().join("other").exists());
 }

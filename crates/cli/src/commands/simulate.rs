@@ -44,45 +44,61 @@ pub async fn simulate(
         .wrap_err_with(|| format!("Failed to read the suite {}", config_path.display()))?;
     let runs = config::parse(&suite)?;
     config::validate(&runs)?;
-    // A rerun would leave the earlier run's files (a larger committee's metrics) beside its own.
-    for (index, run) in runs.iter().enumerate() {
-        let dir = output_dir.join(run.directory(index));
-        ensure!(
-            !dir.exists(),
-            "{} exists: choose another output directory",
-            dir.display()
-        );
-    }
     fs::create_dir_all(&output_dir)
         .wrap_err_with(|| format!("Failed to create {}", output_dir.display()))?;
-    // Written from the text already read: the output directory may hold the suite itself.
-    fs::write(output_dir.join("suite.yaml"), &suite).wrap_err("Failed to copy the suite")?;
+    // The copy describes every run in the directory, so only the same suite may rewrite it (as
+    // when the output directory holds the suite itself).
+    let copy = output_dir.join("suite.yaml");
+    if let Ok(existing) = fs::read_to_string(&copy) {
+        ensure!(
+            existing == suite,
+            "{} holds another suite: choose another output directory",
+            copy.display()
+        );
+    }
+    let mut directories = Vec::with_capacity(runs.len());
+    for (index, run) in runs.iter().enumerate() {
+        match RunDirectory::reserve(output_dir.join(run.directory(index))) {
+            Ok(directory) => directories.push(directory),
+            Err(error) => {
+                for directory in directories {
+                    directory.release()?;
+                }
+                return Err(error.wrap_err("choose another output directory"));
+            }
+        }
+    }
+    fs::write(&copy, &suite).wrap_err("Failed to copy the suite")?;
+
     let total = runs.len();
-    for (index, run) in runs.into_iter().enumerate() {
-        let directory = run.directory(index);
-        println!("[{}/{total}] {directory}", index + 1);
-        let dir = output_dir.join(&directory);
-        tokio::task::spawn_blocking(move || simulate_run(&run, dir))
+    for (index, (run, directory)) in runs.into_iter().zip(directories).enumerate() {
+        let name = run.directory(index);
+        println!("[{}/{total}] {name}", index + 1);
+        tokio::task::spawn_blocking(move || simulate_run(&run, directory))
             .await
             .wrap_err("The simulation panicked")?
-            .wrap_err_with(|| format!("Run {directory} failed"))?;
+            .wrap_err_with(|| format!("Run {name} failed"))?;
     }
     Ok(())
 }
 
-/// Runs a valid `run` with its engine, and writes its outputs into `dir`.
-fn simulate_run(run: &SimulationConfig, dir: PathBuf) -> Result<()> {
+/// Runs a valid `run` with its engine, and writes its outputs into `directory`.
+fn simulate_run(run: &SimulationConfig, directory: RunDirectory) -> Result<()> {
     let engine_config = run.engine_config.clone();
     match run.engine {
-        Engine::Fake => simulate_with(run, FakeConfig::parse(engine_config)?, dir),
+        Engine::Fake => simulate_with(run, FakeConfig::parse(engine_config)?, directory),
         #[cfg(feature = "move")]
-        Engine::Move => simulate_with(run, crate::engines::MoveConfig::parse(engine_config)?, dir),
+        Engine::Move => simulate_with(
+            run,
+            crate::engines::MoveConfig::parse(engine_config)?,
+            directory,
+        ),
         #[cfg(not(feature = "move"))]
         Engine::Move => unreachable!("validation rejects the move engine without the feature"),
     }
 }
 
-fn simulate_with<En>(run: &SimulationConfig, engine: En, dir: PathBuf) -> Result<()>
+fn simulate_with<En>(run: &SimulationConfig, engine: En, directory: RunDirectory) -> Result<()>
 where
     En: ValidatorEngine + Clone + Send + 'static,
 {
@@ -92,7 +108,6 @@ where
         .map(|baseline| runner.run(baseline))
         .transpose()?;
 
-    let directory = RunDirectory::create(dir)?;
     directory.write_config(run)?;
     directory.write_metrics(&simulated)?;
     directory.write_summary(run, &engine, simulated)?;

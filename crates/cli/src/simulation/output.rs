@@ -21,10 +21,19 @@ pub struct RunDirectory {
 }
 
 impl RunDirectory {
-    pub fn create(path: PathBuf) -> Result<Self> {
-        fs::create_dir_all(path.join("metrics"))
+    /// Creates the directory, which must not exist yet: creating it atomically keeps a rerun, or a
+    /// concurrent one, from mixing its files with an earlier run's.
+    pub fn reserve(path: PathBuf) -> Result<Self> {
+        fs::create_dir(&path)
+            .and_then(|()| fs::create_dir(path.join("metrics")))
             .wrap_err_with(|| format!("Failed to create {}", path.display()))?;
         Ok(Self { path })
+    }
+
+    /// Removes the directory before anything wrote to it.
+    pub fn release(self) -> Result<()> {
+        fs::remove_dir_all(&self.path)
+            .wrap_err_with(|| format!("Failed to remove {}", self.path.display()))
     }
 
     /// `config.yaml`: the run with every default filled in, and its provenance.
