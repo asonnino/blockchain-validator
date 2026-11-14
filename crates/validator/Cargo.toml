@@ -16,11 +16,12 @@ prometheus.workspace = true
 rand = { workspace = true, optional = true }
 replica.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 
 [features]
-benchmark = ["dep:humantime-serde", "dep:rand"]
+benchmark = ["dep:humantime-serde", "dep:rand", "dep:serde_json"]
 
 [dev-dependencies]
 checkpoint = { workspace = true, features = ["test-utils"] }

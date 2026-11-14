@@ -16,12 +16,13 @@ use execution::{
     transaction::{FunctionId, Transaction},
     workload::Workload,
 };
+use eyre::ensure;
 use rand::{SeedableRng, rngs::StdRng};
 use replica::client::TransactionClient;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    envelope::{Envelope, MAX_PAYLOAD_SIZE, Payload},
+    envelope::{Envelope, MAX_PAYLOAD_SIZE, NoMessage, Payload},
     metrics::ValidatorMetrics,
 };
 
@@ -63,6 +64,26 @@ impl Default for LoadGeneratorConfig {
 }
 
 impl ImportExport for LoadGeneratorConfig {}
+
+impl LoadGeneratorConfig {
+    /// Checks what the generator needs: a positive load, and envelopes of `transaction_size`
+    /// bytes that hold a transaction and fit a consensus payload.
+    pub fn validate(&self) -> eyre::Result<()> {
+        ensure!(self.load > 0, "load must be positive");
+        let overhead = TransactionGenerator::overhead();
+        ensure!(
+            self.transaction_size > overhead,
+            "transaction_size must be greater than {overhead} bytes"
+        );
+        // Oversized envelopes fail to decode after commit and are silently skipped, so the
+        // generator would exercise nothing downstream.
+        ensure!(
+            self.transaction_size as u64 <= MAX_PAYLOAD_SIZE,
+            "transaction_size must not exceed the {MAX_PAYLOAD_SIZE}-byte payload cap"
+        );
+        Ok(())
+    }
+}
 
 mod load_generator_defaults {
     use std::time::Duration;
@@ -116,8 +137,10 @@ impl TransactionGenerator {
         metrics: Arc<ValidatorMetrics>,
         workload: W,
     ) -> C::JoinHandle<()> {
-        assert!(config.load > 0, "load must be positive");
-        let size = Self::budget::<M>(config.transaction_size);
+        if let Err(error) = config.validate() {
+            panic!("invalid load generator config: {error}");
+        }
+        let size = config.transaction_size - Self::overhead();
         tracing::info!(
             "Starting generator with {} transactions per second, initial delay {:?}",
             config.load,
@@ -139,27 +162,17 @@ impl TransactionGenerator {
         )
     }
 
-    /// The serialized size each transaction may take for its envelope to be exactly
-    /// `transaction_size` bytes — the analog of upstream's fixed raw payload size. Envelope
-    /// overhead is invariant across transactions and timestamps, so one probe suffices.
-    fn budget<M: Serialize>(transaction_size: usize) -> usize {
+    /// The bytes an envelope adds to its transaction, the same for every transaction, timestamp,
+    /// and message type (executions carry no message): a transaction may take `transaction_size`
+    /// minus this for its envelope to be exactly `transaction_size` bytes, the analog of
+    /// upstream's fixed raw payload size.
+    fn overhead() -> usize {
         let probe = Transaction::new(FunctionId::new(0), Vec::new(), Vec::new());
         let probe_size = bincode::serialized_size(&probe).expect("transactions serialize");
-        let overhead = Envelope::<M>::new(0, Payload::Execute(probe))
+        Envelope::<NoMessage>::new(0, Payload::Execute(probe))
             .to_bytes()
             .len()
-            - probe_size as usize;
-        assert!(
-            transaction_size > overhead,
-            "transaction_size must be greater than {overhead} bytes"
-        );
-        // Oversized envelopes fail to decode after commit and are silently skipped, so the
-        // generator would exercise nothing downstream.
-        assert!(
-            transaction_size as u64 <= MAX_PAYLOAD_SIZE,
-            "transaction_size must not exceed the {MAX_PAYLOAD_SIZE}-byte payload cap"
-        );
-        transaction_size - overhead
+            - probe_size as usize
     }
 
     fn fill_batch<M: Serialize, W: Workload>(
@@ -260,7 +273,6 @@ mod tests {
     use fake_engine::FakeWorkload;
 
     use super::*;
-    use crate::envelope::NoMessage;
 
     const TRANSACTION_SIZE: usize = 128;
 
@@ -272,7 +284,7 @@ mod tests {
             namespace: 1,
             counter: 0,
         };
-        let size = TransactionGenerator::budget::<NoMessage>(TRANSACTION_SIZE);
+        let size = TRANSACTION_SIZE - TransactionGenerator::overhead();
         let batch = TransactionGenerator::fill_batch::<NoMessage, _>(&mut stream, 1234, 10, size);
         let mut ids = Vec::with_capacity(batch.len());
         for transaction in batch {
