@@ -6,6 +6,8 @@
 //! Glue in the spirit of sui-node: builds the consensus replica and feeds its committed
 //! sub-dags to a commit processor.
 
+#[cfg(feature = "benchmark")]
+pub mod engine;
 pub mod envelope;
 #[cfg(any(test, feature = "benchmark"))]
 pub mod generator;

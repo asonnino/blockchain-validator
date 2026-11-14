@@ -18,7 +18,6 @@ use execution::{
 };
 use move_core_types::{ident_str, language_storage::ModuleId, vm_status::StatusCode};
 use move_engine::{
-    COUNTER,
     MoveArgument::{self, Object},
     MoveCall, MoveEngine, MoveFailure,
 };
@@ -29,7 +28,7 @@ use sui_types::{
 };
 
 fn scheduler() -> (SequentialScheduler<MoveEngine>, ObjectID) {
-    let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
+    let engine = MoveEngine::counter();
     let package = engine.packages()[0];
     (SequentialScheduler::new(engine), package)
 }
@@ -201,7 +200,7 @@ fn malformed_calls_fail_without_writing() {
 
 #[test]
 fn shared_counters_honour_read_only_access() {
-    let engine = MoveEngine::new(vec![vec![COUNTER.to_vec()]]);
+    let engine = MoveEngine::counter();
     let (package, id) = (engine.packages()[0], shared_counters(&engine)[0]);
     let mut scheduler = SequentialScheduler::new(engine);
     let write = vec![(id, AccessMode::ReadWrite)];
