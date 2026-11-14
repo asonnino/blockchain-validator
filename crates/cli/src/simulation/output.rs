@@ -3,9 +3,13 @@
 
 //! A run's outputs, in the layout pinned in MystenLabs/n-version-move#17.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Write},
+    path::PathBuf,
+};
 
-use eyre::{Context, Result};
+use eyre::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use validator::{engine::Engine, processor::CommitProcessor};
@@ -14,6 +18,59 @@ use crate::simulation::{
     config::{self, SimulationConfig},
     runner::Run,
 };
+
+/// A suite's output directory: its copy of the suite, and one directory per run.
+pub struct SuiteDirectory {
+    path: PathBuf,
+}
+
+impl SuiteDirectory {
+    pub fn create(path: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&path)
+            .wrap_err_with(|| format!("Failed to create {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    /// Claims the directory for `suite`, whose runs are `runs`: writes the suite's copy unless the
+    /// same suite is already there (as when the directory holds it), then reserves every run's
+    /// directory. Both claims are atomic, so a concurrent invocation fails rather than mixing its
+    /// outputs in, and a failed claim undoes the others.
+    pub fn claim(&self, suite: &str, runs: &[SimulationConfig]) -> Result<Vec<RunDirectory>> {
+        let copy = self.path.join("suite.yaml");
+        let created = match OpenOptions::new().write(true).create_new(true).open(&copy) {
+            Ok(mut file) => {
+                file.write_all(suite.as_bytes())?;
+                true
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let existing = fs::read_to_string(&copy)?;
+                ensure!(
+                    existing == suite,
+                    "{} holds another suite: choose another output directory",
+                    copy.display()
+                );
+                false
+            }
+            Err(error) => return Err(error).wrap_err("Failed to copy the suite"),
+        };
+        let mut directories = Vec::with_capacity(runs.len());
+        for (index, run) in runs.iter().enumerate() {
+            match RunDirectory::reserve(self.path.join(run.directory(index))) {
+                Ok(directory) => directories.push(directory),
+                Err(error) => {
+                    for directory in directories {
+                        directory.release()?;
+                    }
+                    if created {
+                        fs::remove_file(&copy)?;
+                    }
+                    return Err(error.wrap_err("choose another output directory"));
+                }
+            }
+        }
+        Ok(directories)
+    }
+}
 
 /// A run's output directory.
 pub struct RunDirectory {
@@ -31,7 +88,7 @@ impl RunDirectory {
     }
 
     /// Removes the directory before anything wrote to it.
-    pub fn release(self) -> Result<()> {
+    fn release(self) -> Result<()> {
         fs::remove_dir_all(&self.path)
             .wrap_err_with(|| format!("Failed to remove {}", self.path.display()))
     }
@@ -216,7 +273,10 @@ impl Percentiles {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{Percentiles, Summary};
+    use std::fs;
+
+    use super::{Percentiles, SuiteDirectory, Summary};
+    use crate::simulation::config::SimulationConfig;
 
     #[test]
     fn percentiles_take_the_nearest_rank() {
@@ -259,5 +319,25 @@ mod tests {
                 "latency_ms": {"executed": {"p50": 2}, "decided": {"p50": 3}},
             })
         );
+    }
+
+    #[test]
+    fn failed_claims_undo_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = |name: &str| SimulationConfig {
+            name: Some(name.into()),
+            ..SimulationConfig::default()
+        };
+        let runs = [named("a"), named("b")];
+        fs::create_dir(dir.path().join("b")).unwrap();
+        let suite = SuiteDirectory::create(dir.path().to_path_buf()).unwrap();
+        assert!(suite.claim("runs a and b", &runs).is_err());
+        assert!(!dir.path().join("suite.yaml").exists());
+        assert!(!dir.path().join("a").exists());
+
+        fs::remove_dir(dir.path().join("b")).unwrap();
+        assert_eq!(suite.claim("runs a and b", &runs).unwrap().len(), 2);
+        let content = fs::read_to_string(dir.path().join("suite.yaml")).unwrap();
+        assert_eq!(content, "runs a and b");
     }
 }

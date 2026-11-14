@@ -317,10 +317,13 @@ fn measurements_name(
     name + ".yaml"
 }
 
-/// A short, stable hash of an engine config.
+/// A stable hash of an engine config, wide enough (128 bits) that distinct configs don't collide.
 fn fingerprint(engine_config: &str) -> String {
     let hash = Blake2s256::digest(engine_config.as_bytes());
-    hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+    hash[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -347,5 +350,10 @@ mod tests {
         let full = name(Engine::Fake, Some("update_share: 1.0\n"));
         assert!(half.starts_with("measurements-p-") && half.ends_with(".yaml"));
         assert_ne!(half, full);
+        // Their 32-bit hashes collide.
+        assert_ne!(
+            name(Engine::Fake, Some("update_share: 0.1602\n")),
+            name(Engine::Fake, Some("update_share: 0.202106\n"))
+        );
     }
 }
