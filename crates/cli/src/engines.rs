@@ -12,7 +12,10 @@ use fake_engine::{FakeExecutor, FakeWorkload};
 use replica::config::PublicReplicaConfig;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use validator::{engine::Engine as ValidatorEngine, processor::SequentialProcessor};
+use validator::{
+    engine::Engine as ValidatorEngine, generator::LoadGeneratorConfig,
+    processor::SequentialProcessor,
+};
 
 #[derive(Clone, Copy, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,6 +34,17 @@ impl Engine {
             Self::Fake => FakeConfig::load_or_default(Some(path))?.to_yaml(),
             Self::Move => MoveConfig::load_or_default(Some(path))?.to_yaml(),
         })
+    }
+
+    /// Checks that `load` suits the workload of the engine configured by `value`.
+    pub fn validate_load(self, value: Option<Value>, load: &LoadGeneratorConfig) -> Result<()> {
+        match self {
+            Self::Fake => load.validate(&FakeConfig::parse(value)?.workload()),
+            #[cfg(feature = "move")]
+            Self::Move => load.validate(&MoveConfig::parse(value)?.workload()),
+            #[cfg(not(feature = "move"))]
+            Self::Move => eyre::bail!("the move engine needs a build with the `move` feature"),
+        }
     }
 
     /// The engine's config in `value` (the defaults without one), validated and re-serialized.

@@ -121,7 +121,15 @@ impl Runner {
                 SimulatorContext::abort(generator);
             }
             // Queued transactions keep committing after the generators stop: wait until every
-            // validator holds the same executed count for a whole window.
+            // validator executed every counted submission, then holds the same count for a whole
+            // window (a batch the abort interrupted may be submitted but uncounted).
+            let submitted = validators
+                .iter()
+                .map(|v| v.metrics().submitted_transactions().get())
+                .sum();
+            for validator in &mut validators {
+                within(validator.wait_for_transactions(submitted)).await?;
+            }
             loop {
                 let target = validators.iter().map(|v| v.executed()).max().unwrap_or(0);
                 for validator in &mut validators {
@@ -224,23 +232,26 @@ impl<P: CommitProcessor> CommitProcessor for Timed<P> {
         now: Duration,
         metrics: &ValidatorMetrics,
     ) -> Processed<P::Message> {
-        let now_ms = now.as_millis() as u64;
         // Engine messages don't decode without their type, which leaves the executions.
         let payloads = subdag.blocks.iter().flat_map(|block| block.transactions());
-        for payload in payloads {
-            let Ok(envelope) = Envelope::<NoMessage>::from_bytes(payload.as_bytes()) else {
-                continue;
-            };
-            let submitted_ms = envelope.timestamp_ms();
-            if let Payload::Execute(_) = envelope.into_payload() {
-                self.timings
-                    .latencies_ms
-                    .push(now_ms.saturating_sub(submitted_ms));
-                self.timings.last_ms = now_ms;
-            }
-        }
+        let submitted_ms: Vec<_> = payloads
+            .filter_map(|payload| Envelope::<NoMessage>::from_bytes(payload.as_bytes()).ok())
+            .filter_map(|envelope| {
+                let submitted_ms = envelope.timestamp_ms();
+                matches!(envelope.into_payload(), Payload::Execute(_)).then_some(submitted_ms)
+            })
+            .collect();
         let processed = self.inner.process(subdag, now, metrics);
         self.timings.busy += processed.busy;
+        // The processor is done once its busy time is over.
+        let done_ms = (now + processed.busy).as_millis() as u64;
+        let latencies = submitted_ms
+            .iter()
+            .map(|submitted| done_ms.saturating_sub(*submitted));
+        self.timings.latencies_ms.extend(latencies);
+        if !submitted_ms.is_empty() {
+            self.timings.last_ms = done_ms;
+        }
         processed
     }
 
@@ -362,7 +373,13 @@ mod tests {
                 .all(|timings| timings.busy.is_zero())
         );
         assert!(Baseline::of(FakeConfig::default()).is_none());
-        // `Timed` records exactly the executions.
+        // `Timed` records exactly the executions, once their processing is done.
+        let fastest = slow
+            .timings
+            .iter()
+            .flat_map(|timings| &timings.latencies_ms)
+            .min();
+        assert!(*fastest.unwrap() >= BUSY.as_millis() as u64);
         for run in [&slow.timings, &baseline.timings] {
             for (timings, processor) in run.iter().zip(&slow.processors) {
                 assert_eq!(timings.latencies_ms.len() as u64, processor.executed());

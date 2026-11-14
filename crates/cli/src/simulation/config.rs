@@ -15,8 +15,7 @@ use validator::generator::LoadGeneratorConfig;
 
 use crate::engines::Engine;
 
-/// Half a generator tick (100 ms): no tick then lands on the stop, a whole number of seconds in,
-/// so runs over the same workload submit the same transactions.
+/// Half a generator tick (100 ms): no tick then lands on the stop, a whole number of seconds in.
 const GENERATOR_OFFSET: Duration = Duration::from_millis(50);
 
 pub fn load(path: &Path) -> Result<Vec<SimulationConfig>> {
@@ -29,6 +28,11 @@ fn parse(suite: &str) -> Result<Vec<SimulationConfig>> {
     let deserializer = serde_yaml::Deserializer::from_str(suite);
     serde_yaml::with::singleton_map_recursive::deserialize(deserializer)
         .wrap_err("Failed to parse the suite")
+}
+
+/// A suite of one run with every default.
+pub fn default_suite() -> Result<String> {
+    to_yaml(&[SimulationConfig::default().resolved()?])
 }
 
 /// `value` in the suite format.
@@ -105,14 +109,9 @@ impl SimulationConfig {
         ensure!(self.committee_size > 0, "a committee has validators");
         ensure!(self.duration_secs > 0, "a run submits for some time");
         self.latency.validate()?;
-        self.load_generator().validate()?;
-        #[cfg(not(feature = "move"))]
-        ensure!(
-            !matches!(self.engine, Engine::Move),
-            "the move engine needs a build with the `move` feature"
-        );
-        self.engine.resolved_config(self.engine_config.clone())?;
-        Ok(())
+        let engine_config = self.engine_config.clone();
+        self.engine
+            .validate_load(engine_config, &self.load_generator())
     }
 
     /// Every validator's load generator.
@@ -169,7 +168,7 @@ mod tests {
         );
         let yaml = to_yaml(&runs).unwrap();
         assert_eq!(to_yaml(&parse(&yaml).unwrap()).unwrap(), yaml);
-        let default = to_yaml(&vec![SimulationConfig::default().resolved().unwrap()]).unwrap();
+        let default = super::default_suite().unwrap();
         assert_eq!(to_yaml(&parse(&default).unwrap()).unwrap(), default);
     }
 
@@ -183,6 +182,7 @@ mod tests {
             "- {engine_config: {update_share: 2}}",
             "- {engine_config: {updates: 1}}",
             "- {load: {transaction_size: 1}}",
+            "- {load: {transaction_size: 13}}",
             "- {load: {transaction_size: 2000000}}",
             "- {latency: {uniform: {range_ms: {start: 100, end: 50}}}}",
             "- {name: a}\n- {name: a}",

@@ -29,10 +29,7 @@ pub async fn simulate(
         dump_config,
     } = args;
     if dump_config {
-        print!(
-            "{}",
-            config::to_yaml(&SimulationConfig::default().resolved()?)?
-        );
+        print!("{}", config::default_suite()?);
         return Ok(());
     }
     let (Some(config_path), Some(output_dir)) = (config_path, output_dir) else {

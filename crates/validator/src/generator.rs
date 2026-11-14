@@ -67,13 +67,13 @@ impl ImportExport for LoadGeneratorConfig {}
 
 impl LoadGeneratorConfig {
     /// Checks what the generator needs: a positive load, and envelopes of `transaction_size`
-    /// bytes that hold a transaction and fit a consensus payload.
-    pub fn validate(&self) -> eyre::Result<()> {
+    /// bytes that hold one of `workload`'s transactions and fit a consensus payload.
+    pub fn validate(&self, workload: &impl Workload) -> eyre::Result<()> {
         ensure!(self.load > 0, "load must be positive");
-        let overhead = TransactionGenerator::overhead();
+        let smallest = TransactionGenerator::overhead() + workload.min_size();
         ensure!(
-            self.transaction_size > overhead,
-            "transaction_size must be greater than {overhead} bytes"
+            self.transaction_size >= smallest,
+            "transaction_size must be at least {smallest} bytes for this workload"
         );
         // Oversized envelopes fail to decode after commit and are silently skipped, so the
         // generator would exercise nothing downstream.
@@ -137,7 +137,7 @@ impl TransactionGenerator {
         metrics: Arc<ValidatorMetrics>,
         workload: W,
     ) -> C::JoinHandle<()> {
-        if let Err(error) = config.validate() {
+        if let Err(error) = config.validate(&workload) {
             panic!("invalid load generator config: {error}");
         }
         let size = config.transaction_size - Self::overhead();
