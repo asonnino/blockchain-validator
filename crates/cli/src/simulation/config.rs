@@ -5,9 +5,10 @@
 //! the fields it omits. Enums are single-key maps, as in mysticeti's suites:
 //! `latency: {uniform: {range_ms: {start: 50, end: 100}}}`.
 
-use std::{collections::HashSet, fs, path::Path, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use eyre::{Context, Result, bail, ensure};
+use replica::config::PublicReplicaConfig;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use simulator::{ExponentialJitter, LatencyModel};
@@ -18,13 +19,7 @@ use crate::engines::Engine;
 /// Half a generator tick (100 ms): no tick then lands on the stop, a whole number of seconds in.
 const GENERATOR_OFFSET: Duration = Duration::from_millis(50);
 
-pub fn load(path: &Path) -> Result<Vec<SimulationConfig>> {
-    let suite = fs::read_to_string(path)
-        .wrap_err_with(|| format!("Failed to read the suite {}", path.display()))?;
-    parse(&suite)
-}
-
-fn parse(suite: &str) -> Result<Vec<SimulationConfig>> {
+pub fn parse(suite: &str) -> Result<Vec<SimulationConfig>> {
     let deserializer = serde_yaml::Deserializer::from_str(suite);
     serde_yaml::with::singleton_map_recursive::deserialize(deserializer)
         .wrap_err("Failed to parse the suite")
@@ -106,7 +101,14 @@ impl SimulationConfig {
                 "run names use letters, digits, '-', and '_'"
             );
         }
-        ensure!(self.committee_size > 0, "a committee has validators");
+        // Mysticeti's committees hold at most 128 authorities (`Committee::new` asserts it).
+        ensure!(
+            (1..=128).contains(&self.committee_size),
+            "committees have 1 to 128 validators"
+        );
+        let public_config = PublicReplicaConfig::new_for_tests(self.committee_size);
+        let committee = public_config.committee();
+        public_config.parameters.consensus.to_protocol(&committee)?;
         ensure!(self.duration_secs > 0, "a run submits for some time");
         self.latency.validate()?;
         let engine_config = self.engine_config.clone();
@@ -179,6 +181,8 @@ mod tests {
             "- {duration_secs: 0}",
             "- {load: {load: 0}}",
             "- {committee_size: 0}",
+            "- {committee_size: 1}",
+            "- {committee_size: 129}",
             "- {engine_config: {update_share: 2}}",
             "- {engine_config: {updates: 1}}",
             "- {load: {transaction_size: 1}}",

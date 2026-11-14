@@ -3,7 +3,7 @@
 
 use std::{fs, path::PathBuf};
 
-use eyre::{Context, Result};
+use eyre::{Context, Result, ensure};
 use tracing_subscriber::filter::LevelFilter;
 use validator::engine::Engine as ValidatorEngine;
 
@@ -40,11 +40,23 @@ pub async fn simulate(
         .with_log_file(log_file)
         .setup()?;
 
-    let runs = config::load(&config_path)?;
+    let suite = fs::read_to_string(&config_path)
+        .wrap_err_with(|| format!("Failed to read the suite {}", config_path.display()))?;
+    let runs = config::parse(&suite)?;
     config::validate(&runs)?;
+    // A rerun would leave the earlier run's files (a larger committee's metrics) beside its own.
+    for (index, run) in runs.iter().enumerate() {
+        let dir = output_dir.join(run.directory(index));
+        ensure!(
+            !dir.exists(),
+            "{} exists: choose another output directory",
+            dir.display()
+        );
+    }
     fs::create_dir_all(&output_dir)
         .wrap_err_with(|| format!("Failed to create {}", output_dir.display()))?;
-    fs::copy(&config_path, output_dir.join("suite.yaml")).wrap_err("Failed to copy the suite")?;
+    // Written from the text already read: the output directory may hold the suite itself.
+    fs::write(output_dir.join("suite.yaml"), &suite).wrap_err("Failed to copy the suite")?;
     let total = runs.len();
     for (index, run) in runs.into_iter().enumerate() {
         let directory = run.directory(index);

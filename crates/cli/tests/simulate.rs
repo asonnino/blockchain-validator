@@ -24,12 +24,16 @@ const SUITE: &str = "
 fn simulate(suite: &str, dir: &Path) -> ExitStatus {
     let path = dir.join("suite.yaml");
     fs::write(&path, suite).unwrap();
+    run(&path, &dir.join("out"))
+}
+
+fn run(suite: &Path, output: &Path) -> ExitStatus {
     Command::new(env!("CARGO_BIN_EXE_validator"))
         .arg("simulate")
         .arg("--config-path")
-        .arg(&path)
+        .arg(suite)
         .arg("--output-dir")
-        .arg(dir.join("out"))
+        .arg(output)
         .status()
         .unwrap()
 }
@@ -102,4 +106,21 @@ fn invalid_suites_run_nothing() {
     let suite = "- {name: fine, duration_secs: 1}\n- {duration_secs: 0}\n";
     assert!(!simulate(suite, dir.path()).success());
     assert!(!dir.path().join("out").exists());
+}
+
+#[test]
+fn outputs_never_overwrite_inputs_or_earlier_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let suite = "- {name: once, duration_secs: 1, load: {load: 10}}\n";
+    // The output directory may hold the suite itself.
+    let path = dir.path().join("suite.yaml");
+    fs::write(&path, suite).unwrap();
+    assert!(run(&path, dir.path()).success());
+    assert_eq!(fs::read_to_string(&path).unwrap(), suite);
+
+    // Rerunning into it would mix the earlier run's files with the new ones.
+    let summary = dir.path().join("once").join("summary.json");
+    let earlier = fs::read(&summary).unwrap();
+    assert!(!run(&path, dir.path()).success());
+    assert_eq!(fs::read(&summary).unwrap(), earlier);
 }
