@@ -143,8 +143,38 @@ pub enum RemoteTestbedCommand {
         #[arg(long, value_enum, default_value_t = Engine::Fake)]
         engine: Engine,
 
-        /// Path to the engine's parameters (YAML); the engine's defaults if omitted.
-        #[arg(long, value_name = "FILE")]
+        /// Path to the engine's parameters (YAML); the engine's defaults if omitted. Genesis
+        /// uploads it, so it can't be combined with `--skip-testbed-configuration`.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with = "skip_testbed_configuration"
+        )]
         engine_config_path: Option<PathBuf>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Args;
+
+    #[test]
+    fn engine_configs_need_the_testbed_configuration() {
+        let benchmark = |extra: &[&str]| {
+            let args = [
+                "validator",
+                "remote-testbed",
+                "--settings-path",
+                "settings.yml",
+                "benchmark",
+                "--engine-config-path",
+                "engine.yaml",
+            ];
+            Args::try_parse_from(args.iter().chain(extra))
+        };
+        assert!(benchmark(&[]).is_ok());
+        assert!(benchmark(&["--skip-testbed-configuration"]).is_err());
+    }
 }
