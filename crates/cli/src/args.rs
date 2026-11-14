@@ -37,6 +37,10 @@ pub enum Command {
     /// Run a single validator from config files.
     Run(RunArgs),
 
+    /// Run suites of whole committees under the discrete-event simulator, one output directory
+    /// per run.
+    Simulate(SimulateArgs),
+
     /// Manage a remote (cloud) testbed of validators and run benchmarks on it.
     ///
     /// Requires a settings file describing the cloud provider, regions, and repository to
@@ -78,6 +82,19 @@ pub struct RunArgs {
     /// Path to the engine's parameters (YAML); the engine's defaults if omitted.
     #[arg(long, value_name = "FILE")]
     pub engine_config_path: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+pub struct SimulateArgs {
+    /// Path to the suite (YAML): a list of runs, each falling back to the defaults.
+    #[arg(long, value_name = "FILE", required_unless_present = "dump_config")]
+    pub config_path: Option<PathBuf>,
+    /// Directory for the suite's copy and each run's outputs.
+    #[arg(long, value_name = "DIR", required_unless_present = "dump_config")]
+    pub output_dir: Option<PathBuf>,
+    /// Print a run with every default and exit.
+    #[arg(long, conflicts_with_all = ["config_path", "output_dir"])]
+    pub dump_config: bool,
 }
 
 #[derive(clap::Args)]

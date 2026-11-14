@@ -20,4 +20,9 @@ pub trait Workload: Send + 'static {
         size: usize,
         rng: &mut StdRng,
     ) -> Transaction;
+
+    /// The smallest `size` target the workload accepts.
+    fn min_size(&self) -> usize {
+        0
+    }
 }

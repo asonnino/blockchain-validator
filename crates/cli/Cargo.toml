@@ -16,11 +16,16 @@ dag.workspace = true
 execution.workspace = true
 eyre.workspace = true
 fake-engine.workspace = true
+futures.workspace = true
 move-engine = { workspace = true, optional = true }
 orchestrator.workspace = true
+prometheus.workspace = true
+rand.workspace = true
 replica.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
+simulator.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing.workspace = true
 tracing-appender.workspace = true
@@ -28,7 +33,6 @@ tracing-subscriber.workspace = true
 validator = { workspace = true, features = ["benchmark"] }
 
 [dev-dependencies]
-rand.workspace = true
 tempfile.workspace = true
 
 [features]

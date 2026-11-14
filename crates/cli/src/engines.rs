@@ -11,11 +11,17 @@ use eyre::{Context, Result, ensure};
 use fake_engine::{FakeExecutor, FakeWorkload};
 use replica::config::PublicReplicaConfig;
 use serde::{Deserialize, Serialize};
-use validator::{engine::Engine as ValidatorEngine, processor::SequentialProcessor};
+use serde_yaml::Value;
+use validator::{
+    engine::Engine as ValidatorEngine, generator::LoadGeneratorConfig,
+    processor::SequentialProcessor,
+};
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Engine {
     /// Creates and updates opaque objects, ignoring the call arguments.
+    #[default]
     Fake,
     /// Runs the bundled counter Move package through Sui's execution layer.
     Move,
@@ -29,12 +35,43 @@ impl Engine {
             Self::Move => MoveConfig::load_or_default(Some(path))?.to_yaml(),
         })
     }
+
+    /// Checks that `load` suits the workload of the engine configured by `value`.
+    pub fn validate_load(self, value: Option<Value>, load: &LoadGeneratorConfig) -> Result<()> {
+        match self {
+            Self::Fake => load.validate(&FakeConfig::parse(value)?.workload()),
+            #[cfg(feature = "move")]
+            Self::Move => load.validate(&MoveConfig::parse(value)?.workload()),
+            #[cfg(not(feature = "move"))]
+            Self::Move => eyre::bail!("the move engine needs a build with the `move` feature"),
+        }
+    }
+
+    /// The engine's config in `value` (the defaults without one), validated and re-serialized.
+    pub fn resolved_config(self, value: Option<Value>) -> Result<Value> {
+        Ok(match self {
+            Self::Fake => serde_yaml::to_value(FakeConfig::parse(value)?)?,
+            Self::Move => serde_yaml::to_value(MoveConfig::parse(value)?)?,
+        })
+    }
 }
 
 /// An engine's parameters, as an `--engine-config-path` file holds them.
 pub trait EngineConfig: ImportExport + Default {
     fn validate(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// The config in `value`, or the defaults without one.
+    fn parse(value: Option<Value>) -> Result<Self> {
+        let config = match value {
+            Some(value) => {
+                serde_yaml::from_value(value).wrap_err("Failed to parse the engine config")?
+            }
+            None => Self::default(),
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// The config at `path`, or the defaults without one.
@@ -50,7 +87,7 @@ pub trait EngineConfig: ImportExport + Default {
 }
 
 /// The fake engine's parameters.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct FakeConfig {
     /// The share of transactions updating a recent creation rather than creating an object.
@@ -73,6 +110,7 @@ impl EngineConfig for FakeConfig {
 impl ValidatorEngine for FakeConfig {
     type Processor = SequentialProcessor<FakeExecutor>;
     type Workload = FakeWorkload;
+    type Reference = FakeExecutor;
 
     fn processor(
         &self,
@@ -88,7 +126,7 @@ impl ValidatorEngine for FakeConfig {
 }
 
 /// The Move engine's parameters: none yet.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct MoveConfig {}
 
@@ -100,6 +138,7 @@ impl EngineConfig for MoveConfig {}
 impl ValidatorEngine for MoveConfig {
     type Processor = SequentialProcessor<move_engine::MoveEngine>;
     type Workload = move_engine::CounterWorkload;
+    type Reference = move_engine::MoveEngine;
 
     fn processor(
         &self,
