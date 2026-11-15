@@ -4,3 +4,4 @@
 pub mod genesis;
 pub mod remote_testbed;
 pub mod run;
+pub mod simulate;

@@ -57,6 +57,8 @@ impl CommitProcessor for Mute {
     }
 }
 
+// Todo: flakes on an `AddrInUse` panic in mysticeti's connection setup until
+// asonnino/mysticeti#343 lands; drop this at the next rev bump.
 #[tokio::test]
 async fn restarted_committee_recovers_execution_state() {
     let dir = tempfile::tempdir().expect("temporary directory");

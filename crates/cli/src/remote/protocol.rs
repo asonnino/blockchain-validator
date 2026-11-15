@@ -23,10 +23,11 @@ use replica::config::{PublicReplicaConfig, ReplicaParameters};
 use serde::{Deserialize, Serialize};
 use validator::generator::LoadGeneratorConfig;
 
-use crate::args::Engine;
+use crate::engines::Engine;
 
 const PUBLIC_REPLICA_CONFIG_FILENAME: &str = PublicReplicaConfig::DEFAULT_FILENAME;
 const LOAD_GENERATOR_CONFIG_FILENAME: &str = LoadGeneratorConfig::DEFAULT_FILENAME;
+const ENGINE_CONFIG_FILENAME: &str = "engine-config.yaml";
 
 /// The replica parameters distributed to every validator. The `Debug` output keys the
 /// benchmark's measurement files, so it must stay short and filesystem-safe.
@@ -75,13 +76,16 @@ impl ProtocolParameters for ClientParameters {}
 pub struct ValidatorProtocol {
     working_dir: PathBuf,
     engine: Engine,
+    /// The engine's parameters as YAML, uploaded at genesis; the engine's defaults if `None`.
+    engine_config: Option<String>,
 }
 
 impl ValidatorProtocol {
-    pub fn new(settings: &Settings, engine: Engine) -> Self {
+    pub fn new(settings: &Settings, engine: Engine, engine_config: Option<String>) -> Self {
         Self {
             working_dir: settings.working_dir.clone(),
             engine,
+            engine_config,
         }
     }
 }
@@ -141,12 +145,20 @@ impl ProtocolCommands for ValidatorProtocol {
         ]
         .join(" ");
 
+        let upload_engine_config = self.engine_config.as_ref().map(|engine_config| {
+            let path = self.working_dir.join(ENGINE_CONFIG_FILENAME);
+            format!("echo -e '{engine_config}' > {}", path.display())
+        });
+
         [
             "source $HOME/.cargo/env",
             &upload_replica_parameters,
             &upload_load_generator_config,
-            &genesis,
         ]
+        .into_iter()
+        .chain(upload_engine_config.as_deref())
+        .chain([genesis.as_str()])
+        .collect::<Vec<_>>()
         .join(" && ")
     }
 
@@ -182,6 +194,10 @@ impl ProtocolCommands for ValidatorProtocol {
                     format!("--private-config-path {}", private_config_path.display()),
                     format!("--engine {}", engine.get_name()),
                 ];
+                if self.engine_config.is_some() {
+                    let path = self.working_dir.join(ENGINE_CONFIG_FILENAME);
+                    run.push(format!("--engine-config-path {}", path.display()));
+                }
                 if load > 0 {
                     run.push(format!(
                         "--load-generator-config-path {}",
@@ -307,38 +323,75 @@ mod tests {
         settings::Settings,
     };
 
-    use super::{ClientParameters, NodeParameters, ValidatorProtocol};
-    use crate::args::{Args, Command, Engine};
+    use super::{ClientParameters, ENGINE_CONFIG_FILENAME, NodeParameters, ValidatorProtocol};
+    use crate::{
+        args::{Args, Command},
+        engines::Engine,
+    };
+
+    // Todo: use `Instance::new_for_test` once it leaves `cfg(test)` (asonnino/mysticeti#225).
+    fn instance() -> Instance {
+        serde_yaml::from_str(
+            "{id: '0', region: '', main_ip: 127.0.0.1, tags: [], specs: '', status: Active}",
+        )
+        .unwrap()
+    }
+
+    fn parameters(load: usize) -> BenchmarkParameters<NodeParameters, ClientParameters> {
+        BenchmarkParameters {
+            settings: Settings::default(),
+            node_parameters: NodeParameters::default(),
+            client_parameters: ClientParameters::default(),
+            nodes: 4,
+            load,
+        }
+    }
 
     #[test]
     fn validators_parse_their_node_commands() {
-        // Todo: use `Instance::new_for_test` once it leaves `cfg(test)` (asonnino/mysticeti#225).
-        let instance: Instance = serde_yaml::from_str(
-            "{id: '0', region: '', main_ip: 127.0.0.1, tags: [], specs: '', status: Active}",
-        )
-        .unwrap();
-        let protocol = ValidatorProtocol::new(&Settings::default(), Engine::Move);
-        // Below one transaction per node, validators run without a load generator.
-        for (load, generates) in [(400, true), (3, false)] {
-            let parameters = BenchmarkParameters {
-                settings: Settings::default(),
-                node_parameters: NodeParameters::default(),
-                client_parameters: ClientParameters::default(),
-                nodes: 4,
-                load,
-            };
-            let commands = protocol.node_command(vec![instance.clone(); 4], &parameters);
-            assert_eq!(commands.len(), 4);
-            for (i, (_, command)) in commands.into_iter().enumerate() {
-                let run = command.rsplit(" && ").next().unwrap();
-                let parsed = Args::try_parse_from(run.split_whitespace()).unwrap();
-                let Command::Run(args) = parsed.command else {
-                    panic!("not a run command: {run}");
-                };
-                assert_eq!(args.authority, Authority::from(i));
-                assert!(matches!(args.engine, Engine::Move));
-                assert_eq!(args.load_generator_config_path.is_some(), generates);
+        let uploaded = Settings::default().working_dir.join(ENGINE_CONFIG_FILENAME);
+        for engine_config in [None, Some("update_share: 0.5\n".to_string())] {
+            let configured = engine_config.is_some();
+            let protocol =
+                ValidatorProtocol::new(&Settings::default(), Engine::Move, engine_config);
+            // Below one transaction per node, validators run without a load generator.
+            for (load, generates) in [(400, true), (3, false)] {
+                let commands = protocol.node_command(vec![instance(); 4], &parameters(load));
+                assert_eq!(commands.len(), 4);
+                for (i, (_, command)) in commands.into_iter().enumerate() {
+                    let run = command.rsplit(" && ").next().unwrap();
+                    let parsed = Args::try_parse_from(run.split_whitespace()).unwrap();
+                    let Command::Run(args) = parsed.command else {
+                        panic!("not a run command: {run}");
+                    };
+                    assert_eq!(args.authority, Authority::from(i));
+                    assert!(matches!(args.engine, Engine::Move));
+                    assert_eq!(args.load_generator_config_path.is_some(), generates);
+                    let expected = configured.then(|| uploaded.clone());
+                    assert_eq!(args.engine_config_path, expected);
+                }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn genesis_uploads_the_engine_parameters() {
+        let engine_config = "update_share: 0.5\n";
+        let protocol = ValidatorProtocol::new(
+            &Settings::default(),
+            Engine::Fake,
+            Some(engine_config.to_string()),
+        );
+        let instances = vec![instance(); 4];
+        let genesis = protocol
+            .genesis_command(instances.iter(), &parameters(400))
+            .await;
+        // Where `node_command` points `--engine-config-path`.
+        let uploaded = Settings::default().working_dir.join(ENGINE_CONFIG_FILENAME);
+        let upload = format!("echo -e '{engine_config}' > {}", uploaded.display());
+        assert!(
+            genesis.split(" && ").any(|step| step == upload),
+            "{genesis}"
+        );
     }
 }

@@ -77,7 +77,12 @@ impl<C: ServerProviderClient + Display> RemoteTestbedDriver<C> {
                 skip_testbed_update,
                 skip_testbed_configuration,
                 engine,
+                engine_config_path,
             } => {
+                // Validated here, before anything deploys.
+                let engine_config = engine_config_path
+                    .map(|path| engine.normalized_config(&path))
+                    .transpose()?;
                 let instances = self.testbed.instances();
                 let setup_commands = self
                     .testbed
@@ -85,7 +90,7 @@ impl<C: ServerProviderClient + Display> RemoteTestbedDriver<C> {
                     .await
                     .wrap_err("Failed to load testbed setup commands")?;
                 let username = self.testbed.username().to_string();
-                RemoteBenchmarkDriver::new(self.settings, username, engine)
+                RemoteBenchmarkDriver::new(self.settings, username, engine, engine_config)
                     .benchmark(
                         instances,
                         setup_commands,

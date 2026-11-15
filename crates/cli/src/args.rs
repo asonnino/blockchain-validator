@@ -3,9 +3,11 @@
 
 use std::{net::IpAddr, path::PathBuf};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use dag::authority::Authority;
 use tracing_subscriber::filter::LevelFilter;
+
+use crate::engines::Engine;
 
 /// Blockchain validator: a mysticeti consensus replica composed with execution and
 /// self-certifying checkpoints.
@@ -34,6 +36,10 @@ pub enum Command {
 
     /// Run a single validator from config files.
     Run(RunArgs),
+
+    /// Run suites of whole committees under the discrete-event simulator, one output directory
+    /// per run.
+    Simulate(SimulateArgs),
 
     /// Manage a remote (cloud) testbed of validators and run benchmarks on it.
     ///
@@ -73,14 +79,22 @@ pub struct RunArgs {
     /// Execution engine; the load generator submits the engine's own workload.
     #[arg(long, value_enum, default_value_t = Engine::Fake)]
     pub engine: Engine,
+    /// Path to the engine's parameters (YAML); the engine's defaults if omitted.
+    #[arg(long, value_name = "FILE")]
+    pub engine_config_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-pub enum Engine {
-    /// Creates and updates opaque objects, ignoring the call arguments.
-    Fake,
-    /// Runs the bundled counter Move package through Sui's execution layer.
-    Move,
+#[derive(clap::Args)]
+pub struct SimulateArgs {
+    /// Path to the suite (YAML): a list of runs, each falling back to the defaults.
+    #[arg(long, value_name = "FILE", required_unless_present = "dump_config")]
+    pub config_path: Option<PathBuf>,
+    /// Directory for the suite's copy and each run's outputs.
+    #[arg(long, value_name = "DIR", required_unless_present = "dump_config")]
+    pub output_dir: Option<PathBuf>,
+    /// Print a run with every default and exit.
+    #[arg(long, conflicts_with_all = ["config_path", "output_dir"])]
+    pub dump_config: bool,
 }
 
 #[derive(clap::Args)]
@@ -145,5 +159,39 @@ pub enum RemoteTestbedCommand {
         /// Execution engine the validators run.
         #[arg(long, value_enum, default_value_t = Engine::Fake)]
         engine: Engine,
+
+        /// Path to the engine's parameters (YAML); the engine's defaults if omitted. Genesis
+        /// uploads it, so it can't be combined with `--skip-testbed-configuration`.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with = "skip_testbed_configuration"
+        )]
+        engine_config_path: Option<PathBuf>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Args;
+
+    #[test]
+    fn engine_configs_need_the_testbed_configuration() {
+        let benchmark = |extra: &[&str]| {
+            let args = [
+                "validator",
+                "remote-testbed",
+                "--settings-path",
+                "settings.yml",
+                "benchmark",
+                "--engine-config-path",
+                "engine.yaml",
+            ];
+            Args::try_parse_from(args.iter().chain(extra))
+        };
+        assert!(benchmark(&[]).is_ok());
+        assert!(benchmark(&["--skip-testbed-configuration"]).is_err());
+    }
 }

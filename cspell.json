@@ -23,6 +23,7 @@
         "Deque",
         "dorny",
         "fixint",
+        "hexdigit",
         "humantime",
         "impls",
         "lamport",

@@ -89,6 +89,10 @@ impl Workload for FakeWorkload {
         self.recent.push_back(id);
         Self::creation(id, padding)
     }
+
+    fn min_size(&self) -> usize {
+        self.overhead + 1
+    }
 }
 
 #[cfg(test)]
