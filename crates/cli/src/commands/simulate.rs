@@ -4,6 +4,7 @@
 use std::{fs, path::PathBuf};
 
 use eyre::{Context, Result};
+use n_move::NMoveConfig;
 use tracing_subscriber::filter::LevelFilter;
 use validator::engine::Engine as ValidatorEngine;
 
@@ -71,6 +72,11 @@ fn simulate_run(run: &SimulationConfig, directory: RunDirectory) -> Result<()> {
         ),
         #[cfg(not(feature = "move"))]
         Engine::Move => unreachable!("validation rejects the move engine without the feature"),
+        // Reports need every validator's records.
+        Engine::NMove => {
+            let engine = NMoveConfig::parse(engine_config)?.recording();
+            simulate_with(run, engine, directory)
+        }
     }
 }
 

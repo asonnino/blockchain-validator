@@ -9,6 +9,7 @@ use clap::ValueEnum;
 use dag::{authority::Authority, config::ImportExport};
 use eyre::{Context, Result, ensure};
 use fake_engine::{FakeExecutor, FakeWorkload};
+use n_move::NMoveConfig;
 use replica::config::PublicReplicaConfig;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -25,6 +26,9 @@ pub enum Engine {
     Fake,
     /// Runs the bundled counter Move package through Sui's execution layer.
     Move,
+    /// Runs several synthetic versions of the fake engine, whose validators vote on each
+    /// transaction's result through consensus.
+    NMove,
 }
 
 impl Engine {
@@ -33,6 +37,7 @@ impl Engine {
         Ok(match self {
             Self::Fake => FakeConfig::load_or_default(Some(path))?.to_yaml(),
             Self::Move => MoveConfig::load_or_default(Some(path))?.to_yaml(),
+            Self::NMove => NMoveConfig::load_or_default(Some(path))?.to_yaml(),
         })
     }
 
@@ -49,6 +54,7 @@ impl Engine {
             Self::Move => MoveConfig::parse(value)?.validate_run(load, public_config),
             #[cfg(not(feature = "move"))]
             Self::Move => eyre::bail!("the move engine needs a build with the `move` feature"),
+            Self::NMove => NMoveConfig::parse(value)?.validate_run(load, public_config),
         }
     }
 
@@ -57,6 +63,7 @@ impl Engine {
         Ok(match self {
             Self::Fake => serde_yaml::to_value(FakeConfig::parse(value)?)?,
             Self::Move => serde_yaml::to_value(MoveConfig::parse(value)?)?,
+            Self::NMove => serde_yaml::to_value(NMoveConfig::parse(value)?)?,
         })
     }
 }
@@ -156,6 +163,12 @@ impl ValidatorEngine for MoveConfig {
     /// Derived from an engine of its own: every engine publishes the same genesis.
     fn workload(&self) -> Self::Workload {
         move_engine::CounterWorkload::new(&move_engine::MoveEngine::counter())
+    }
+}
+
+impl EngineConfig for NMoveConfig {
+    fn validate(&self) -> Result<()> {
+        NMoveConfig::validate(self)
     }
 }
 

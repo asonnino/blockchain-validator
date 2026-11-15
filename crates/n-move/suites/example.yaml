@@ -1,0 +1,18 @@
+# An n-move suite for `validator simulate`: one run per entry, each falling back to the defaults
+# (`validator simulate --dump-config`) for the fields it omits. The n-move parameters under
+# `engine_config` are documented on `n_move::NMoveConfig`.
+#
+#   cargo run -- simulate --config-path crates/n-move/suites/example.yaml --output-dir results
+- name: all-correct
+  duration_secs: 10
+  engine: n-move
+- name: one-wrong-version
+  duration_secs: 10
+  engine: n-move
+  engine_config:
+    clusters:
+      - versions: [0]
+        probability: 0.5
+    cost:
+      per_execution_us: 100
+    update_share: 0.5

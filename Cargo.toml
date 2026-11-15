@@ -22,6 +22,7 @@ checkpoint = { path = "crates/checkpoint" }
 execution = { path = "crates/execution" }
 fake-engine = { path = "crates/fake-engine" }
 move-engine = { path = "crates/move-engine" }
+n-move = { path = "crates/n-move" }
 validator = { path = "crates/validator" }
 
 bincode = "1.3.3"

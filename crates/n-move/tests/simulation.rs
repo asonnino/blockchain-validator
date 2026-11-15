@@ -78,7 +78,8 @@ fn run(seed: u64, config: SyntheticConfig, batches: Vec<Vec<Transaction>>) -> Re
             .with_cost(CostModel {
                 per_execution: EXECUTION,
                 per_gas: Duration::ZERO,
-            });
+            })
+            .with_records();
             let validator = ValidatorBuilder::with_processor(
                 processor,
                 authority,

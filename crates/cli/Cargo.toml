@@ -18,6 +18,7 @@ eyre.workspace = true
 fake-engine.workspace = true
 futures.workspace = true
 move-engine = { workspace = true, optional = true }
+n-move.workspace = true
 orchestrator.workspace = true
 prometheus.workspace = true
 rand.workspace = true
