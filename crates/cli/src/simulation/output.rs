@@ -4,12 +4,12 @@
 //! A run's outputs, in the layout pinned in MystenLabs/n-version-move#17.
 
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{ErrorKind, Write},
     path::PathBuf,
 };
 
-use eyre::{Context, Result, ensure};
+use eyre::{Context, Result, bail, ensure};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use validator::{engine::Engine, processor::CommitProcessor};
@@ -33,13 +33,24 @@ impl SuiteDirectory {
 
     /// Claims the directory for `suite`, whose runs are `runs`: writes the suite's copy unless the
     /// same suite is already there (as when the directory holds it), then reserves every run's
-    /// directory. Both claims are atomic, so a concurrent invocation fails rather than mixing its
-    /// outputs in, and a failed claim undoes the others.
+    /// directory, undoing everything on failure. Claims hold an exclusive lock on the directory,
+    /// so a concurrent one fails rather than interleaving; the lock dies with the process.
     pub fn claim(&self, suite: &str, runs: &[SimulationConfig]) -> Result<Vec<RunDirectory>> {
+        let lock = File::open(&self.path)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                bail!("another invocation is claiming {}", self.path.display())
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
         let copy = self.path.join("suite.yaml");
         let created = match OpenOptions::new().write(true).create_new(true).open(&copy) {
             Ok(mut file) => {
-                file.write_all(suite.as_bytes())?;
+                if let Err(error) = file.write_all(suite.as_bytes()) {
+                    fs::remove_file(&copy)?;
+                    return Err(error).wrap_err("Failed to copy the suite");
+                }
                 true
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
@@ -271,9 +282,9 @@ impl Percentiles {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
+    use std::fs::{self, File};
 
-    use std::fs;
+    use serde_json::{Value, json};
 
     use super::{Percentiles, SuiteDirectory, Summary};
     use crate::simulation::config::SimulationConfig;
@@ -336,6 +347,12 @@ mod tests {
         assert!(!dir.path().join("a").exists());
 
         fs::remove_dir(dir.path().join("b")).unwrap();
+        // A concurrent claim holds the directory: this one can't interleave with it.
+        let concurrent = File::open(dir.path()).unwrap();
+        concurrent.lock().unwrap();
+        assert!(suite.claim("runs a and b", &runs).is_err());
+        assert!(!dir.path().join("suite.yaml").exists());
+        concurrent.unlock().unwrap();
         assert_eq!(suite.claim("runs a and b", &runs).unwrap().len(), 2);
         let content = fs::read_to_string(dir.path().join("suite.yaml")).unwrap();
         assert_eq!(content, "runs a and b");
