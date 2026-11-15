@@ -3,7 +3,7 @@
 
 use std::{fs, path::PathBuf};
 
-use eyre::{Context, Result, ensure};
+use eyre::{Context, Result};
 use tracing_subscriber::filter::LevelFilter;
 use validator::engine::Engine as ValidatorEngine;
 
@@ -12,7 +12,7 @@ use crate::{
     engines::{Engine, EngineConfig, FakeConfig},
     simulation::{
         config::{self, SimulationConfig},
-        output::RunDirectory,
+        output::{RunDirectory, SuiteDirectory},
         runner::{Baseline, Runner},
     },
     tracing::ValidatorTracing,
@@ -44,31 +44,7 @@ pub async fn simulate(
         .wrap_err_with(|| format!("Failed to read the suite {}", config_path.display()))?;
     let runs = config::parse(&suite)?;
     config::validate(&runs)?;
-    fs::create_dir_all(&output_dir)
-        .wrap_err_with(|| format!("Failed to create {}", output_dir.display()))?;
-    // The copy describes every run in the directory, so only the same suite may rewrite it (as
-    // when the output directory holds the suite itself).
-    let copy = output_dir.join("suite.yaml");
-    if let Ok(existing) = fs::read_to_string(&copy) {
-        ensure!(
-            existing == suite,
-            "{} holds another suite: choose another output directory",
-            copy.display()
-        );
-    }
-    let mut directories = Vec::with_capacity(runs.len());
-    for (index, run) in runs.iter().enumerate() {
-        match RunDirectory::reserve(output_dir.join(run.directory(index))) {
-            Ok(directory) => directories.push(directory),
-            Err(error) => {
-                for directory in directories {
-                    directory.release()?;
-                }
-                return Err(error.wrap_err("choose another output directory"));
-            }
-        }
-    }
-    fs::write(&copy, &suite).wrap_err("Failed to copy the suite")?;
+    let directories = SuiteDirectory::create(output_dir)?.claim(&suite, &runs)?;
 
     let total = runs.len();
     for (index, (run, directory)) in runs.into_iter().zip(directories).enumerate() {
