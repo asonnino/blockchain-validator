@@ -113,7 +113,7 @@ impl SimulationConfig {
         self.latency.validate()?;
         let engine_config = self.engine_config.clone();
         self.engine
-            .validate_load(engine_config, &self.load_generator())
+            .validate_run(engine_config, &self.load_generator(), &public_config)
     }
 
     /// Every validator's load generator.

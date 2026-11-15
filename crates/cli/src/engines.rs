@@ -36,12 +36,17 @@ impl Engine {
         })
     }
 
-    /// Checks that `load` suits the workload of the engine configured by `value`.
-    pub fn validate_load(self, value: Option<Value>, load: &LoadGeneratorConfig) -> Result<()> {
+    /// Checks the engine configured by `value` can run `load` on `public_config`'s committee.
+    pub fn validate_run(
+        self,
+        value: Option<Value>,
+        load: &LoadGeneratorConfig,
+        public_config: &PublicReplicaConfig,
+    ) -> Result<()> {
         match self {
-            Self::Fake => load.validate(&FakeConfig::parse(value)?.workload()),
+            Self::Fake => FakeConfig::parse(value)?.validate_run(load, public_config),
             #[cfg(feature = "move")]
-            Self::Move => load.validate(&MoveConfig::parse(value)?.workload()),
+            Self::Move => MoveConfig::parse(value)?.validate_run(load, public_config),
             #[cfg(not(feature = "move"))]
             Self::Move => eyre::bail!("the move engine needs a build with the `move` feature"),
         }
