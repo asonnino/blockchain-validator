@@ -7,7 +7,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use dag::{authority::Authority, committee::Stake, config::ImportExport};
-use eyre::{Result, ensure};
+use eyre::{Result, ensure, eyre};
 use fake_engine::{FakeExecutor, FakeWorkload};
 use replica::config::PublicReplicaConfig;
 use serde::{Deserialize, Serialize};
@@ -78,12 +78,15 @@ impl NMoveConfig {
         }
     }
 
-    /// The stake a result needs.
-    pub fn threshold(&self) -> Stake {
+    /// The stake a result needs, unless a rule's arithmetic overflows.
+    pub fn threshold(&self) -> Option<Stake> {
+        let (faults, wrong) = (self.faults, self.wrong);
         match self.threshold {
-            Threshold::T(stake) => stake,
-            Threshold::Rule(Rule::SimpleMajority) => self.faults + self.wrong + 1,
-            Threshold::Rule(Rule::HonestMajority) => 2 * self.faults + self.wrong + 1,
+            Threshold::T(stake) => Some(stake),
+            Threshold::Rule(Rule::SimpleMajority) => faults.checked_add(wrong)?.checked_add(1),
+            Threshold::Rule(Rule::HonestMajority) => {
+                faults.checked_mul(2)?.checked_add(wrong)?.checked_add(1)
+            }
         }
     }
 
@@ -152,11 +155,12 @@ impl Engine for NMoveConfig {
             committee.len()
         );
         self.validate_versions(versions)?;
-        let threshold = self.threshold();
-        ensure!(
-            (1..=committee.total_stake()).contains(&threshold),
-            "threshold {threshold} is out of the committee's reach"
-        );
+        let reach = 1..=committee.total_stake();
+        let threshold = self
+            .threshold()
+            .filter(|threshold| reach.contains(threshold));
+        let threshold =
+            threshold.ok_or_else(|| eyre!("the threshold is out of the committee's reach"))?;
 
         let synthetic = Arc::new(self.synthetic(versions));
         let engines = (0..versions)
@@ -268,9 +272,14 @@ mod tests {
     fn thresholds_take_a_stake_or_a_rule() {
         let threshold =
             |form| config(&format!("{{faults: 2, wrong: 1, threshold: {form}}}")).threshold();
-        assert_eq!(threshold("{t: 3}"), 3);
-        assert_eq!(threshold("{rule: simple_majority}"), 4);
-        assert_eq!(threshold("{rule: honest_majority}"), 6);
+        assert_eq!(threshold("{t: 3}"), Some(3));
+        assert_eq!(threshold("{rule: simple_majority}"), Some(4));
+        assert_eq!(threshold("{rule: honest_majority}"), Some(6));
+        // Overflowing rules have no threshold, rather than a wrapped one.
+        let honest = config("{faults: 9223372036854775808}");
+        assert_eq!(honest.threshold(), None);
+        let simple = config("{faults: 18446744073709551615, threshold: {rule: simple_majority}}");
+        assert_eq!(simple.threshold(), None);
     }
 
     #[test]
@@ -303,6 +312,7 @@ mod tests {
             "{threshold: {t: 5}}",
             "{threshold: {t: 0}}",
             "{faults: 2}",
+            "{faults: 9223372036854775808}",
             // One version per validator, unless set.
             "{failure: [0.0, 0.0, 0.0, 0.0, 0.0]}",
             "{clusters: [{versions: [4], probability: 1.0}]}",
