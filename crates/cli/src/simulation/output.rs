@@ -92,9 +92,7 @@ impl RunDirectory {
     /// Creates the directory, which must not exist yet: creating it atomically keeps a rerun, or a
     /// concurrent one, from mixing its files with an earlier run's.
     pub fn reserve(path: PathBuf) -> Result<Self> {
-        fs::create_dir(&path)
-            .and_then(|()| fs::create_dir(path.join("metrics")))
-            .wrap_err_with(|| format!("Failed to create {}", path.display()))?;
+        fs::create_dir(&path).wrap_err_with(|| format!("Failed to create {}", path.display()))?;
         Ok(Self { path })
     }
 
@@ -121,6 +119,7 @@ impl RunDirectory {
 
     /// `metrics/<authority>.prom`.
     pub fn write_metrics<P>(&self, run: &Run<P>) -> Result<()> {
+        fs::create_dir(self.path.join("metrics"))?;
         for (authority, text) in run.metrics.iter().enumerate() {
             self.write(&format!("metrics/{authority}.prom"), text)?;
         }
