@@ -15,8 +15,10 @@ eyre.workspace = true
 fake-engine.workspace = true
 replica.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
 tracing.workspace = true
-validator.workspace = true
+validator = { workspace = true, features = ["benchmark"] }
 
 [dev-dependencies]
 fake-engine = { workspace = true, features = ["test-utils"] }

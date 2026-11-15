@@ -149,8 +149,10 @@ pub struct NVersionProcessor<E> {
     executing: Option<Vec<Executed>>,
     /// The first commit delivered after replay, once replay ends.
     live_from: Option<u64>,
-    /// The decided transactions of replayed commits, which leave no records.
-    replayed: u64,
+    /// Every decided transaction, recorded or not.
+    decided: u64,
+    /// Whether to keep [`Records`], which grow with every transaction.
+    recording: bool,
     records: Records,
 }
 
@@ -195,7 +197,8 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             queue: VecDeque::new(),
             executing: None,
             live_from: None,
-            replayed: 0,
+            decided: 0,
+            recording: false,
             records: Records::default(),
         })
     }
@@ -203,6 +206,20 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
     pub fn with_cost(mut self, cost: CostModel) -> Self {
         self.cost = cost;
         self
+    }
+
+    pub fn with_records(mut self) -> Self {
+        self.recording = true;
+        self
+    }
+
+    pub fn version(&self) -> VersionId {
+        self.version
+    }
+
+    /// Whether to record what happens now: records cover only the commits delivered after replay.
+    fn records_live(&self) -> bool {
+        self.recording && self.live_from.is_some()
     }
 
     /// The final state, the checkpoint certifier, and the records.
@@ -256,8 +273,9 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
                 }
                 Decision::Rejected(rejection) => Outcome::Rejected(rejection),
             };
-            if !self.live_from.is_some_and(|first| position.commit >= first) {
-                self.replayed += 1;
+            self.decided += 1;
+            let live = self.live_from.is_some_and(|first| position.commit >= first);
+            if !self.recording || !live {
                 continue;
             }
             self.records.transactions.push(TransactionRecord {
@@ -344,7 +362,7 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
         &mut self,
         mut subdag: CommittedSubDag,
         now: Duration,
-        _metrics: &ValidatorMetrics,
+        metrics: &ValidatorMetrics,
     ) -> Processed<Vote> {
         let anchor = subdag.anchor;
         let info = CommitInfo {
@@ -366,7 +384,12 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
                 match envelope.into_payload() {
                     Payload::Execute(transaction) => transactions.push((transaction, submitted_ms)),
                     Payload::Attest(checkpoint) => {
-                        self.certifier.record(anchor, author, checkpoint);
+                        if let Some(timings) = self.certifier.record(anchor, author, checkpoint) {
+                            let minted = now.saturating_sub(timings.minted_at);
+                            metrics.observe_checkpoint_certification_latency(minted);
+                            let submitted = Duration::from_millis(timings.mean_timestamp_ms);
+                            metrics.observe_end_to_end_latency(now.saturating_sub(submitted));
+                        }
                     }
                     Payload::Message(vote) => {
                         vote_bytes += bytes.len();
@@ -377,7 +400,7 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
                     }
                 }
             }
-            if self.live_from.is_some() {
+            if self.records_live() {
                 self.records.blocks.push(BlockRecord {
                     round: block.round(),
                     author,
@@ -416,7 +439,7 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
                 payloads.extend(self.release(queued, anchor.round, now, &mut busy));
             }
         }
-        if self.live_from.is_some() {
+        if self.records_live() {
             self.records.busy += busy;
         }
         Processed { payloads, busy }
@@ -441,7 +464,7 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
     }
 
     fn executed(&self) -> u64 {
-        self.replayed + self.records.transactions.len() as u64
+        self.decided
     }
 
     /// The highest certified commitment equals the final state's.
@@ -539,7 +562,7 @@ mod tests {
         processor::CommitProcessor,
     };
 
-    use super::{CostModel, NVersionProcessor, Outcome, repair};
+    use super::{CostModel, NVersionProcessor, Outcome, Records, repair};
     use crate::{
         assignment::VersionId,
         digest::ResultDigest,
@@ -562,6 +585,11 @@ mod tests {
 
     /// [`processor_with`], still replaying.
     fn replaying_with<E: ExecutionEngine>(engine: impl Fn() -> E) -> NVersionProcessor<E> {
+        unrecorded_with(engine).with_records()
+    }
+
+    /// [`replaying_with`], keeping no records.
+    fn unrecorded_with<E: ExecutionEngine>(engine: impl Fn() -> E) -> NVersionProcessor<E> {
         let public_config = PublicReplicaConfig::new_for_tests(4);
         let assignment = (0..4).map(VersionId).collect();
         let engines = (0..4).map(|_| engine()).collect();
@@ -948,6 +976,56 @@ mod tests {
             certifier.record(anchor, Authority::from(author), checkpoint.clone())
         });
         assert_eq!(timings.unwrap().mean_timestamp_ms, 1 << 63);
+    }
+
+    #[test]
+    fn without_records_decisions_still_count() {
+        let mut processor = unrecorded_with(|| FakeExecutor);
+        processor.after_replay();
+        let create = execute(FakeTransaction::success(
+            vec![],
+            vec![ObjectId::new(1)],
+            vec![],
+        ));
+        let first = process(&mut processor, subdag_at(1, vec![(0, vec![create])]));
+        let [Payload::Message(vote)] = &first[..] else {
+            panic!("one own vote: {first:?}");
+        };
+        process(&mut processor, votes_at(2, vote));
+        assert_eq!(processor.executed(), 1);
+        assert_eq!(processor.into_parts().2, Records::default());
+    }
+
+    #[test]
+    fn certified_checkpoints_feed_the_latency_metrics() {
+        let mut processor = processor();
+        let creation = FakeTransaction::success(vec![], vec![ObjectId::new(1)], vec![]);
+        let create = Envelope::new(500, Payload::<Vote>::Execute(creation.into())).to_bytes();
+        let first = process(&mut processor, subdag_at(1, vec![(0, vec![create])]));
+        let [Payload::Message(vote)] = &first[..] else {
+            panic!("one own vote: {first:?}");
+        };
+        let minted = process(&mut processor, votes_at(2, vote));
+        let [Payload::Attest(checkpoint)] = &minted[..] else {
+            panic!("a checkpoint: {minted:?}");
+        };
+
+        // A quorum of attestations certifies it.
+        let metrics = ValidatorMetrics::new(&Registry::new());
+        let attestations = (1..4)
+            .map(|author| {
+                let attestation = Payload::<Vote>::Attest(checkpoint.clone());
+                (author, vec![Envelope::new(0, attestation).to_bytes()])
+            })
+            .collect();
+        processor.process(subdag_at(3, attestations), Duration::from_secs(3), &metrics);
+        // Minted at 2 s and certified at 3 s, for a transaction submitted at 0.5 s.
+        let certification = metrics.checkpoint_certification_latency_s();
+        assert_eq!(certification.get_sample_count(), 1);
+        assert_eq!(certification.get_sample_sum(), 1.0);
+        let end_to_end = metrics.end_to_end_latency_s();
+        assert_eq!(end_to_end.get_sample_count(), 1);
+        assert_eq!(end_to_end.get_sample_sum(), 2.5);
     }
 
     #[test]

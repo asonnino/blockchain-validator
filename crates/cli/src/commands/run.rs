@@ -5,6 +5,7 @@ use std::{fs, path::PathBuf};
 
 use dag::{authority::Authority, config::ImportExport, context::TokioCtx};
 use eyre::{Result, WrapErr, eyre};
+use n_move::NMoveConfig;
 use replica::{
     config::{PrivateReplicaConfig, PublicReplicaConfig},
     prometheus::{MetricsRegistry, PrometheusServer},
@@ -73,6 +74,16 @@ pub async fn run(
         }
         #[cfg(not(feature = "move"))]
         Engine::Move => Err(eyre!("--engine move needs a build with the `move` feature")),
+        Engine::NMove => {
+            run_with(
+                NMoveConfig::load_or_default(config_path)?,
+                authority,
+                public_config,
+                private_config,
+                load_generator_config,
+            )
+            .await
+        }
     }
 }
 
