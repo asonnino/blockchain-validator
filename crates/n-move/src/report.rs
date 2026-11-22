@@ -1,7 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! n-move's records of a simulated run, in the layout pinned in MystenLabs/n-version-move#17.
+//! What validators record of a run, and the files and summary n-move makes of a simulated one, in
+//! the layout pinned in MystenLabs/n-version-move#17.
 
 use std::{
     fs::File,
@@ -10,17 +11,79 @@ use std::{
     time::Duration,
 };
 
-use execution::engine::ExecutionEngine;
+use dag::authority::Authority;
+use execution::{crypto::Digest, engine::ExecutionEngine};
 use eyre::{Context, Result};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    assignment::VersionId,
-    decision::Rejection,
-    engine::NMoveConfig,
-    processor::{NVersionProcessor, Outcome, Records, TransactionRecord},
+    config::NMoveConfig, decision::Rejection, processor::NVersionProcessor, versions::VersionId,
+    vote::Position,
 };
+
+/// How a transaction ended, against the reference engine's result on the decided state.
+#[derive(PartialEq, Debug)]
+pub enum Outcome {
+    FinalCorrect,
+    FinalWrong,
+    Rejected(Rejection),
+}
+
+impl Outcome {
+    /// The outcome and, for rejections, the reason, as the outputs name them.
+    fn names(&self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::FinalCorrect => ("final_correct", None),
+            Self::FinalWrong => ("final_wrong", None),
+            Self::Rejected(Rejection::Impossible) => ("rejected", Some("impossible")),
+            Self::Rejected(Rejection::Cutoff) => ("rejected", Some("cutoff")),
+            Self::Rejected(Rejection::EarlierTransaction) => {
+                ("rejected", Some("earlier_transaction"))
+            }
+        }
+    }
+}
+
+/// One transaction as this validator saw it. Times are milliseconds since the epoch on the
+/// validator's clock; processing time counts from the sub-dag that triggered it.
+#[derive(PartialEq, Debug)]
+pub struct TransactionRecord {
+    pub position: Position,
+    pub digest: Digest,
+    pub submitted_ms: u64,
+    pub committed_ms: u64,
+    pub executed_ms: u64,
+    /// When the own vote committed, unless the transaction was decided before.
+    pub voted_ms: Option<u64>,
+    pub decided_ms: u64,
+    pub outcome: Outcome,
+    /// The own result lost.
+    pub lost: bool,
+    /// The own execution ran on inputs an earlier decision changed.
+    pub lost_to_earlier: bool,
+    pub repairs: u32,
+    /// The own execution's gas.
+    pub gas_used: u64,
+}
+
+/// The bytes of n-move votes a committed block carries.
+#[derive(PartialEq, Debug)]
+pub struct BlockRecord {
+    pub round: u64,
+    pub author: Authority,
+    pub vote_bytes: usize,
+}
+
+/// What a processor measured over the commits delivered after replay.
+#[derive(Default, PartialEq, Debug)]
+pub struct Records {
+    /// In decision order.
+    pub transactions: Vec<TransactionRecord>,
+    /// In commit order.
+    pub blocks: Vec<BlockRecord>,
+    pub busy: Duration,
+}
 
 /// Every validator's records of a run, by authority.
 pub struct RunRecords {
@@ -173,21 +236,6 @@ impl RunRecords {
         let file =
             File::create(path).wrap_err_with(|| format!("Failed to create {}", path.display()))?;
         Ok(BufWriter::new(file))
-    }
-}
-
-impl Outcome {
-    /// The outcome and, for rejections, the reason, as the outputs name them.
-    fn names(&self) -> (&'static str, Option<&'static str>) {
-        match self {
-            Self::FinalCorrect => ("final_correct", None),
-            Self::FinalWrong => ("final_wrong", None),
-            Self::Rejected(Rejection::Impossible) => ("rejected", Some("impossible")),
-            Self::Rejected(Rejection::Cutoff) => ("rejected", Some("cutoff")),
-            Self::Rejected(Rejection::EarlierTransaction) => {
-                ("rejected", Some("earlier_transaction"))
-            }
-        }
     }
 }
 

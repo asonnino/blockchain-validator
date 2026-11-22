@@ -104,3 +104,36 @@ impl Byzantine {
         largest.map_or(honest, |(result, _)| Vote { result, ..honest })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Byzantine, Results};
+    use crate::{
+        digest::{InputDigest, ResultDigest},
+        vote::{Position, Vote},
+    };
+
+    #[test]
+    fn colluders_vote_the_wrong_result_with_the_most_honest_stake() {
+        let [truth, own, a, b] = [0, 1, 2, 3].map(ResultDigest::new_for_test);
+        let collude = |honest: &[(u64, ResultDigest)]| {
+            let vote = Vote {
+                position: Position {
+                    commit: 0,
+                    index: 0,
+                },
+                input: InputDigest::new_for_test(0),
+                result: own,
+            };
+            let honest = honest.to_vec();
+            Byzantine::collude(vote, Results { truth, honest }).result
+        };
+        // Stake adds up over authorities sharing a result.
+        assert_eq!(collude(&[(2, a), (1, b), (2, b), (5, truth)]), b);
+        // Ties go to the first in authority order.
+        assert_eq!(collude(&[(1, b), (1, a)]), b);
+        assert_eq!(collude(&[(1, a), (1, b)]), a);
+        // With no honest result wrong, the own one.
+        assert_eq!(collude(&[(1, truth)]), own);
+    }
+}

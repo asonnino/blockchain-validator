@@ -16,7 +16,8 @@ use execution::{
 };
 use fake_engine::FakeExecutor;
 
-use crate::{assignment::VersionId, digest::chance};
+use super::VersionId;
+use crate::digest::chance;
 
 /// Versions wrong together, all with the same wrong result.
 pub struct Cluster {
@@ -142,7 +143,7 @@ mod tests {
     use fake_engine::{FakeExecutor, FakeTransaction};
 
     use super::{Cluster, SyntheticConfig, SyntheticEngine};
-    use crate::{assignment::VersionId, digest::ResultDigest};
+    use crate::{digest::ResultDigest, versions::VersionId};
 
     /// A store holding object 1, and transactions that each write it and create a distinct object.
     fn setup() -> (InMemoryStore, Vec<Transaction>) {
