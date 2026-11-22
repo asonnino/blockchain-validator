@@ -4,30 +4,18 @@
 //! The n-version processor on a committee under the mysticeti simulator, each validator running a
 //! synthetic version of the fake engine and classifying outcomes against a version never wrong.
 
-use std::{path::Path, pin::pin, sync::Arc, time::Duration};
+mod common;
 
-use checkpoint::certifier::CheckpointCertifier;
-use dag::{authority::Authority, context::Ctx, metrics::Metrics};
-use execution::{
-    object::ObjectId,
-    store::{InMemoryStore, StateView},
-    transaction::Transaction,
-};
+use std::{sync::Arc, time::Duration};
+
+use common::{Results, outcomes};
+use execution::{object::ObjectId, store::StateView, transaction::Transaction};
 use fake_engine::{FakeExecutor, FakeTransaction};
-use futures::future::{Either, select};
 use n_move::{
-    Cluster, CostModel, NVersionProcessor, Outcome, Position, Records, Rejection, SyntheticConfig,
+    Cluster, CostModel, NVersionProcessor, Outcome, Records, Rejection, SyntheticConfig,
     SyntheticEngine, VersionId, assign,
 };
-use rand::{SeedableRng, rngs::StdRng};
-use replica::{
-    builder::StorageKind,
-    config::{PrivateReplicaConfig, PublicReplicaConfig},
-};
-use simulator::{
-    LatencyModel, SimulatedNetwork, SimulatorContext, SimulatorExecutor, UniformLatency,
-};
-use validator::validator::ValidatorBuilder;
+use replica::config::PublicReplicaConfig;
 
 const COMMITTEE_SIZE: usize = 4;
 const THRESHOLD: u64 = 3;
@@ -35,99 +23,35 @@ const THRESHOLD: u64 = 3;
 const CUTOFF: u64 = 50;
 /// The objects the workload creates, then updates.
 const OBJECTS: u64 = 10;
-/// Simulated time any wait may take: validators that disagree would otherwise wait forever.
-const LIMIT: Duration = Duration::from_secs(60);
 const EXECUTION: Duration = Duration::from_millis(1);
 
-/// Every validator's final state, certifier, and records.
-type Results = Vec<(InMemoryStore, CheckpointCertifier, Records)>;
-
-/// Runs one synthetic version per authority under `config`, submitting each batch once every
-/// validator decided the previous ones, from a different validator each time.
+/// Runs one synthetic version per authority under `config`, through [`common::run`].
 fn run(seed: u64, config: SyntheticConfig, batches: Vec<Vec<Transaction>>) -> Results {
-    SimulatorExecutor::run(StdRng::seed_from_u64(seed), async move {
-        let public_config = PublicReplicaConfig::new_for_tests(COMMITTEE_SIZE);
+    let config = Arc::new(config);
+    let correct = Arc::new(crate::config(Vec::new()));
+    let processor = move |authority, public_config: &PublicReplicaConfig| {
         let committee = public_config.committee();
-        let latency = LatencyModel::Uniform(UniformLatency { range_ms: 50..100 });
-        let (network, node_networks) = SimulatedNetwork::new(&committee, latency);
-        let private_configs =
-            PrivateReplicaConfig::new_for_benchmarks(Path::new("unused"), COMMITTEE_SIZE);
-        let config = Arc::new(config);
-        let correct = Arc::new(crate::config(Vec::new()));
-        let assignment = assign(&committee, COMMITTEE_SIZE, seed);
-
-        let mut validators = Vec::with_capacity(COMMITTEE_SIZE);
-        for (index, (node_network, private_config)) in
-            node_networks.into_iter().zip(private_configs).enumerate()
-        {
-            let authority = Authority::from(index);
-            let engines = (0..COMMITTEE_SIZE)
-                .map(|version| SyntheticEngine::new(VersionId(version), config.clone()))
-                .collect();
-            let reference = SyntheticEngine::new(VersionId(0), correct.clone());
-            let processor = NVersionProcessor::new(
-                authority,
-                engines,
-                reference,
-                assignment.clone(),
-                THRESHOLD,
-                CUTOFF,
-                &public_config,
-            )
-            .expect("processor must build")
-            .with_cost(CostModel {
-                per_execution: EXECUTION,
-                per_gas: Duration::ZERO,
-            })
-            .with_records();
-            let validator = ValidatorBuilder::with_processor(
-                processor,
-                authority,
-                public_config.clone(),
-                private_config,
-            )
-            .with_storage(StorageKind::Ephemeral)
-            .with_simulated_crypto()
-            // The default metrics spawn their reporter on tokio, absent here.
-            .with_metrics(Metrics::new_for_test(COMMITTEE_SIZE))
-            .with_network(node_network)
-            .build()
-            .start::<SimulatorContext>()
-            .await
-            .expect("validator must start");
-            validators.push(validator);
-        }
-        network.connect_all().await;
-
-        let mut decided = 0;
-        for (index, batch) in batches.into_iter().enumerate() {
-            decided += batch.len() as u64;
-            let submitter = &validators[index % COMMITTEE_SIZE];
-            submitter
-                .submit(batch)
-                .await
-                .expect("submission must succeed");
-            for validator in &mut validators {
-                within(validator.wait_for_transactions(decided)).await;
-            }
-        }
-        for validator in &mut validators {
-            within(validator.wait_for_certified()).await;
-        }
-
-        let mut results = Vec::with_capacity(COMMITTEE_SIZE);
-        for validator in validators {
-            results.push(validator.shutdown().await.into_parts());
-        }
-        results
-    })
-}
-
-async fn within<T>(future: impl Future<Output = T>) -> T {
-    match select(pin!(future), pin!(SimulatorContext::sleep(LIMIT))).await {
-        Either::Left((output, _)) => output,
-        Either::Right(_) => panic!("still waiting after {LIMIT:?} of simulated time"),
-    }
+        let engines = (0..COMMITTEE_SIZE)
+            .map(|version| SyntheticEngine::new(VersionId(version), config.clone()))
+            .collect();
+        let reference = SyntheticEngine::new(VersionId(0), correct.clone());
+        NVersionProcessor::new(
+            authority,
+            engines,
+            reference,
+            assign(&committee, COMMITTEE_SIZE, seed),
+            THRESHOLD,
+            CUTOFF,
+            public_config,
+        )
+        .expect("processor must build")
+        .with_cost(CostModel {
+            per_execution: EXECUTION,
+            per_gas: Duration::ZERO,
+        })
+        .with_records()
+    };
+    common::run(COMMITTEE_SIZE, seed, processor, batches)
 }
 
 fn config(clusters: Vec<Cluster>) -> SyntheticConfig {
@@ -157,14 +81,6 @@ fn workload() -> Vec<Vec<Transaction>> {
         .map(|id| FakeTransaction::success(vec![], vec![], vec![id]).into())
         .collect();
     vec![creations, updates]
-}
-
-/// Each decided transaction's position and outcome, in decision order.
-fn outcomes(records: &Records) -> Vec<(Position, &Outcome)> {
-    let transactions = records.transactions.iter();
-    transactions
-        .map(|record| (record.position, &record.outcome))
-        .collect()
 }
 
 /// Asserts every validator ended with the same store, certificate, and outcomes, every one

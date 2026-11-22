@@ -7,6 +7,7 @@
 //! that wires them into the validator.
 
 mod assignment;
+mod byzantine;
 mod decision;
 mod digest;
 mod engine;
@@ -16,9 +17,13 @@ mod synthetic;
 mod vote;
 
 pub use assignment::{VersionId, assign};
+pub use byzantine::{Byzantine, Selective, Strategy};
 pub use decision::{Decider, Decision, Rejection};
 pub use digest::{InputDigest, ResultDigest};
-pub use engine::{ClusterConfig, CostConfig, NMoveConfig, Rule, Threshold};
+pub use engine::{
+    ByzantineConfig, ClusterConfig, CostConfig, NMoveConfig, Rule, SelectiveConfig, StrategyConfig,
+    Threshold,
+};
 pub use processor::{
     BlockRecord, CostModel, NVersionProcessor, Outcome, Records, TransactionRecord,
 };

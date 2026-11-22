@@ -5,10 +5,15 @@
 //! with its own version, votes on every transaction's result, and executes the next commit only
 //! once every transaction of this one is decided.
 
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use checkpoint::certifier::{CheckpointCertifier, CheckpointTimings};
-use dag::{authority::Authority, committee::Stake, consensus::CommittedSubDag, crypto::AsBytes};
+use dag::{
+    authority::Authority,
+    committee::{Committee, Stake},
+    consensus::CommittedSubDag,
+    crypto::AsBytes,
+};
 use execution::{
     crypto::Digest,
     effects::{AbortReason, ExecutionOutput, ExecutionStatus},
@@ -26,6 +31,7 @@ use validator::{
 
 use crate::{
     assignment::VersionId,
+    byzantine::{Ballot, Byzantine, Results},
     decision::{Decider, Decision, Rejection},
     digest::{InputDigest, ResultDigest},
     vote::{Position, Vote},
@@ -123,6 +129,8 @@ struct Executed {
     committed_ms: u64,
     executed_ms: u64,
     voted_ms: Option<u64>,
+    /// The vote this validator cast on it, if it did yet.
+    vote: Option<Vote>,
 }
 
 /// A validator's [`CommitProcessor`] for n-version execution.
@@ -154,6 +162,10 @@ pub struct NVersionProcessor<E> {
     /// Whether to keep [`Records`], which grow with every transaction.
     recording: bool,
     records: Records,
+    committee: Arc<Committee>,
+    byzantine: Option<Byzantine>,
+    /// Late votes, in the order they fall due, with the anchor round they wait for.
+    delayed: VecDeque<(u64, Vote)>,
 }
 
 impl<E: ExecutionEngine> NVersionProcessor<E> {
@@ -192,7 +204,7 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             store,
             decider: Decider::new(committee.clone(), threshold, cutoff),
             certifier: CheckpointCertifier::new(committee.clone(), protocol.quorum_threshold),
-            commit_clock: CommitClock::new(committee),
+            commit_clock: CommitClock::new(committee.clone()),
             commits: 0,
             queue: VecDeque::new(),
             executing: None,
@@ -200,6 +212,9 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             decided: 0,
             recording: false,
             records: Records::default(),
+            committee,
+            byzantine: None,
+            delayed: VecDeque::new(),
         })
     }
 
@@ -210,6 +225,12 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
 
     pub fn with_records(mut self) -> Self {
         self.recording = true;
+        self
+    }
+
+    /// Makes this validator vote as `byzantine` says.
+    pub fn with_byzantine(mut self, byzantine: Byzantine) -> Self {
+        self.byzantine = Some(byzantine);
         self
     }
 
@@ -319,24 +340,43 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
 
         let mut overlay = Overlay::new(&self.store);
         let mut votes = Vec::with_capacity(queued.transactions.len());
+        let mut delayed = Vec::new();
         let mut transactions = Vec::with_capacity(queued.transactions.len());
         for (index, (transaction, submitted_ms)) in queued.transactions.into_iter().enumerate() {
             let input = InputDigest::new(&overlay, &transaction);
             let output = execute(engine, &overlay, &transaction);
             *busy += self.cost.cost(&output);
             let result = ResultDigest::new(&output);
-            overlay.apply(&output);
             let position = Position {
                 commit: queued.commit,
                 index: index
                     .try_into()
                     .expect("commits hold fewer than 2^32 transactions"),
             };
-            votes.push(Payload::Message(Vote {
+            let honest = Vote {
                 position,
                 input,
                 result,
-            }));
+            };
+            // Byzantine votes see the transaction's input state, before the own output.
+            let ballot = match &self.byzantine {
+                None => Ballot::Now(honest),
+                Some(byzantine) => byzantine.ballot(honest, &transaction, round, || {
+                    self.results(byzantine, &overlay, &transaction)
+                }),
+            };
+            overlay.apply(&output);
+            let vote = match ballot {
+                Ballot::Now(vote) => {
+                    votes.push(Payload::Message(vote));
+                    Some(vote)
+                }
+                Ballot::Due(due, vote) => {
+                    delayed.push((due, vote));
+                    None
+                }
+                Ballot::Withheld => None,
+            };
             transactions.push(Executed {
                 position,
                 transaction,
@@ -348,10 +388,39 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
                 committed_ms: queued.committed_ms,
                 executed_ms: millis(now + *busy),
                 voted_ms: None,
+                vote,
             });
         }
         self.executing = Some(transactions);
+        self.delayed.extend(delayed);
         votes
+    }
+
+    /// What collusion compares for `transaction`, executed on `view` by the reference and by
+    /// every honest authority's version.
+    fn results<V: StateView>(
+        &self,
+        byzantine: &Byzantine,
+        view: &V,
+        transaction: &Transaction,
+    ) -> Results {
+        let result = |engine: &E| ResultDigest::new(&execute(engine, view, transaction));
+        let by_version: Vec<_> = self.engines.iter().map(result).collect();
+        let honest = self
+            .committee
+            .authorities()
+            .filter(|authority| !byzantine.authorities.contains(authority))
+            .map(|authority| {
+                let stake = self
+                    .committee
+                    .get_stake(authority)
+                    .expect("committee members");
+                (stake, by_version[self.assignment[authority.index()].0])
+            });
+        Results {
+            truth: result(&self.reference),
+            honest: honest.collect(),
+        }
     }
 }
 
@@ -439,6 +508,7 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
                 payloads.extend(self.release(queued, anchor.round, now, &mut busy));
             }
         }
+        payloads.extend(self.due_votes(anchor.round));
         if self.records_live() {
             self.records.busy += busy;
         }
@@ -453,13 +523,9 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
         let Some((executing, head)) = self.executing.as_ref().zip(self.decider.head()) else {
             return pending.collect();
         };
-        let votes = executing[head.index as usize..].iter().map(|executed| {
-            Payload::Message(Vote {
-                position: executed.position,
-                input: executed.input,
-                result: executed.result,
-            })
-        });
+        let votes = executing[head.index as usize..]
+            .iter()
+            .filter_map(|executed| executed.vote.map(Payload::Message));
         pending.chain(votes).collect()
     }
 
@@ -478,6 +544,26 @@ impl<E: ExecutionEngine + Send + 'static> CommitProcessor for NVersionProcessor<
 }
 
 impl<E> NVersionProcessor<E> {
+    /// The late votes due at anchor round `round`, noted as cast.
+    fn due_votes(&mut self, round: u64) -> Vec<Payload<Vote>> {
+        let mut due = Vec::new();
+        while let Some(&(at, vote)) = self.delayed.front()
+            && at <= round
+        {
+            self.delayed.pop_front();
+            let executed = self
+                .executing
+                .as_mut()
+                .and_then(|executing| executing.get_mut(vote.position.index as usize))
+                .filter(|executed| executed.position == vote.position);
+            if let Some(executed) = executed {
+                executed.vote = Some(vote);
+            }
+            due.push(Payload::Message(vote));
+        }
+        due
+    }
+
     /// Notes that the own vote on `position` committed at `now_ms`.
     fn voted(&mut self, position: Position, now_ms: u64) {
         let executed = self
@@ -565,8 +651,9 @@ mod tests {
     use super::{CostModel, NVersionProcessor, Outcome, Records, repair};
     use crate::{
         assignment::VersionId,
+        byzantine::{Byzantine, Selective, Strategy},
         digest::ResultDigest,
-        synthetic::{SyntheticConfig, SyntheticEngine},
+        synthetic::{Cluster, SyntheticConfig, SyntheticEngine},
         vote::{Position, Vote},
     };
 
@@ -1026,6 +1113,212 @@ mod tests {
         let end_to_end = metrics.end_to_end_latency_s();
         assert_eq!(end_to_end.get_sample_count(), 1);
         assert_eq!(end_to_end.get_sample_sum(), 2.5);
+    }
+
+    /// Authority 0, voting as `strategy` on the transactions `selective` picks.
+    fn byzantine(
+        strategy: Strategy,
+        selective: Option<Selective>,
+    ) -> NVersionProcessor<FakeExecutor> {
+        processor().with_byzantine(Byzantine {
+            strategy,
+            selective,
+            authorities: vec![Authority::from(0usize)],
+        })
+    }
+
+    /// `count` creations, of distinct objects.
+    fn creations(count: u64) -> Vec<Vec<u8>> {
+        let creation = |id| FakeTransaction::success(vec![], vec![ObjectId::new(id)], vec![]);
+        (1..=count).map(|id| execute(creation(id))).collect()
+    }
+
+    #[test]
+    fn withheld_votes_are_never_cast() {
+        let mut processor = byzantine(Strategy::Withhold, None);
+        let released = process(&mut processor, subdag_at(1, vec![(0, creations(2))]));
+        assert!(own_votes(&released).is_empty());
+        assert!(own_votes(&processor.after_replay()).is_empty());
+    }
+
+    #[test]
+    fn fixed_votes_carry_the_fixed_digest() {
+        let fixed = ResultDigest::fixed(7);
+        let mut processor = byzantine(Strategy::Fixed(fixed), None);
+        let released = process(&mut processor, subdag_at(1, vec![(0, creations(2))]));
+        let votes = own_votes(&released);
+        assert_eq!(votes.len(), 2);
+        assert!(votes.iter().all(|vote| vote.result == fixed));
+        assert_eq!(own_votes(&processor.after_replay()), votes);
+    }
+
+    #[test]
+    fn late_votes_wait_their_rounds() {
+        let mut processor = byzantine(Strategy::Late { rounds: 2 }, None);
+        let released = process(&mut processor, subdag_at(1, vec![(0, creations(1))]));
+        assert!(own_votes(&released).is_empty());
+        let idle = |round| subdag_at(round, vec![(1, Vec::new())]);
+        assert!(own_votes(&process(&mut processor, idle(2))).is_empty());
+        // Replay resubmits only what was cast.
+        assert!(own_votes(&processor.after_replay()).is_empty());
+        assert_eq!(own_votes(&process(&mut processor, idle(3))).len(), 1);
+        assert_eq!(own_votes(&processor.after_replay()).len(), 1);
+    }
+
+    /// `authority`'s processor over four synthetic versions, run as `assignment` says (by
+    /// authority) and wrong in `clusters` (each a set of versions wrong together).
+    fn synthetic(
+        authority: usize,
+        assignment: [usize; 4],
+        clusters: &[&[usize]],
+    ) -> NVersionProcessor<SyntheticEngine> {
+        let clusters = clusters.iter().map(|versions| Cluster {
+            versions: versions.iter().copied().map(VersionId).collect(),
+            probability: 1.0,
+            transactions: None,
+        });
+        let wrongness = Arc::new(SyntheticConfig {
+            seed: 0,
+            failure: vec![0.0; 4],
+            clusters: clusters.collect(),
+        });
+        let correct = Arc::new(SyntheticConfig {
+            seed: 0,
+            failure: vec![0.0],
+            clusters: Vec::new(),
+        });
+        let engines = (0..4)
+            .map(|version| SyntheticEngine::new(VersionId(version), wrongness.clone()))
+            .collect();
+        let mut processor = NVersionProcessor::new(
+            Authority::from(authority),
+            engines,
+            SyntheticEngine::new(VersionId(0), correct),
+            assignment.into_iter().map(VersionId).collect(),
+            3,
+            2,
+            &PublicReplicaConfig::new_for_tests(4),
+        )
+        .unwrap();
+        processor.after_replay();
+        processor
+    }
+
+    /// The vote `processor` casts on a creation.
+    fn own_result<E: ExecutionEngine + Send + 'static>(
+        mut processor: NVersionProcessor<E>,
+    ) -> ResultDigest {
+        let released = process(&mut processor, subdag_at(1, vec![(0, creations(1))]));
+        own_votes(&released)[0].result
+    }
+
+    #[test]
+    fn colluders_vote_the_largest_wrong_result() {
+        const IN_ORDER: [usize; 4] = [0, 1, 2, 3];
+        fn honest(authority: usize, assignment: [usize; 4], clusters: &[&[usize]]) -> ResultDigest {
+            own_result(synthetic(authority, assignment, clusters))
+        }
+        /// Authority 0, one of the `colluders`.
+        fn colluded(
+            colluders: &[usize],
+            assignment: [usize; 4],
+            clusters: &[&[usize]],
+        ) -> ResultDigest {
+            own_result(
+                synthetic(0, assignment, clusters).with_byzantine(Byzantine {
+                    strategy: Strategy::Collude,
+                    selective: None,
+                    authorities: colluders.iter().copied().map(Authority::from).collect(),
+                }),
+            )
+        }
+
+        // Honest authorities 1 and 2 share a wrong result.
+        let together: &[&[usize]] = &[&[1, 2]];
+        assert_eq!(
+            colluded(&[0], IN_ORDER, together),
+            honest(1, IN_ORDER, together)
+        );
+        assert_ne!(
+            colluded(&[0], IN_ORDER, together),
+            honest(0, IN_ORDER, together)
+        );
+        // Of two wrong results, the one with more honest stake.
+        let split: &[&[usize]] = &[&[1], &[2, 3]];
+        assert_eq!(colluded(&[0], IN_ORDER, split), honest(2, IN_ORDER, split));
+        // Its own stake doesn't count: its own wrong result would tie and come first.
+        let own: &[&[usize]] = &[&[0], &[1]];
+        assert_eq!(colluded(&[0], IN_ORDER, own), honest(1, IN_ORDER, own));
+        // Nor does another colluder's, for the same reason.
+        let other: &[&[usize]] = &[&[1], &[2]];
+        assert_eq!(
+            colluded(&[0, 1], IN_ORDER, other),
+            honest(2, IN_ORDER, other)
+        );
+        // Results go by each authority's version: authority 1 runs version 0.
+        let swapped: &[&[usize]] = &[&[1], &[0]];
+        assert_eq!(
+            colluded(&[0], [1, 0, 2, 3], swapped),
+            honest(1, [1, 0, 2, 3], swapped)
+        );
+        // With no honest version wrong, it votes its own result.
+        assert_eq!(colluded(&[0], IN_ORDER, &[]), honest(0, IN_ORDER, &[]));
+    }
+
+    #[test]
+    fn late_votes_falling_due_after_their_decision_stay_off_later_transactions() {
+        let mut late = byzantine(Strategy::Late { rounds: 2 }, None);
+        let released = process(&mut late, subdag_at(1, vec![(0, creations(1))]));
+        assert!(own_votes(&released).is_empty());
+        let mut honest = processor();
+        let honest_votes = process(&mut honest, subdag_at(1, vec![(0, creations(1))]));
+        let [Payload::Message(vote)] = &honest_votes[..] else {
+            panic!("one honest vote: {honest_votes:?}");
+        };
+
+        // Authorities 1 to 3 decide the first commit as a second one, also of one transaction, is
+        // released; its late vote falls due at round 4.
+        let ballot = || Envelope::new(0, Payload::Message(*vote)).to_bytes();
+        let second = execute(FakeTransaction::success(
+            vec![],
+            vec![ObjectId::new(2)],
+            vec![],
+        ));
+        let blocks = vec![
+            (0, vec![second]),
+            (1, vec![ballot()]),
+            (2, vec![ballot()]),
+            (3, vec![ballot()]),
+        ];
+        process(&mut late, subdag_at(2, blocks));
+
+        // The first commit's vote falls due, and isn't taken for the second commit's.
+        let due = process(&mut late, subdag_at(3, vec![(1, Vec::new())]));
+        let due = own_votes(&due);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].position.commit, 0);
+        assert!(own_votes(&late.after_replay()).is_empty());
+    }
+
+    #[test]
+    fn selective_byzantines_pick_a_seeded_share() {
+        let fixed = ResultDigest::fixed(7);
+        let picked = |share, seed| {
+            let selective = Selective { share, seed };
+            let mut processor = byzantine(Strategy::Fixed(fixed), Some(selective));
+            let released = process(&mut processor, subdag_at(1, vec![(0, creations(16))]));
+            let votes = own_votes(&released);
+            votes
+                .iter()
+                .map(|vote| vote.result == fixed)
+                .collect::<Vec<_>>()
+        };
+        assert!(picked(0.0, 1).iter().all(|byzantine| !byzantine));
+        assert!(picked(1.0, 1).iter().all(|byzantine| *byzantine));
+        let half = picked(0.5, 1);
+        assert!(half.contains(&true) && half.contains(&false), "{half:?}");
+        assert_eq!(half, picked(0.5, 1));
+        assert_ne!(half, picked(0.5, 2));
     }
 
     #[test]

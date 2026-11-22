@@ -58,6 +58,15 @@ impl ResultDigest {
         Self(Digest::new(hasher.finalize().into()))
     }
 
+    /// A digest no execution produces, which Byzantine validators can vote for: a domain tag
+    /// hashed with `label`.
+    pub fn fixed(label: u64) -> Self {
+        let mut hasher = Hasher::new();
+        update_bytes(&mut hasher, b"n-move fixed result");
+        hasher.update(label.to_be_bytes());
+        Self(Digest::new(hasher.finalize().into()))
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(byte: u8) -> Self {
         Self(Digest::new([byte; 32]))
@@ -94,6 +103,11 @@ impl InputDigest {
     pub(crate) fn new_for_test(byte: u8) -> Self {
         Self(Digest::new([byte; 32]))
     }
+}
+
+/// A uniform draw in [0, 1) from `seed` and `parts`: the top 53 bits of [`seeded`].
+pub(crate) fn chance(seed: u64, parts: &[&[u8]]) -> f64 {
+    (seeded(seed, parts) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// A uniform `u64` drawn from `seed` and `parts`.
