@@ -13,7 +13,7 @@ use execution::{object::ObjectId, store::StateView, transaction::Transaction};
 use fake_engine::{FakeExecutor, FakeTransaction};
 use n_move::{
     Cluster, CostModel, NVersionProcessor, Outcome, Records, Rejection, SyntheticConfig,
-    SyntheticEngine, VersionId, assign,
+    SyntheticEngine, VersionId, Versions, assign,
 };
 use replica::config::PublicReplicaConfig;
 
@@ -35,21 +35,14 @@ fn run(seed: u64, config: SyntheticConfig, batches: Vec<Vec<Transaction>>) -> Re
             .map(|version| SyntheticEngine::new(VersionId(version), config.clone()))
             .collect();
         let reference = SyntheticEngine::new(VersionId(0), correct.clone());
-        NVersionProcessor::new(
-            authority,
-            engines,
-            reference,
-            assign(&committee, COMMITTEE_SIZE, seed),
-            THRESHOLD,
-            CUTOFF,
-            public_config,
-        )
-        .expect("processor must build")
-        .with_cost(CostModel {
+        let assignment = assign(&committee, COMMITTEE_SIZE, seed);
+        let versions = Versions::new(engines, reference, assignment).with_cost(CostModel {
             per_execution: EXECUTION,
             per_gas: Duration::ZERO,
-        })
-        .with_records()
+        });
+        NVersionProcessor::new(authority, versions, THRESHOLD, CUTOFF, public_config)
+            .expect("processor must build")
+            .with_records()
     };
     common::run(COMMITTEE_SIZE, seed, processor, batches)
 }

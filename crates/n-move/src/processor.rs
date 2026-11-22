@@ -15,10 +15,9 @@ use dag::{
     crypto::AsBytes,
 };
 use execution::{
-    crypto::Digest,
-    effects::{AbortReason, ExecutionOutput, ExecutionStatus},
+    effects::{ExecutionOutput, ExecutionStatus},
     engine::{CommitInfo, ExecutionEngine},
-    store::{InMemoryStore, Overlay, StateView},
+    store::{InMemoryStore, Overlay},
     transaction::Transaction,
 };
 use replica::config::PublicReplicaConfig;
@@ -30,83 +29,13 @@ use validator::{
 };
 
 use crate::{
-    assignment::VersionId,
-    byzantine::{Ballot, Byzantine, Results},
-    decision::{Decider, Decision, Rejection},
+    byzantine::{Ballot, Byzantine},
+    decision::{Decider, Decision},
     digest::{InputDigest, ResultDigest},
+    report::{BlockRecord, Outcome, Records, TransactionRecord},
+    versions::{VersionId, Versions},
     vote::{Position, Vote},
 };
-
-/// The simulated time the processor's executions take, reported as [`Processed::busy`]: a
-/// constant per execution plus a cost per unit of gas. Repairs count as executions; ground-truth
-/// runs of the reference engine and collusion's runs of every version do not, as colluders are
-/// omniscient. Costs, like the simulated time they add up to, must fit a
-/// [`Duration`]: processing panics otherwise.
-#[derive(Default)]
-pub struct CostModel {
-    pub per_execution: Duration,
-    pub per_gas: Duration,
-}
-
-impl CostModel {
-    fn cost(&self, output: &ExecutionOutput) -> Duration {
-        const NANOS_PER_SEC: u128 = 1_000_000_000;
-        let nanos = self
-            .per_gas
-            .as_nanos()
-            .saturating_mul(u128::from(output.gas_used()));
-        let secs = u64::try_from(nanos / NANOS_PER_SEC).expect("costs fit a Duration");
-        self.per_execution + Duration::new(secs, (nanos % NANOS_PER_SEC) as u32)
-    }
-}
-
-/// How a transaction ended, against the reference engine's result on the decided state.
-#[derive(PartialEq, Debug)]
-pub enum Outcome {
-    FinalCorrect,
-    FinalWrong,
-    Rejected(Rejection),
-}
-
-/// One transaction as this validator saw it. Times are milliseconds since the epoch on the
-/// validator's clock; processing time counts from the sub-dag that triggered it.
-#[derive(PartialEq, Debug)]
-pub struct TransactionRecord {
-    pub position: Position,
-    pub digest: Digest,
-    pub submitted_ms: u64,
-    pub committed_ms: u64,
-    pub executed_ms: u64,
-    /// When the own vote committed, unless the transaction was decided before.
-    pub voted_ms: Option<u64>,
-    pub decided_ms: u64,
-    pub outcome: Outcome,
-    /// The own result lost.
-    pub lost: bool,
-    /// The own execution ran on inputs an earlier decision changed.
-    pub lost_to_earlier: bool,
-    pub repairs: u32,
-    /// The own execution's gas.
-    pub gas_used: u64,
-}
-
-/// The bytes of n-move votes a committed block carries.
-#[derive(PartialEq, Debug)]
-pub struct BlockRecord {
-    pub round: u64,
-    pub author: Authority,
-    pub vote_bytes: usize,
-}
-
-/// What a processor measured over the commits delivered after replay.
-#[derive(Default, PartialEq, Debug)]
-pub struct Records {
-    /// In decision order.
-    pub transactions: Vec<TransactionRecord>,
-    /// In commit order.
-    pub blocks: Vec<BlockRecord>,
-    pub busy: Duration,
-}
 
 /// A committed sub-dag's transactions, waiting for the barrier.
 struct Queued {
@@ -137,15 +66,9 @@ struct Executed {
 /// A validator's [`CommitProcessor`] for n-version execution.
 pub struct NVersionProcessor<E> {
     authority: Authority,
-    /// One engine per version, the own one and the others for repair.
-    engines: Vec<E>,
+    versions: Versions<E>,
     /// The own version.
     version: VersionId,
-    /// Each authority's version.
-    assignment: Vec<VersionId>,
-    /// Never wrong.
-    reference: E,
-    cost: CostModel,
     /// The final state: decided results only.
     store: InMemoryStore,
     decider: Decider,
@@ -170,13 +93,10 @@ pub struct NVersionProcessor<E> {
 }
 
 impl<E: ExecutionEngine> NVersionProcessor<E> {
-    /// `authority` runs `engines[assignment[authority]]`; [`Decider::new`] takes `threshold` and
-    /// `cutoff`.
+    /// `authority` runs its version of `versions`; [`Decider::new`] takes `threshold` and `cutoff`.
     pub fn new(
         authority: Authority,
-        engines: Vec<E>,
-        reference: E,
-        assignment: Vec<VersionId>,
+        versions: Versions<E>,
         threshold: Stake,
         cutoff: u64,
         public_config: &PublicReplicaConfig,
@@ -184,24 +104,17 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
         let committee = public_config.committee();
         let protocol = public_config.parameters.consensus.to_protocol(&committee)?;
         assert_eq!(
-            assignment.len(),
+            versions.assignment().len(),
             committee.len(),
             "one version per authority"
         );
-        assert!(
-            assignment.iter().all(|version| version.0 < engines.len()),
-            "one engine per version"
-        );
-        let version = assignment[authority.index()];
+        let version = versions.assignment()[authority.index()];
         let mut store = InMemoryStore::default();
-        store.apply(ExecutionOutput::success(engines[version.0].genesis()));
+        store.apply(ExecutionOutput::success(versions.engine(version).genesis()));
         Ok(Self {
             authority,
-            engines,
+            versions,
             version,
-            assignment,
-            reference,
-            cost: CostModel::default(),
             store,
             decider: Decider::new(committee.clone(), threshold, cutoff),
             certifier: CheckpointCertifier::new(committee.clone(), protocol.quorum_threshold),
@@ -217,11 +130,6 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             byzantine: None,
             delayed: VecDeque::new(),
         })
-    }
-
-    pub fn with_cost(mut self, cost: CostModel) -> Self {
-        self.cost = cost;
-        self
     }
 
     pub fn with_records(mut self) -> Self {
@@ -266,7 +174,7 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             let (mut lost, mut repairs) = (false, 0);
             let outcome = match decision {
                 Decision::Final { result, voters } => {
-                    let truth = execute(&self.reference, &self.store, &executed.transaction);
+                    let truth = self.versions.truth(&self.store, &executed.transaction);
                     let correct = ResultDigest::new(&truth) == result;
                     lost = executed.result != result;
                     let own = executed.input == input && !lost;
@@ -274,15 +182,9 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
                         Some(output) if own => output,
                         _ => {
                             let transaction = &executed.transaction;
-                            let (output, tries, spent) = repair(
-                                &self.engines,
-                                &self.assignment,
-                                &self.store,
-                                transaction,
-                                result,
-                                &voters,
-                                &self.cost,
-                            );
+                            let (output, tries, spent) =
+                                self.versions
+                                    .repair(&self.store, transaction, result, &voters);
                             (repairs, *busy) = (tries, *busy + spent);
                             output
                         }
@@ -329,8 +231,10 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
         now: Duration,
         busy: &mut Duration,
     ) -> Vec<Payload<Vote>> {
-        let engine = &self.engines[self.version.0];
-        let prologue = engine.begin_commit(&self.store, &queued.info);
+        let prologue = self
+            .versions
+            .engine(self.version)
+            .begin_commit(&self.store, &queued.info);
         assert_eq!(
             *prologue.status(),
             ExecutionStatus::Success,
@@ -346,8 +250,8 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
         let mut transactions = Vec::with_capacity(queued.transactions.len());
         for (index, (transaction, submitted_ms)) in queued.transactions.into_iter().enumerate() {
             let input = InputDigest::new(&overlay, &transaction);
-            let output = execute(engine, &overlay, &transaction);
-            *busy += self.cost.cost(&output);
+            let (output, cost) = self.versions.execute(self.version, &overlay, &transaction);
+            *busy += cost;
             let result = ResultDigest::new(&output);
             let position = Position {
                 commit: queued.commit,
@@ -364,7 +268,9 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
             let ballot = match &self.byzantine {
                 None => Ballot::Now(honest),
                 Some(byzantine) => byzantine.ballot(honest, &transaction, round, || {
-                    self.results(byzantine, &overlay, &transaction)
+                    let committee = &self.committee;
+                    self.versions
+                        .results(committee, byzantine, &overlay, &transaction)
                 }),
             };
             overlay.apply(&output);
@@ -396,33 +302,6 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
         self.executing = Some(transactions);
         self.delayed.extend(delayed);
         votes
-    }
-
-    /// What collusion compares for `transaction`, executed on `view` by the reference and by
-    /// every honest authority's version.
-    fn results<V: StateView>(
-        &self,
-        byzantine: &Byzantine,
-        view: &V,
-        transaction: &Transaction,
-    ) -> Results {
-        let result = |engine: &E| ResultDigest::new(&execute(engine, view, transaction));
-        let by_version: Vec<_> = self.engines.iter().map(result).collect();
-        let honest = self
-            .committee
-            .authorities()
-            .filter(|authority| !byzantine.authorities.contains(authority))
-            .map(|authority| {
-                let stake = self
-                    .committee
-                    .get_stake(authority)
-                    .expect("committee members");
-                (stake, by_version[self.assignment[authority.index()].0])
-            });
-        Results {
-            truth: result(&self.reference),
-            honest: honest.collect(),
-        }
     }
 }
 
@@ -583,47 +462,6 @@ fn millis(time: Duration) -> u64 {
     u64::try_from(time.as_millis()).expect("times fit u64 milliseconds")
 }
 
-/// `transaction`'s output under `engine`, failing static verification as the scheduler does.
-fn execute<E: ExecutionEngine, V: StateView>(
-    engine: &E,
-    view: &V,
-    transaction: &Transaction,
-) -> ExecutionOutput {
-    if transaction.verify() {
-        engine.execute(view, transaction)
-    } else {
-        ExecutionOutput::aborted(AbortReason::InvalidTransaction)
-    }
-}
-
-/// Re-executes `transaction` on the final state with each winning voter's version in turn, until
-/// one reproduces `result`; a Byzantine voter's version may not, but an honest voter's does.
-/// Returns the output, the executions tried, and their cost.
-fn repair<E: ExecutionEngine>(
-    engines: &[E],
-    assignment: &[VersionId],
-    store: &InMemoryStore,
-    transaction: &Transaction,
-    result: ResultDigest,
-    voters: &[Authority],
-    cost: &CostModel,
-) -> (ExecutionOutput, u32, Duration) {
-    let (mut tried, mut spent) = (Vec::new(), Duration::ZERO);
-    for voter in voters {
-        let version = assignment[voter.index()];
-        if tried.contains(&version) {
-            continue;
-        }
-        tried.push(version);
-        let output = execute(&engines[version.0], store, transaction);
-        spent += cost.cost(&output);
-        if ResultDigest::new(&output) == result {
-            return (output, tried.len() as u32, spent);
-        }
-    }
-    panic!("no voter's version reproduces the final result");
-}
-
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
@@ -635,10 +473,11 @@ mod tests {
         crypto::CryptoEngine,
     };
     use execution::{
+        crypto::Digest,
         effects::ExecutionOutput,
         engine::{CommitInfo, ExecutionEngine},
         object::{Object, ObjectId, Version},
-        store::{InMemoryStore, StateView},
+        store::StateView,
         transaction::Transaction,
     };
     use fake_engine::{FakeExecutor, FakeTransaction};
@@ -650,49 +489,45 @@ mod tests {
         processor::CommitProcessor,
     };
 
-    use super::{CostModel, NVersionProcessor, Outcome, Records, repair};
+    use super::NVersionProcessor;
     use crate::{
-        assignment::VersionId,
         byzantine::{Byzantine, Selective, Strategy},
         digest::ResultDigest,
-        synthetic::{Cluster, SyntheticConfig, SyntheticEngine},
+        report::{Outcome, Records},
+        versions::{Cluster, CostModel, SyntheticConfig, SyntheticEngine, VersionId, Versions},
         vote::{Position, Vote},
     };
 
     /// Authority 0 of four correct versions, deciding at 3 of 4 with a cutoff of 2 rounds.
     fn processor() -> NVersionProcessor<FakeExecutor> {
-        processor_with(|| FakeExecutor)
+        processor_with(versions(|| FakeExecutor))
     }
 
+    /// Four versions, and the reference, all of `engine`, one per authority.
+    fn versions<E: ExecutionEngine>(engine: impl Fn() -> E) -> Versions<E> {
+        let engines = (0..4).map(|_| engine()).collect();
+        Versions::new(engines, engine(), (0..4).map(VersionId).collect())
+    }
+
+    /// [`processor`], over `versions`.
     fn processor_with<E: ExecutionEngine + Send + 'static>(
-        engine: impl Fn() -> E,
+        versions: Versions<E>,
     ) -> NVersionProcessor<E> {
-        let mut processor = replaying_with(engine);
+        let mut processor = replaying_with(versions);
         processor.after_replay();
         processor
     }
 
     /// [`processor_with`], still replaying.
-    fn replaying_with<E: ExecutionEngine>(engine: impl Fn() -> E) -> NVersionProcessor<E> {
-        unrecorded_with(engine).with_records()
+    fn replaying_with<E: ExecutionEngine>(versions: Versions<E>) -> NVersionProcessor<E> {
+        unrecorded_with(versions).with_records()
     }
 
     /// [`replaying_with`], keeping no records.
-    fn unrecorded_with<E: ExecutionEngine>(engine: impl Fn() -> E) -> NVersionProcessor<E> {
+    fn unrecorded_with<E: ExecutionEngine>(versions: Versions<E>) -> NVersionProcessor<E> {
         let public_config = PublicReplicaConfig::new_for_tests(4);
-        let assignment = (0..4).map(VersionId).collect();
-        let engines = (0..4).map(|_| engine()).collect();
         let authority = Authority::from(0usize);
-        NVersionProcessor::new(
-            authority,
-            engines,
-            engine(),
-            assignment,
-            3,
-            2,
-            &public_config,
-        )
-        .unwrap()
+        NVersionProcessor::new(authority, versions, 3, 2, &public_config).unwrap()
     }
 
     fn execute(transaction: FakeTransaction) -> Vec<u8> {
@@ -856,7 +691,7 @@ mod tests {
 
     #[test]
     fn released_commits_begin_with_their_own_prologue() {
-        let mut processor = processor_with(|| Clocked);
+        let mut processor = processor_with(versions(|| Clocked));
         let x = ObjectId::new(1);
         let create = execute(FakeTransaction::success(vec![], vec![x], vec![]));
         let first = process(
@@ -898,7 +733,7 @@ mod tests {
             per_execution: Duration::from_millis(1),
             per_gas: Duration::ZERO,
         };
-        let mut processor = processor().with_cost(cost);
+        let mut processor = processor_with(versions(|| FakeExecutor).with_cost(cost));
         let metrics = ValidatorMetrics::new(&Registry::new());
         let creations = [1, 2].map(|id| {
             let creation = FakeTransaction::success(vec![], vec![ObjectId::new(id)], vec![]);
@@ -947,20 +782,6 @@ mod tests {
             blocks,
             [(1, 0, 0)].into_iter().chain(voting).collect::<Vec<_>>()
         );
-
-        let gas = ExecutionOutput::success(Vec::new()).with_gas_used(500);
-        let cost = CostModel {
-            per_execution: Duration::from_millis(1),
-            per_gas: Duration::from_micros(1),
-        };
-        assert_eq!(cost.cost(&gas), Duration::from_micros(1500));
-        // Costs beyond 2^64 ns stay exact.
-        let heavy = ExecutionOutput::success(Vec::new()).with_gas_used(20_000_000_000);
-        let per_second = CostModel {
-            per_execution: Duration::ZERO,
-            per_gas: Duration::from_secs(1),
-        };
-        assert_eq!(per_second.cost(&heavy), Duration::from_secs(20_000_000_000));
     }
 
     #[test]
@@ -996,7 +817,7 @@ mod tests {
             per_execution: Duration::from_millis(1),
             per_gas: Duration::ZERO,
         };
-        let mut processor = replaying_with(|| FakeExecutor).with_cost(cost);
+        let mut processor = replaying_with(versions(|| FakeExecutor).with_cost(cost));
         let metrics = ValidatorMetrics::new(&Registry::new());
         let replay = |processor: &mut NVersionProcessor<_>, subdag| {
             processor.process(subdag, Duration::ZERO, &metrics).payloads
@@ -1069,7 +890,7 @@ mod tests {
 
     #[test]
     fn without_records_decisions_still_count() {
-        let mut processor = unrecorded_with(|| FakeExecutor);
+        let mut processor = unrecorded_with(versions(|| FakeExecutor));
         processor.after_replay();
         let create = execute(FakeTransaction::success(
             vec![],
@@ -1175,106 +996,6 @@ mod tests {
         assert!(processor.delayed.is_empty());
     }
 
-    /// `authority`'s processor over four synthetic versions, run as `assignment` says (by
-    /// authority) and wrong in `clusters` (each a set of versions wrong together).
-    fn synthetic(
-        authority: usize,
-        assignment: [usize; 4],
-        clusters: &[&[usize]],
-    ) -> NVersionProcessor<SyntheticEngine> {
-        let clusters = clusters.iter().map(|versions| Cluster {
-            versions: versions.iter().copied().map(VersionId).collect(),
-            probability: 1.0,
-            transactions: None,
-        });
-        let wrongness = Arc::new(SyntheticConfig {
-            seed: 0,
-            failure: vec![0.0; 4],
-            clusters: clusters.collect(),
-        });
-        let correct = Arc::new(SyntheticConfig {
-            seed: 0,
-            failure: vec![0.0],
-            clusters: Vec::new(),
-        });
-        let engines = (0..4)
-            .map(|version| SyntheticEngine::new(VersionId(version), wrongness.clone()))
-            .collect();
-        let mut processor = NVersionProcessor::new(
-            Authority::from(authority),
-            engines,
-            SyntheticEngine::new(VersionId(0), correct),
-            assignment.into_iter().map(VersionId).collect(),
-            3,
-            2,
-            &PublicReplicaConfig::new_for_tests(4),
-        )
-        .unwrap();
-        processor.after_replay();
-        processor
-    }
-
-    /// The vote `processor` casts on a creation.
-    fn own_result<E: ExecutionEngine + Send + 'static>(
-        mut processor: NVersionProcessor<E>,
-    ) -> ResultDigest {
-        let released = process(&mut processor, subdag_at(1, vec![(0, creations(1))]));
-        own_votes(&released)[0].result
-    }
-
-    #[test]
-    fn colluders_vote_the_largest_wrong_result() {
-        const IN_ORDER: [usize; 4] = [0, 1, 2, 3];
-        fn honest(authority: usize, assignment: [usize; 4], clusters: &[&[usize]]) -> ResultDigest {
-            own_result(synthetic(authority, assignment, clusters))
-        }
-        /// Authority 0, one of the `colluders`.
-        fn colluded(
-            colluders: &[usize],
-            assignment: [usize; 4],
-            clusters: &[&[usize]],
-        ) -> ResultDigest {
-            own_result(
-                synthetic(0, assignment, clusters).with_byzantine(Byzantine {
-                    strategy: Strategy::Collude,
-                    selective: None,
-                    authorities: colluders.iter().copied().map(Authority::from).collect(),
-                }),
-            )
-        }
-
-        // Honest authorities 1 and 2 share a wrong result.
-        let together: &[&[usize]] = &[&[1, 2]];
-        assert_eq!(
-            colluded(&[0], IN_ORDER, together),
-            honest(1, IN_ORDER, together)
-        );
-        assert_ne!(
-            colluded(&[0], IN_ORDER, together),
-            honest(0, IN_ORDER, together)
-        );
-        // Of two wrong results, the one with more honest stake.
-        let split: &[&[usize]] = &[&[1], &[2, 3]];
-        assert_eq!(colluded(&[0], IN_ORDER, split), honest(2, IN_ORDER, split));
-        // Its own stake doesn't count: its own wrong result would tie and come first.
-        let own: &[&[usize]] = &[&[0], &[1]];
-        assert_eq!(colluded(&[0], IN_ORDER, own), honest(1, IN_ORDER, own));
-        // Nor does another colluder's, for the same reason.
-        let other: &[&[usize]] = &[&[1], &[2]];
-        assert_eq!(
-            colluded(&[0, 1], IN_ORDER, other),
-            honest(2, IN_ORDER, other)
-        );
-        // Results go by each authority's version: authority 1 runs version 0.
-        let swapped: &[&[usize]] = &[&[1], &[0]];
-        assert_eq!(
-            colluded(&[0], [1, 0, 2, 3], swapped),
-            honest(1, [1, 0, 2, 3], swapped)
-        );
-        // With no honest version wrong, it votes its own result.
-        assert_eq!(colluded(&[0], IN_ORDER, &[]), honest(0, IN_ORDER, &[]));
-    }
-
     #[test]
     fn late_votes_falling_due_after_their_decision_stay_off_later_transactions() {
         let mut late = byzantine(Strategy::Late { rounds: 2 }, None);
@@ -1310,6 +1031,56 @@ mod tests {
         assert!(own_votes(&late.after_replay()).is_empty());
     }
 
+    /// `authority`'s processor over four synthetic versions, one per authority, of which version 1
+    /// is wrong on `transaction` alone.
+    fn wrong_on(authority: usize, transaction: Digest) -> NVersionProcessor<SyntheticEngine> {
+        let synthetic = |clusters| {
+            Arc::new(SyntheticConfig {
+                seed: 0,
+                failure: vec![0.0; 4],
+                clusters,
+            })
+        };
+        let cluster = Cluster {
+            versions: vec![VersionId(1)],
+            probability: 1.0,
+            transactions: Some(vec![transaction]),
+        };
+        let config = synthetic(vec![cluster]);
+        let engines = (0..4)
+            .map(|version| SyntheticEngine::new(VersionId(version), config.clone()))
+            .collect();
+        let reference = SyntheticEngine::new(VersionId(0), synthetic(Vec::new()));
+        let versions = Versions::new(engines, reference, (0..4).map(VersionId).collect());
+        let public_config = PublicReplicaConfig::new_for_tests(4);
+        let authority = Authority::from(authority);
+        let mut processor =
+            NVersionProcessor::new(authority, versions, 3, 2, &public_config).unwrap();
+        processor.after_replay();
+        processor
+    }
+
+    #[test]
+    fn colluders_run_every_version_on_the_commits_earlier_outputs() {
+        // The update reads the object the commit's creation writes.
+        let x = ObjectId::new(1);
+        let create = || FakeTransaction::success(vec![], vec![x], vec![]);
+        let update = || FakeTransaction::success(vec![], vec![], vec![x]);
+        let results = |mut processor: NVersionProcessor<SyntheticEngine>| {
+            let commit = vec![(0, vec![execute(create()), execute(update())])];
+            let released = process(&mut processor, subdag_at(1, commit));
+            let votes = own_votes(&released);
+            votes.iter().map(|vote| vote.result).collect::<Vec<_>>()
+        };
+        let digest = Transaction::from(update()).digest();
+        let colluder = wrong_on(0, digest).with_byzantine(Byzantine {
+            strategy: Strategy::Collude,
+            selective: None,
+            authorities: vec![Authority::from(0usize)],
+        });
+        assert_eq!(results(colluder), results(wrong_on(1, digest)));
+    }
+
     #[test]
     fn selective_byzantines_pick_a_seeded_share() {
         let fixed = ResultDigest::fixed(7);
@@ -1329,69 +1100,5 @@ mod tests {
         assert!(half.contains(&true) && half.contains(&false), "{half:?}");
         assert_eq!(half, picked(0.5, 1));
         assert_ne!(half, picked(0.5, 2));
-    }
-
-    #[test]
-    fn repair_skips_versions_that_do_not_reproduce_the_result() {
-        let (store, transaction, result, engines) = repair_setup();
-        let voters = [Authority::from(0usize), Authority::from(1usize)];
-        let assignment = [VersionId(0), VersionId(1)];
-        let cost = CostModel {
-            per_execution: Duration::from_millis(1),
-            per_gas: Duration::ZERO,
-        };
-        let (output, tries, spent) = repair(
-            &engines,
-            &assignment,
-            &store,
-            &transaction,
-            result,
-            &voters,
-            &cost,
-        );
-        assert_eq!(ResultDigest::new(&output), result);
-        assert_eq!((tries, spent), (2, Duration::from_millis(2)));
-    }
-
-    #[test]
-    #[should_panic(expected = "no voter's version reproduces the final result")]
-    fn repair_never_applies_another_result() {
-        let (store, transaction, result, engines) = repair_setup();
-        let assignment = [VersionId(0), VersionId(1)];
-        let voters = [Authority::from(0usize)];
-        let cost = CostModel::default();
-        repair(
-            &engines,
-            &assignment,
-            &store,
-            &transaction,
-            result,
-            &voters,
-            &cost,
-        );
-    }
-
-    /// Version 0 is always wrong and version 1 correct, on an update of an existing object.
-    fn repair_setup() -> (
-        InMemoryStore,
-        Transaction,
-        ResultDigest,
-        Vec<SyntheticEngine>,
-    ) {
-        let id = ObjectId::new(1);
-        let mut store = InMemoryStore::default();
-        let object = Object::new(id, Version::new(1), b"x".to_vec());
-        store.apply(ExecutionOutput::success(vec![object]));
-        let transaction: Transaction = FakeTransaction::success(vec![], vec![], vec![id]).into();
-        let result = ResultDigest::new(&FakeExecutor.execute(&store, &transaction));
-        let config = Arc::new(SyntheticConfig {
-            seed: 0,
-            failure: vec![1.0, 0.0],
-            clusters: Vec::new(),
-        });
-        let engines = (0..2)
-            .map(|version| SyntheticEngine::new(VersionId(version), config.clone()))
-            .collect();
-        (store, transaction, result, engines)
     }
 }
