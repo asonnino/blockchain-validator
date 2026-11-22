@@ -27,7 +27,7 @@ pub enum Strategy {
     /// A result no version computes, the same on every transaction.
     Fixed(ResultDigest),
     Withhold,
-    /// The own result, `rounds` rounds later than an honest vote.
+    /// The own result, `rounds` rounds later than an honest vote; never, past the last round.
     Late {
         rounds: u64,
     },
@@ -74,7 +74,10 @@ impl Byzantine {
             Strategy::Collude => Ballot::Now(Self::collude(honest, results())),
             Strategy::Fixed(result) => Ballot::Now(Vote { result, ..honest }),
             Strategy::Withhold => Ballot::Withheld,
-            Strategy::Late { rounds } => Ballot::Due(round + rounds, honest),
+            Strategy::Late { rounds } => match round.checked_add(rounds) {
+                Some(due) => Ballot::Due(due, honest),
+                None => Ballot::Withheld,
+            },
         }
     }
 

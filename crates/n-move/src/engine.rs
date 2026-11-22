@@ -204,6 +204,14 @@ impl Engine for NMoveConfig {
             "Byzantine validators beyond the {} validators",
             committee.len()
         );
+        let stake: Stake = authorities
+            .clone()
+            .filter_map(|index| committee.get_stake(Authority::from(*index)))
+            .sum();
+        ensure!(
+            stake < threshold,
+            "Byzantine validators hold {stake} stake, reaching the threshold of {threshold}"
+        );
         Ok(match byzantine.authorities.contains(&authority.index()) {
             true => processor.with_byzantine(Byzantine {
                 strategy: byzantine.strategy.strategy(),
@@ -402,7 +410,8 @@ mod tests {
         // What depends on the committee fails when building a processor for it.
         let public_config = PublicReplicaConfig::new_for_tests(4);
         let authority = Authority::from(0usize);
-        for fit in ["{}", "{threshold: {t: 4}}"] {
+        let two_byzantine = "{byzantine: {authorities: [0, 1], strategy: {fixed: 7}}}";
+        for fit in ["{}", "{threshold: {t: 4}}", two_byzantine] {
             assert!(
                 config(fit).processor(authority, &public_config).is_ok(),
                 "{fit}"
@@ -418,10 +427,20 @@ mod tests {
             "{failure: [0.0, 0.0, 0.0, 0.0, 0.0]}",
             "{clusters: [{versions: [4], probability: 1.0}]}",
             "{byzantine: {authorities: [4], strategy: withhold}}",
+            // Byzantine stake reaching the threshold of 3, even for an honest validator.
+            "{byzantine: {authorities: [1, 2, 3], strategy: {fixed: 7}}}",
         ] {
             let processor = config(unfit).processor(authority, &public_config);
             assert!(processor.is_err(), "{unfit} fits 4 validators");
         }
+        // Stake counts, not validators: validator 0 holds 2 of 5.
+        let mut weighted = public_config.clone();
+        weighted.identifiers[0].stake = 2;
+        assert!(
+            config(two_byzantine)
+                .processor(authority, &weighted)
+                .is_err()
+        );
     }
 
     #[test]

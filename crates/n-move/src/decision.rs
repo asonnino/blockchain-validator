@@ -132,7 +132,7 @@ impl Decider {
     }
 
     fn evaluate(&self, pending: &Pending, input: InputDigest) -> Option<Decision> {
-        let deadline = pending.round + self.cutoff;
+        let deadline = pending.round.saturating_add(self.cutoff);
         let timely = || {
             pending
                 .ballots
@@ -302,6 +302,14 @@ mod tests {
         assert_eq!(decide(&mut decider), None);
         decider.record(13, [vote(2, 0, INPUT, 1)]);
         assert_eq!(decide(&mut decider), rejected(0, Rejection::Cutoff));
+    }
+
+    #[test]
+    fn cutoffs_past_the_last_round_never_fire() {
+        let mut decider = decider(vec![1; 4], 3, u64::MAX);
+        decider.register(0, 1, 1);
+        decider.record(u64::MAX, []);
+        assert_eq!(decide(&mut decider), None);
     }
 
     #[test]

@@ -228,7 +228,8 @@ impl<E: ExecutionEngine> NVersionProcessor<E> {
         self
     }
 
-    /// Makes this validator vote as `byzantine` says.
+    /// Makes this validator vote as `byzantine` says. Its authorities must hold less stake than
+    /// the threshold, or they could finalize a result no version reproduces, and repair panics.
     pub fn with_byzantine(mut self, byzantine: Byzantine) -> Self {
         self.byzantine = Some(byzantine);
         self
@@ -1163,6 +1164,14 @@ mod tests {
         assert!(own_votes(&processor.after_replay()).is_empty());
         assert_eq!(own_votes(&process(&mut processor, idle(3))).len(), 1);
         assert_eq!(own_votes(&processor.after_replay()).len(), 1);
+    }
+
+    #[test]
+    fn votes_late_past_the_last_round_are_never_cast() {
+        let mut processor = byzantine(Strategy::Late { rounds: u64::MAX }, None);
+        let released = process(&mut processor, subdag_at(1, vec![(0, creations(1))]));
+        assert!(own_votes(&released).is_empty());
+        assert!(processor.delayed.is_empty());
     }
 
     /// `authority`'s processor over four synthetic versions, run as `assignment` says (by
