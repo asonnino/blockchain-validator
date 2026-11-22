@@ -39,7 +39,8 @@ use crate::{
 
 /// The simulated time the processor's executions take, reported as [`Processed::busy`]: a
 /// constant per execution plus a cost per unit of gas. Repairs count as executions; ground-truth
-/// runs of the reference engine do not. Costs, like the simulated time they add up to, must fit a
+/// runs of the reference engine and collusion's runs of every version do not, as colluders are
+/// omniscient. Costs, like the simulated time they add up to, must fit a
 /// [`Duration`]: processing panics otherwise.
 #[derive(Default)]
 pub struct CostModel {
