@@ -132,6 +132,7 @@ impl RunRecords {
                 "threshold": config.threshold(),
                 "cutoff_rounds": config.cutoff_rounds,
                 "versions": config.versions.unwrap_or(self.records.len()),
+                "byzantine": config.byzantine,
             },
             "duration_ms": duration_ms,
             "transactions": decided.len(),

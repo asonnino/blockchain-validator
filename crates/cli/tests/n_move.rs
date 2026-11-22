@@ -13,11 +13,13 @@ use std::{
 
 use serde_json::Value;
 
-/// `correct` costs 1 ms per execution; `mixed` clusters give every outcome: three versions
-/// agreeing on a wrong result finalize it, two against two reject the transaction.
+/// `correct` costs 1 ms per execution, and its validator 3 withholds every vote. `mixed` clusters
+/// give every outcome: three versions agreeing on a wrong result finalize it, two against two
+/// reject the transaction.
 const SUITE: &str = "
 - {name: correct, duration_secs: 2, load: {load: 10}, engine: n-move,
-    engine_config: {cost: {per_execution_us: 1000}}}
+    engine_config: {cost: {per_execution_us: 1000},
+        byzantine: {authorities: [3], strategy: withhold}}}
 - {name: mixed, duration_secs: 2, load: {load: 10}, engine: n-move,
     engine_config: {update_share: 0.5, clusters: [
         {versions: [0, 1, 2], probability: 0.3}, {versions: [0, 1], probability: 0.5}]}}
@@ -145,6 +147,17 @@ fn records_agree_with_their_summary() {
         correct["outcomes"]["final_correct"],
         correct["transactions"]
     );
+    // Validator 3 withholds its votes, but the other three reach the threshold.
+    let byzantine = &correct["parameters"]["byzantine"];
+    assert_eq!(byzantine["authorities"], serde_json::json!([3]));
+    assert_eq!(byzantine["strategy"], "withhold");
+    let records = lines(&output.join("correct").join("transactions.jsonl"));
+    let voted = |authority: u64| {
+        let own = records.iter().filter(|r| r["authority"] == authority);
+        own.filter(|r| !r["voted_ms"].is_null()).count()
+    };
+    assert!(voted(0) > 0);
+    assert_eq!(voted(3), 0);
     // One 1 ms execution per transaction and validator, and nothing to repair.
     let transactions = correct["transactions"].as_u64().unwrap();
     for busy_ms in correct["busy_ms"].as_array().unwrap() {

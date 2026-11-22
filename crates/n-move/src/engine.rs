@@ -16,6 +16,8 @@ use validator::engine::Engine;
 
 use crate::{
     assignment::{VersionId, assign},
+    byzantine::{Byzantine, Selective, Strategy},
+    digest::ResultDigest,
     processor::{CostModel, NVersionProcessor},
     report::RunRecords,
     synthetic::{Cluster, SyntheticConfig, SyntheticEngine},
@@ -45,6 +47,8 @@ pub struct NMoveConfig {
     pub cost: CostConfig,
     /// The share of transactions updating a recent creation rather than creating an object.
     pub update_share: f64,
+    /// Validators voting as Byzantine ones; none if absent.
+    pub byzantine: Option<ByzantineConfig>,
     #[serde(skip)]
     recording: bool,
 }
@@ -62,6 +66,7 @@ impl Default for NMoveConfig {
             clusters: Vec::new(),
             cost: CostConfig::default(),
             update_share: 0.0,
+            byzantine: None,
             recording: false,
         }
     }
@@ -101,6 +106,9 @@ impl NMoveConfig {
                 .all(|probability| (0.0..=1.0).contains(probability)),
             "probabilities and shares lie in [0, 1]"
         );
+        if let Some(byzantine) = &self.byzantine {
+            byzantine.validate()?;
+        }
         match self.versions {
             Some(versions) => self.validate_versions(versions),
             None => Ok(()),
@@ -183,8 +191,36 @@ impl Engine for NMoveConfig {
             public_config,
         )?
         .with_cost(self.cost.model());
-        Ok(match self.recording {
+        let processor = match self.recording {
             true => processor.with_records(),
+            false => processor,
+        };
+        let Some(byzantine) = &self.byzantine else {
+            return Ok(processor);
+        };
+        let authorities = byzantine.authorities.iter();
+        ensure!(
+            authorities.clone().all(|index| *index < committee.len()),
+            "Byzantine validators beyond the {} validators",
+            committee.len()
+        );
+        let stake: Stake = authorities
+            .clone()
+            .filter_map(|index| committee.get_stake(Authority::from(*index)))
+            .sum();
+        ensure!(
+            stake < threshold,
+            "Byzantine validators hold {stake} stake, reaching the threshold of {threshold}"
+        );
+        Ok(match byzantine.authorities.contains(&authority.index()) {
+            true => processor.with_byzantine(Byzantine {
+                strategy: byzantine.strategy.strategy(),
+                selective: byzantine.selective.map(|selective| Selective {
+                    share: selective.share,
+                    seed: selective.seed,
+                }),
+                authorities: authorities.copied().map(Authority::from).collect(),
+            }),
             false => processor,
         })
     }
@@ -229,6 +265,72 @@ pub enum Rule {
     SimpleMajority,
     /// For n = 3f + 2W + 1.
     HonestMajority,
+}
+
+/// Validators voting as Byzantine ones, by index, all with one strategy.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ByzantineConfig {
+    pub authorities: Vec<usize>,
+    /// `collude`, `withhold`, `{fixed: <label>}`, or `{late: <rounds>}`.
+    #[serde(with = "serde_yaml::with::singleton_map")]
+    pub strategy: StrategyConfig,
+    /// Byzantine on this share of transactions only; on every transaction if absent.
+    pub selective: Option<SelectiveConfig>,
+}
+
+impl ByzantineConfig {
+    fn validate(&self) -> Result<()> {
+        let mut authorities = self.authorities.clone();
+        authorities.sort_unstable();
+        authorities.dedup();
+        ensure!(
+            authorities.len() == self.authorities.len(),
+            "Byzantine validators repeat"
+        );
+        if let StrategyConfig::Late(rounds) = self.strategy {
+            ensure!(rounds > 0, "late votes are at least a round late");
+        }
+        if let Some(selective) = self.selective {
+            let share = selective.share;
+            ensure!(
+                (0.0..=1.0).contains(&share),
+                "selective share {share} is not in [0, 1]"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// [`Strategy`] in suite terms.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyConfig {
+    Collude,
+    Withhold,
+    /// The [`ResultDigest::fixed`] digest with this label.
+    Fixed(u64),
+    /// Votes this many rounds late.
+    Late(u64),
+}
+
+impl StrategyConfig {
+    fn strategy(self) -> Strategy {
+        match self {
+            Self::Collude => Strategy::Collude,
+            Self::Withhold => Strategy::Withhold,
+            Self::Fixed(label) => Strategy::Fixed(ResultDigest::fixed(label)),
+            Self::Late(rounds) => Strategy::Late { rounds },
+        }
+    }
+}
+
+/// [`Selective`] in suite terms.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct SelectiveConfig {
+    pub share: f64,
+    pub seed: u64,
 }
 
 /// Versions wrong together, with the same wrong result, by index.
@@ -287,6 +389,10 @@ mod tests {
         config("{versions: 4, failure: [0.1], clusters: [{versions: [3], probability: 1.0}]}")
             .validate()
             .unwrap();
+        let byzantine = "{authorities: [3], strategy: {late: 3}, selective: {share: 0.5, seed: 1}}";
+        config(&format!("{{byzantine: {byzantine}}}"))
+            .validate()
+            .unwrap();
         for invalid in [
             "{failure: [1.5]}",
             "{update_share: -0.1}",
@@ -294,6 +400,9 @@ mod tests {
             "{versions: 0}",
             "{versions: 2, failure: [0.0, 0.0, 0.0]}",
             "{versions: 2, clusters: [{versions: [2], probability: 1.0}]}",
+            "{byzantine: {authorities: [1, 1], strategy: withhold}}",
+            "{byzantine: {authorities: [0], strategy: {late: 0}}}",
+            "{byzantine: {authorities: [0], strategy: collude, selective: {share: 1.5, seed: 0}}}",
         ] {
             assert!(config(invalid).validate().is_err(), "{invalid} validates");
         }
@@ -301,7 +410,8 @@ mod tests {
         // What depends on the committee fails when building a processor for it.
         let public_config = PublicReplicaConfig::new_for_tests(4);
         let authority = Authority::from(0usize);
-        for fit in ["{}", "{threshold: {t: 4}}"] {
+        let two_byzantine = "{byzantine: {authorities: [0, 1], strategy: {fixed: 7}}}";
+        for fit in ["{}", "{threshold: {t: 4}}", two_byzantine] {
             assert!(
                 config(fit).processor(authority, &public_config).is_ok(),
                 "{fit}"
@@ -316,10 +426,21 @@ mod tests {
             // One version per validator, unless set.
             "{failure: [0.0, 0.0, 0.0, 0.0, 0.0]}",
             "{clusters: [{versions: [4], probability: 1.0}]}",
+            "{byzantine: {authorities: [4], strategy: withhold}}",
+            // Byzantine stake reaching the threshold of 3, even for an honest validator.
+            "{byzantine: {authorities: [1, 2, 3], strategy: {fixed: 7}}}",
         ] {
             let processor = config(unfit).processor(authority, &public_config);
             assert!(processor.is_err(), "{unfit} fits 4 validators");
         }
+        // Stake counts, not validators: validator 0 holds 2 of 5.
+        let mut weighted = public_config.clone();
+        weighted.identifiers[0].stake = 2;
+        assert!(
+            config(two_byzantine)
+                .processor(authority, &weighted)
+                .is_err()
+        );
     }
 
     #[test]

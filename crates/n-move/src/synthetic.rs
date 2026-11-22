@@ -16,7 +16,7 @@ use execution::{
 };
 use fake_engine::FakeExecutor;
 
-use crate::{assignment::VersionId, digest::seeded};
+use crate::{assignment::VersionId, digest::chance};
 
 /// Versions wrong together, all with the same wrong result.
 pub struct Cluster {
@@ -99,9 +99,7 @@ impl SyntheticEngine {
     fn wrongness(&self, transaction: &Transaction) -> Option<Tag> {
         let digest = transaction.digest();
         let fires = |tag: &Tag, probability: f64| {
-            let draw = seeded(self.config.seed, &[&tag.0, digest.as_bytes()]);
-            // The top 53 bits, uniform in [0, 1).
-            ((draw >> 11) as f64 / (1u64 << 53) as f64) < probability
+            chance(self.config.seed, &[&tag.0, digest.as_bytes()]) < probability
         };
         let clusters = self.config.clusters.iter().enumerate();
         clusters
